@@ -37,7 +37,8 @@ _ACTION_CODE_MAP = {'A': 'allow', 'B': 'block', 'D': 'block', 'R': 'block'}
 _ACTION_CODE_TO_POLICY = {'A': 'ALLOW', 'B': 'BLOCK', 'D': 'BLOCK'}
 _DESC_ACTION_MAP = {'block': 'block', 'drop': 'block', 'reject': 'block', 'allow': 'allow'}
 
-# Shown in LogDetail when a log's only matching policy has no id (#112).
+# Shown in LogDetail when a log's only matching policy has no id (#112). The UI
+# turns "Troubleshooting on the docs site" into a link (IDLESS_DOCS_LINK_TEXT).
 _IDLESS_POLICY_MESSAGE = (
     "The UniFi controller returned this policy without an id, so its logging cannot be "
     "toggled here. Toggle syslog for this rule in the UniFi Network app, or see "
@@ -478,6 +479,7 @@ def match_log_to_policy(unifi_api, interface_in, interface_out, rule_name,
             return {
                 "status": "uncontrollable",
                 "message": _IDLESS_POLICY_MESSAGE,
+                "reason": "no_id",
                 "policy": {"id": None, "name": idless.get('name', '')}
             }
         derived = next((p for p in all_matches if _is_derived(p)), None)

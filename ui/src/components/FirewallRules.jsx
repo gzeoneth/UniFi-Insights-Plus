@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react'
 import { fetchFirewallPolicies, patchFirewallPolicy, bulkUpdateFirewallLoggingStream } from '../api'
-import { isControllablePolicy, isPostureCandidate, SYSLOG_DELAY_WARNING } from '../lib/firewallPolicyLogging'
+import { isControllablePolicy, isPostureCandidate, IDLESS_DOCS_URL, SYSLOG_DELAY_WARNING } from '../lib/firewallPolicyLogging'
 import SyslogToggle from './SyslogToggle'
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -15,7 +15,6 @@ const UPPER_NAMES = { vpn: 'VPN', dmz: 'DMZ' }
 const IDLESS_TOGGLE_TITLE = 'Logging cannot be toggled here: the UniFi controller returned this policy '
   + 'without an id (usually a legacy rule the zone-based firewall migration did not fully convert). '
   + 'Toggle syslog for this rule in the UniFi Network app, or see Troubleshooting on the docs site.'
-const IDLESS_DOCS_URL = 'https://insightsplus.dev/docs/troubleshooting#firewall-policies-without-an-id'
 
 function normalizeZoneName(name) {
   return UPPER_NAMES[name.toLowerCase()] || name

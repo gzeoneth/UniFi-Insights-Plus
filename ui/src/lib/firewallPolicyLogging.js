@@ -20,6 +20,13 @@ export function isControllablePolicy(policy) {
   return isPostureCandidate(policy) && !!policy.id
 }
 
+/** Troubleshooting page for policies the controller returns without an id (#112).
+ *  Linked from the FirewallRules notice and the LogDetail Rule Logging message. */
+export const IDLESS_DOCS_URL = 'https://insightsplus.dev/docs/troubleshooting#firewall-policies-without-an-id'
+
+/** Phrase in the backend's id-less match message that LogDetail renders as the docs link. */
+export const IDLESS_DOCS_LINK_TEXT = 'Troubleshooting on the docs site'
+
 /** Warning text shared by both FirewallRules bulk confirm and LogDetail single confirm. */
 export const SYSLOG_DELAY_WARNING =
   'Changes are applied immediately on the UniFi Gateway but may take up to 5 minutes to reflect in the Log Stream.'

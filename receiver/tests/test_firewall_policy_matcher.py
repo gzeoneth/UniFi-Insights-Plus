@@ -407,6 +407,8 @@ class TestMatchLogToPolicy:
         assert result['status'] == 'uncontrollable'
         assert result['message'] == fpm._IDLESS_POLICY_MESSAGE
         assert 'without an id' in result['message']
+        assert 'Troubleshooting on the docs site' in result['message']  # linked by LogDetail
+        assert result['reason'] == 'no_id'
         assert result['policy'] == {'id': None, 'name': 'Legacy'}
 
     def test_disabled_idless_reports_disabled_first(self):
