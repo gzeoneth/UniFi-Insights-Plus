@@ -83,7 +83,8 @@ class SyslogReceiver:
             'inserted': 0,
             'flush_errors': 0,
             'dropped': 0,
-            'parse_exceptions': 0,
+            'parse_exceptions': 0,   # unexpected exception anywhere in _handle_message
+            'enrich_exceptions': 0,  # enrich() raised; row stored un-enriched
         }
         self._load_disabled_types()
 
@@ -169,29 +170,36 @@ class SyslogReceiver:
                 self.stats['filtered'] += 1
                 return
 
-            # Enrich with GeoIP, ASN, AbuseIPDB, rDNS
-            parsed = self.enricher.enrich(parsed)
+            # Enrich with GeoIP, ASN, AbuseIPDB, rDNS. enrich() mutates its
+            # argument, so hand it a copy: if it raises, the original parsed
+            # row is stored un-enriched instead of being dropped.
+            try:
+                parsed = self.enricher.enrich(dict(parsed))
+            except Exception:
+                self.stats['enrich_exceptions'] += 1
+                self._warn_rate_limited('enrich_exceptions', addr, raw_log)
 
             with self.batch_lock:
                 self.batch.append(parsed)
                 if len(self.batch) >= BATCH_SIZE:
                     self._flush_batch()
         except Exception:
-            # Never let a single malformed/edge-case packet kill the receiver
-            # thread. UDP/514 is reachable by any LAN host (and an attacker
-            # who can spoof source IPs over UDP); an unhandled exception here
-            # would crash the receiver and force a supervisord restart,
-            # losing in-flight packets — a one-packet remote DoS.
+            # Last-resort guard: UDP/514 accepts packets from any LAN host, so an
+            # unexpected exception must never kill the receiver thread (that
+            # forces a supervisord restart and loses the unflushed batch).
             self.stats['parse_exceptions'] += 1
-            # Rate-limit the log line so an attacker can't fill disk with our
-            # own warnings: emit once per 100 exceptions, with the first.
-            if self.stats['parse_exceptions'] % 100 == 1:
-                logger.warning(
-                    "Unhandled exception processing packet from %s "
-                    "(total parse_exceptions=%d). Sample raw_log: %.200r",
-                    addr, self.stats['parse_exceptions'], raw_log,
-                    exc_info=True,
-                )
+            self._warn_rate_limited('parse_exceptions', addr, raw_log)
+
+    def _warn_rate_limited(self, counter: str, addr: tuple, raw_log: str):
+        """Log a WARNING with traceback for the 1st and every 100th occurrence.
+
+        Bounded so a flood of hostile packets cannot fill the disk with our
+        own warnings. Must be called from inside an ``except`` block.
+        """
+        n = self.stats[counter]
+        if n == 1 or n % 100 == 0:
+            logger.warning("%s #%d while handling packet from %s: %.200r",
+                           counter, n, addr, raw_log, exc_info=True)
 
     def _maybe_flush_batch(self):
         """Flush batch if timeout elapsed."""
@@ -243,9 +251,12 @@ class SyslogReceiver:
         self.last_heartbeat = now
 
         silence = now - self.last_receive_time if self.last_receive_time else 0
-        logger.debug("Heartbeat — received=%d parsed=%d filtered=%d inserted=%d dropped=%d flush_errors=%d silence=%.0fs",
-                     self.stats['received'], self.stats['parsed'], self.stats['filtered'],
-                     self.stats['inserted'], self.stats['dropped'], self.stats['flush_errors'], silence)
+        logger.debug("Heartbeat — received=%d parsed=%d failed=%d filtered=%d inserted=%d dropped=%d "
+                     "flush_errors=%d parse_exc=%d enrich_exc=%d silence=%.0fs",
+                     self.stats['received'], self.stats['parsed'], self.stats['failed'],
+                     self.stats['filtered'], self.stats['inserted'], self.stats['dropped'],
+                     self.stats['flush_errors'], self.stats['parse_exceptions'],
+                     self.stats['enrich_exceptions'], silence)
 
         # Warn if no packets received for a long time (gateway may have stopped sending)
         if self.last_receive_time and silence > 30:

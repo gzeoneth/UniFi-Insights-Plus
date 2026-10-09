@@ -5,7 +5,8 @@ packets from any source. Before this fix, an unhandled exception in
 parse_log or enricher.enrich would crash the receiver thread, allowing a
 one-packet remote DoS. The handler now wraps the critical section in
 try/except and rate-limits the warning log so a sustained attack cannot
-fill the disk with warnings.
+fill the disk with warnings. An enrich() failure keeps the parsed row and
+stores it un-enriched.
 
 Findings addressed:
 - C4 (Gemini VULN-001) — malformed packet → receiver thread crash
@@ -49,9 +50,9 @@ class TestHandleMessageResilience:
 
     Each test forces an exception in a different layer of the parse pipeline
     (real parser timestamp ValueError, mocked parse_log, mocked enricher.enrich)
-    and asserts the receiver swallows the exception, increments the
-    parse_exceptions counter, rate-limits its WARNING log, and keeps processing
-    subsequent packets.
+    and asserts the receiver swallows the exception, increments the matching
+    counter (failed, parse_exceptions or enrich_exceptions), rate-limits its
+    WARNING log, and keeps processing subsequent packets.
     """
 
     def test_malformed_timestamp_does_not_raise(self, receiver):
@@ -80,15 +81,29 @@ class TestHandleMessageResilience:
         # Receiver state is otherwise normal — batch is unaffected.
         assert receiver.batch == []
 
-    def test_enricher_raising_is_swallowed(self, receiver, monkeypatch):
-        # If enricher.enrich raises, we must catch it. Same threat model.
-        receiver.enricher.enrich = MagicMock(side_effect=RuntimeError("simulated enricher bug"))
+    def test_enrich_exception_keeps_row(self, receiver):
+        # If enricher.enrich raises, the packet must not be dropped: the parsed
+        # row is batched un-enriched and counted as enrich_exceptions, not
+        # parse_exceptions.
+        def _partial_then_raise(p):
+            p['country'] = 'XX'  # partial mutation must not leak into the row
+            raise RuntimeError("simulated enricher bug")
+
+        receiver.enricher.enrich = MagicMock(side_effect=_partial_then_raise)
 
         # Use a syslog header the real parser accepts so we reach enrich().
         data = b"Feb  8 16:43:49 host kernel: [WAN_IN-B] IN=ppp0 OUT=br20 SRC=1.2.3.4 DST=10.0.0.5 PROTO=TCP SPT=1234 DPT=80"
         receiver._handle_message(data, ('1.2.3.4', 1234))
 
-        assert receiver.stats['parse_exceptions'] == 1
+        assert receiver.stats['enrich_exceptions'] == 1
+        assert receiver.stats['parse_exceptions'] == 0
+        assert receiver.stats['parsed'] == 1
+        assert len(receiver.batch) == 1
+        row = receiver.batch[0]
+        assert row['src_ip'] == '1.2.3.4'
+        assert row['dst_ip'] == '10.0.0.5'
+        assert 'country' not in row
+        assert 'remote_ip' not in row
 
     def test_burst_of_bad_packets_logs_bounded_warnings(self, receiver, monkeypatch, caplog):
         # An attacker sending 1000 malformed packets must not produce 1000
@@ -98,15 +113,16 @@ class TestHandleMessageResilience:
                             MagicMock(side_effect=RuntimeError("boom")))
 
         import logging
-        with caplog.at_level(logging.WARNING, logger='__main__'):
+        with caplog.at_level(logging.WARNING, logger='receiver'):
             for _ in range(1000):
                 receiver._handle_message(b"any payload", ('1.2.3.4', 1234))
 
         assert receiver.stats['parse_exceptions'] == 1000
-        # Rate-limited at 1-per-100 starting from the first: expect ~10 warnings.
-        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert 1 <= len(warning_records) <= 12, \
-            f"expected ~10 rate-limited warnings, got {len(warning_records)}"
+        # Rate-limited: the 1st and every 100th (1, 100, 200, ..., 1000).
+        warning_records = [r for r in caplog.records
+                           if r.levelno >= logging.WARNING and r.name == 'receiver']
+        assert len(warning_records) == 11, \
+            f"expected 11 rate-limited warnings, got {len(warning_records)}"
 
     def test_normal_packet_after_bad_packet_still_works(self, receiver):
         # Send a malformed packet, then a normal one. State must not be
@@ -120,3 +136,17 @@ class TestHandleMessageResilience:
         # The good packet should have been parsed and added to the batch.
         assert receiver.stats['parsed'] >= 1
         assert len(receiver.batch) >= 1
+
+    def test_heartbeat_includes_exception_counters(self, receiver, caplog):
+        import logging
+        receiver.stats.update({'failed': 5, 'parse_exceptions': 2, 'enrich_exceptions': 3})
+        receiver.last_heartbeat = 0  # force the heartbeat to fire
+
+        with caplog.at_level(logging.DEBUG, logger='receiver'):
+            receiver._maybe_log_heartbeat()
+
+        heartbeat = [r.getMessage() for r in caplog.records if 'Heartbeat' in r.getMessage()]
+        assert len(heartbeat) == 1
+        assert 'failed=5' in heartbeat[0]
+        assert 'parse_exc=2' in heartbeat[0]
+        assert 'enrich_exc=3' in heartbeat[0]

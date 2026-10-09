@@ -129,6 +129,12 @@ class TestParseSyslogTimestamp:
         monkeypatch.setenv('TZ', 'UTC')
         assert parse_syslog_timestamp('Feb', '1', '99999999999:00:00') is None
 
+    def test_parse_log_returns_none_for_overflow_day(self, monkeypatch):
+        # End to end through the header regex (day is \d+): a 20-digit day
+        # overflows datetime() and must yield None, not an exception.
+        monkeypatch.setenv('TZ', 'UTC')
+        assert parse_log('Feb 99999999999999999999 10:00:00 host kernel: x') is None
+
 
 # ── detect_log_type ──────────────────────────────────────────────────────────
 
