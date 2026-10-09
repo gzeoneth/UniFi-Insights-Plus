@@ -535,7 +535,9 @@ def _tool_set_firewall_syslog(args: dict) -> dict:
     if not policies:
         raise ValueError("policies list is required")
     policy_data = unifi_routes.get_firewall_policies()
-    by_id = {p.get('id'): p for p in policy_data.get('policies', [])}
+    # Id-less policies (#112) are listed but can never be targeted: keying them
+    # under None/'' would let a request without a real id reach a PATCH.
+    by_id = {p['id']: p for p in policy_data.get('policies', []) if p.get('id')}
     cleaned = []
     errors = []
     for item in policies:
