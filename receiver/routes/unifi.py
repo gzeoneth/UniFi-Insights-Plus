@@ -369,11 +369,16 @@ def _partition_bulk_policies(body: dict) -> tuple[list, list]:
 
 
 def _add_rejected(result: dict, rejected: list) -> dict:
-    """Count rejected (invalid-id) items as failed in a bulk_patch_logging result."""
+    """Count rejected (invalid-id) items as failed in a bulk_patch_logging result.
+
+    Rejected entries are appended after the controller errors, untruncated:
+    bulk_patch_logging already bounds its own list, and truncating here
+    could drop its trailing verification entry.
+    """
     if rejected:
         result['total'] = result.get('total', 0) + len(rejected)
         result['failed'] = result.get('failed', 0) + len(rejected)
-        result['errors'] = (rejected + (result.get('errors') or []))[:20]
+        result['errors'] = (result.get('errors') or []) + rejected
     return result
 
 

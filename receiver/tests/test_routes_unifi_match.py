@@ -215,6 +215,30 @@ class TestPolicyIdValidation:
         assert resp.json()['failed'] == 1
         assert resp.json()['errors'] == [{'id': POLICY_ID_2 + '\n', 'error': 'Invalid firewall policy id'}]
 
+    def test_bulk_rejected_ids_do_not_drop_controller_errors(self, unifi_client):
+        # 20 controller failures plus the verification entry must all survive
+        # alongside one rejected id; rejected entries are appended last.
+        client, mock_deps = unifi_client
+        _enable_unifi_with_features(mock_deps)
+        controller_errors = [{'id': f'c{i}', 'error': 'HTTP 500'} for i in range(20)]
+        verification = {'verification': '1 policies did not reflect the requested state', 'ids': ['x']}
+        mock_deps.unifi_api.bulk_patch_logging.return_value = {
+            'total': 21, 'success': 0, 'failed': 21, 'skipped': 0, 'retried': 0,
+            'errors': controller_errors + [verification],
+        }
+
+        resp = client.post('/api/firewall/policies/bulk-logging', json={'policies': [
+            {'id': POLICY_ID, 'loggingEnabled': True},
+            {'id': 'undefined', 'loggingEnabled': True},
+        ]})
+        assert resp.status_code == 200
+        errors = resp.json()['errors']
+        assert len(errors) == 22
+        assert errors[:21] == controller_errors + [verification]
+        assert errors[21] == {'id': 'undefined', 'error': 'Invalid firewall policy id'}
+        assert resp.json()['failed'] == 22
+        assert resp.json()['total'] == 22
+
     def test_patch_accepts_uuid(self, unifi_client):
         client, mock_deps = unifi_client
         _enable_unifi_with_features(mock_deps)
