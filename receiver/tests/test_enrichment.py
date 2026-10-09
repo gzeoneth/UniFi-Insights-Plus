@@ -838,11 +838,11 @@ class TestEnricherRemoteIpSelection:
         assert parsed['remote_ip'] == '2001:4860:4860::8888'
         enricher.geoip.lookup.assert_called_once_with('2001:4860:4860::8888')
 
-    def test_unknown_direction_both_global_preserves_source_fallback(self, monkeypatch):
+    def test_no_direction_both_global_preserves_source_fallback(self, monkeypatch):
         enricher = self._make_enricher(monkeypatch)
         parsed = {
             'log_type': 'firewall',
-            'direction': 'unknown',
+            'direction': None,  # derive_direction's only non-directional value
             'src_ip': '2001:4860:4860::8888',
             'dst_ip': '2606:4700:4700::1111',
         }
