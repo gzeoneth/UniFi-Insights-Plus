@@ -72,6 +72,9 @@
 - **MaxMind GeoLite2 account** ([free signup](https://www.maxmind.com/en/geolite2/signup)) - for GeoIP/ASN lookups
 - **AbuseIPDB API key** ([free tier](https://www.abuseipdb.com/register?plan=free), recommended but optional) - for threat scoring
 
+<!-- toggle names to be verified by the owner on a Network 10.x controller -->
+> **UniFi Network 10.x: enable SIEM-mode activity logging.** The gateway only emits the firewall and system syslog that Insights Plus parses when **Activity Logging** is set to **SIEM Server** (pointed at the Docker host, UDP port 514) with **Devices: Gateway** and **System Log: Firewall Default Policy** enabled. These settings live under **Settings > Integrations > Syslog** (`https://<controller-hostname-or-ip>/network/default/integrations/syslog`). If Insights Plus shows raw packet counts but nothing parses, disable SIEM, reboot the gateway, re-enable it, and re-check those two toggles.
+
 **Minimum host resources (estimated):**
 
 - **CPU:** 4 cores/threads minimum (PostgreSQL + receiver + API run concurrently)
