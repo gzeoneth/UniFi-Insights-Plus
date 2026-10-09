@@ -472,6 +472,9 @@ function GroupHeaderRow({ group, expanded, onToggle, onToggleExpand, toggling })
   const allEnabled = enabledCount === controllable.length && controllable.length > 0
   const noneEnabled = enabledCount === 0
   const canToggle = controllable.length > 0 && !toggling
+  // Explain a disabled group toggle when id-less rules (#112) are why nothing is controllable
+  const idlessTitle = controllable.length === 0
+    && policies.some(p => isPostureCandidate(p) && !p.id) ? IDLESS_TOGGLE_TITLE : undefined
 
   return (
     <tr
@@ -520,6 +523,7 @@ function GroupHeaderRow({ group, expanded, onToggle, onToggleExpand, toggling })
             checked={allEnabled}
             disabled={!canToggle}
             onChange={(val) => onToggle(group, val)}
+            title={idlessTitle}
           />
           {!allEnabled && !noneEnabled && canToggle && (
             <span className="text-[9px] text-amber-400">&bull;</span>

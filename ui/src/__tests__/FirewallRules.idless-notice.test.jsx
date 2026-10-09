@@ -85,6 +85,19 @@ describe('FirewallRules id-less policies', () => {
     expect(disabled[0].getAttribute('title')).toMatch(IDLESS_TITLE)
   })
 
+  it('explains a disabled group toggle when every rule in the group is id-less', async () => {
+    mockFetch.mockResolvedValue(payload([
+      policy({ name: 'Legacy pair' }),
+      policy({ name: 'Legacy pair', index: 200 }),
+      policy({ id: '11111111-2222-4333-8444-555555555555', name: 'Has id', index: 300 }),
+    ]))
+    render(<FirewallRules />)
+
+    await screen.findByText(/2 firewall policies were returned/)
+    const groupToggle = screen.getAllByTestId('toggle').find(t => t.disabled)
+    expect(groupToggle.getAttribute('title')).toMatch(IDLESS_TITLE)
+  })
+
   it('pluralises the notice', async () => {
     mockFetch.mockResolvedValue(payload([
       policy({ name: 'Legacy A' }),
