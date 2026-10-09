@@ -381,18 +381,20 @@ class TestGetFirewallDataIdless:
         api.get_firewall_policies = MagicMock(return_value=[dict(p) for p in policies])
         api.get_firewall_zones = MagicMock(return_value=[])
 
-    def test_get_firewall_data_hides_idless_policies(self, api, caplog):
+    def test_get_firewall_data_keeps_idless_policies(self, api, caplog):
+        """Option A (#112): id-less policies stay visible and are counted."""
         self._setup(api, self.POLICIES)
         with caplog.at_level('WARNING', logger='unifi_api'):
             data = api.get_firewall_data()
 
-        assert [p['id'] for p in data['policies']] == ['p1']
-        assert data['totalCount'] == 1
-        assert data['loggingEnabled'] == 1
-        assert data['loggingDisabled'] == 0
+        assert [p.get('name') for p in data['policies']] == ['Allow LAN', 'Legacy rule', 'Empty id']
+        assert data['totalCount'] == 3
+        assert data['loggingEnabled'] == 2
+        assert data['loggingDisabled'] == 1
         warnings = [r for r in caplog.records if 'without an id' in r.getMessage()]
         assert len(warnings) == 1
         assert '2 firewall policies' in warnings[0].getMessage()
+        assert 'hidden' not in warnings[0].getMessage()
 
     def test_warns_once_per_distinct_idless_set(self, api, caplog):
         self._setup(api, self.POLICIES)
@@ -405,10 +407,10 @@ class TestGetFirewallDataIdless:
         warnings = [r for r in caplog.records if 'without an id' in r.getMessage()]
         assert len(warnings) == 2
 
-    def test_include_idless_returns_all_without_warning(self, api, caplog):
-        self._setup(api, self.POLICIES)
+    def test_no_warning_without_idless_policies(self, api, caplog):
+        self._setup(api, self.POLICIES[:1])
         with caplog.at_level('WARNING', logger='unifi_api'):
-            data = api.get_firewall_data(include_idless=True)
+            data = api.get_firewall_data()
 
-        assert len(data['policies']) == 3
+        assert data['totalCount'] == 1
         assert not [r for r in caplog.records if 'without an id' in r.getMessage()]

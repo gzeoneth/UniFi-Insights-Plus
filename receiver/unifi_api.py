@@ -845,17 +845,15 @@ class UniFiAPI:
             offset += len(page)
         return all_policies
 
-    def get_firewall_data(self, include_idless: bool = False) -> dict:
+    def get_firewall_data(self) -> dict:
         """Fetch policies + zones in one call for the frontend.
 
-        Policies without an ``id`` cannot be patched (the UI would send
-        ``/firewall/policies/undefined``, issue #112), so they are hidden
-        unless ``include_idless`` is set. The log-to-policy matcher sets it
-        because rule-action resolution only needs zone/index/action metadata.
+        All policies are returned, including any without an ``id`` (issue
+        #112): they still shape the zone matrix and resolve rule actions, but
+        cannot be patched, so the UI disables their toggle and the routes
+        reject non-UUID ids. Counts include them.
         """
-        policies = self.get_firewall_policies()
-        if not include_idless:
-            policies = self._drop_idless_policies(policies)
+        policies = self._warn_idless_policies(self.get_firewall_policies())
         zones = self.get_firewall_zones()
 
         logging_enabled = sum(1 for p in policies if p.get('loggingEnabled'))
@@ -869,8 +867,8 @@ class UniFiAPI:
             'loggingDisabled': logging_disabled,
         }
 
-    def _drop_idless_policies(self, policies: list) -> list:
-        """Remove policies without an id, warning once per distinct set."""
+    def _warn_idless_policies(self, policies: list) -> list:
+        """Warn once per distinct set of id-less policies; return the list unchanged."""
         idless = [p for p in policies if not p.get('id')]
         if not idless:
             self._idless_policies_warned = None
@@ -879,10 +877,11 @@ class UniFiAPI:
         if names != self._idless_policies_warned:
             self._idless_policies_warned = names
             logger.warning(
-                "Integration API returned %d firewall policies without an id; hidden from the UI "
-                "(first names: %s). Likely un-migrated legacy rules on the controller, see issue #112.",
+                "Integration API returned %d firewall policies without an id; their logging cannot be "
+                "toggled from Insights Plus (first names: %s). Likely legacy rules the zone-based "
+                "firewall migration did not fully convert, see issue #112.",
                 len(idless), list(names[:5]))
-        return [p for p in policies if p.get('id')]
+        return policies
 
     def patch_firewall_policy(self, policy_id: str, logging_enabled: bool) -> dict:
         """Update loggingEnabled on a single policy."""

@@ -37,6 +37,13 @@ _ACTION_CODE_MAP = {'A': 'allow', 'B': 'block', 'D': 'block', 'R': 'block'}
 _ACTION_CODE_TO_POLICY = {'A': 'ALLOW', 'B': 'BLOCK', 'D': 'BLOCK'}
 _DESC_ACTION_MAP = {'block': 'block', 'drop': 'block', 'reject': 'block', 'allow': 'allow'}
 
+# Shown in LogDetail when a log's only matching policy has no id (#112).
+_IDLESS_POLICY_MESSAGE = (
+    "The UniFi controller returned this policy without an id, so its logging cannot be "
+    "toggled here. Toggle syslog for this rule in the UniFi Network app, or see "
+    "Troubleshooting on the docs site."
+)
+
 
 def _action_from_desc(rule_desc):
     """Extract action from rule description text (e.g. 'Block Unauthorized Traffic').
@@ -162,7 +169,7 @@ def _get_snapshot(unifi_api, vpn_networks=None):
     # Multiple threads may race to build; the last write wins (safe — all produce
     # equivalent data from the same UniFi state).
     zone_data = build_zone_map(unifi_api, vpn_networks=vpn_networks)
-    fw_data = unifi_api.get_firewall_data(include_idless=True)  # action lookup works without ids
+    fw_data = unifi_api.get_firewall_data()
 
     snapshot = {
         'zone_data': zone_data,
@@ -435,8 +442,6 @@ def match_log_to_policy(unifi_api, interface_in, interface_out, rule_name,
 
     all_matches = []
     for p in policies:
-        if not p.get('id'):
-            continue  # id-less policies cannot be toggled (#112)
         if p.get('source', {}).get('zoneId') != src_zone_id:
             continue
         if p.get('destination', {}).get('zoneId') != dst_zone_id:
@@ -451,11 +456,13 @@ def match_log_to_policy(unifi_api, interface_in, interface_out, rule_name,
         return {"status": "unmatched",
                 "message": "No matching policy found"}
 
-    # Build controllable candidate set — filter DERIVED and disabled BEFORE
-    # deciding ambiguity, so an uncontrollable twin doesn't block a valid match.
+    # Build controllable candidate set: filter DERIVED, disabled and id-less
+    # (#112, cannot be patched) BEFORE deciding ambiguity, so an
+    # uncontrollable twin doesn't block a valid match.
     controllable = [p for p in all_matches
                     if p.get('metadata', {}).get('origin', '') != 'DERIVED'
-                    and p.get('enabled') is not False]
+                    and p.get('enabled') is not False
+                    and p.get('id')]
 
     if len(controllable) == 0:
         # All matches are uncontrollable
@@ -467,10 +474,16 @@ def match_log_to_policy(unifi_api, interface_in, interface_out, rule_name,
                 "message": "This rule is auto-generated and cannot be modified.",
                 "policy": {"id": policy.get('id'), "name": policy.get('name', '')}
             }
+        if policy.get('enabled') is False:
+            return {
+                "status": "uncontrollable",
+                "message": "This rule is disabled and cannot be toggled.",
+                "policy": {"id": policy.get('id'), "name": policy.get('name', '')}
+            }
         return {
             "status": "uncontrollable",
-            "message": "This rule is disabled and cannot be toggled.",
-            "policy": {"id": policy.get('id'), "name": policy.get('name', '')}
+            "message": _IDLESS_POLICY_MESSAGE,
+            "policy": {"id": policy.get('id') or None, "name": policy.get('name', '')}
         }
 
     if len(controllable) > 1:
