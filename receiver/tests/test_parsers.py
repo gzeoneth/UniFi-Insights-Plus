@@ -576,3 +576,53 @@ class TestParseLog:
         line = 'Feb  8 16:43:49 UDR systemd[1]: Starting Daily Cleanup...'
         r = parse_log(line)
         assert r['log_type'] == 'system'
+
+
+# ── Invalid-field warnings are rate-limited and repr-escaped ─────────────────
+
+class TestInvalidFieldWarnings:
+    PREFIX = 'Feb  8 16:43:49 UDR-UK kernel: [WAN_IN-B-4000000003-D]IN=ppp0 OUT=br20 '
+
+    @staticmethod
+    def _warnings(caplog):
+        return [r for r in caplog.records if r.name == 'parsers' and r.levelname == 'WARNING']
+
+    def test_invalid_src_flood_logs_one_escaped_line(self, monkeypatch, caplog):
+        import logging
+        import log_utils
+        monkeypatch.setenv('TZ', 'UTC')
+        clock = [500.0]
+        monkeypatch.setattr(log_utils.time, 'monotonic', lambda: clock[0])
+        # A trailing "\n" still matches the header regex and stays in raw_log.
+        line = self.PREFIX + 'SRC=999.1.1.1 DST=10.0.20.100 PROTO=TCP SPT=54321 DPT=443\n'
+
+        with caplog.at_level(logging.WARNING, logger='parsers'):
+            for i in range(500):
+                clock[0] = 500.0 + i * 0.1  # 500 packets over 50 s
+                r = parse_log(line)
+                assert r['src_ip'] is None
+
+        warnings = self._warnings(caplog)
+        assert len(warnings) == 1
+        msg = warnings[0].getMessage()
+        assert 'Invalid src_ip' in msg
+        assert '\n' not in msg   # cannot forge an extra log line
+        assert r'\n' in msg      # the newline is shown escaped (repr)
+
+    def test_invalid_mac_is_rate_limited_and_escaped(self, monkeypatch, caplog):
+        import logging
+        monkeypatch.setenv('TZ', 'UTC')
+        monkeypatch.setattr(parsers, 'MAC_RE', parsers.re.compile(r'(?!)'))  # reject every MAC
+        line = (self.PREFIX + 'MAC=aa:bb:cc:dd:ee:ff:11:22:33:44:55:66:08:00 '
+                'SRC=203.0.113.5 DST=10.0.20.100 PROTO=TCP SPT=54321 DPT=443\n')
+
+        with caplog.at_level(logging.WARNING, logger='parsers'):
+            for _ in range(3):
+                r = parse_log(line)
+                assert r['mac_address'] is None
+
+        warnings = self._warnings(caplog)
+        assert len(warnings) == 1
+        msg = warnings[0].getMessage()
+        assert 'Invalid mac_address' in msg
+        assert '\n' not in msg

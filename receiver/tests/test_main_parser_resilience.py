@@ -107,23 +107,37 @@ class TestHandleMessageResilience:
         assert 'remote_ip' not in row
 
     def test_burst_of_bad_packets_logs_bounded_warnings(self, receiver, monkeypatch, caplog):
-        # An attacker sending 1000 malformed packets must not produce 1000
-        # WARNING log entries (which would fill the disk).
+        # An attacker sending 1000 malformed packets within a minute must
+        # produce one WARNING, not one per packet (time-based rate limit).
+        import logging
         import main as main_module
+        import log_utils
         monkeypatch.setattr(main_module, 'parse_log',
                             MagicMock(side_effect=RuntimeError("boom")))
+        clock = [1000.0]
+        monkeypatch.setattr(log_utils.time, 'monotonic', lambda: clock[0])
 
-        import logging
+        def _warnings():
+            return [r for r in caplog.records
+                    if r.levelno >= logging.WARNING and r.name == 'receiver']
+
         with caplog.at_level(logging.WARNING, logger='receiver'):
-            for _ in range(1000):
+            for i in range(1000):
+                clock[0] = 1000.0 + i * 0.05  # 1000 packets over 50 s
                 receiver._handle_message(b"any payload", ('1.2.3.4', 1234))
 
-        assert receiver.stats['parse_exceptions'] == 1000
-        # Rate-limited: the 1st and every 100th (1, 100, 200, ..., 1000).
-        warning_records = [r for r in caplog.records
-                           if r.levelno >= logging.WARNING and r.name == 'receiver']
-        assert len(warning_records) == 11, \
-            f"expected 11 rate-limited warnings, got {len(warning_records)}"
+            assert receiver.stats['parse_exceptions'] == 1000
+            assert len(_warnings()) == 1
+            assert _warnings()[0].exc_info is not None  # traceback on the one line
+            assert '0 similar suppressed' in _warnings()[0].getMessage()
+
+            clock[0] = 1000.0 + log_utils.WARN_INTERVAL_SECONDS + 1
+            receiver._handle_message(b"any payload", ('1.2.3.4', 1234))
+
+        assert len(_warnings()) == 2
+        second = _warnings()[1].getMessage()
+        assert '999 similar suppressed' in second
+        assert 'total 1001' in second
 
     def test_normal_packet_after_bad_packet_still_works(self, receiver):
         # Send a malformed packet, then a normal one. State must not be

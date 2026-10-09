@@ -21,6 +21,7 @@ import schedule
 
 from parsers import parse_log
 import parsers
+from log_utils import rate_limited_warning
 from db import Database, get_config, set_config, build_conn_params, is_external_db, wait_for_postgres
 from enrichment import Enricher
 from backfill import BackfillTask
@@ -191,15 +192,16 @@ class SyslogReceiver:
             self._warn_rate_limited('parse_exceptions', addr, raw_log)
 
     def _warn_rate_limited(self, counter: str, addr: tuple, raw_log: str):
-        """Log a WARNING with traceback for the 1st and every 100th occurrence.
+        """Log at most one WARNING (with traceback) per counter per interval.
 
-        Bounded so a flood of hostile packets cannot fill the disk with our
-        own warnings. Must be called from inside an ``except`` block.
+        Delegates to ``log_utils.rate_limited_warning``, so log volume stays
+        at one line per minute per counter whatever the packet rate; the
+        line carries the running total and the suppressed count. Must be
+        called from inside an ``except`` block.
         """
-        n = self.stats[counter]
-        if n == 1 or n % 100 == 0:
-            logger.warning("%s #%d while handling packet from %s: %.200r",
-                           counter, n, addr, raw_log, exc_info=True)
+        rate_limited_warning(logger, f'receiver.{counter}',
+                             "%s (total %d) while handling packet from %s: %.200r",
+                             counter, self.stats[counter], addr, raw_log, exc_info=True)
 
     def _maybe_flush_batch(self):
         """Flush batch if timeout elapsed."""

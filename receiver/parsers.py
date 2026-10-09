@@ -12,6 +12,7 @@ import logging
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+from log_utils import rate_limited_warning
 from services import get_service_name
 
 logger = logging.getLogger(__name__)
@@ -538,13 +539,17 @@ def parse_log(raw_log: str) -> dict | None:
             try:
                 ipaddress.ip_address(ip_val)
             except ValueError:
-                logger.warning("Invalid %s '%s' in log: %.300s", ip_field, ip_val, original_raw)
+                # Packet content is attacker-controlled: rate-limit, and use
+                # %r so embedded newlines cannot forge extra log lines.
+                rate_limited_warning(logger, f'parsers.invalid_{ip_field}',
+                                     "Invalid %s %.64r in log: %.300r", ip_field, ip_val, original_raw)
                 parsed[ip_field] = None
 
     # Validate MAC field — reject invalid macaddr values before DB insert
     mac_val = parsed.get('mac_address')
     if mac_val and not MAC_RE.fullmatch(mac_val):
-        logger.warning("Invalid mac_address '%s' in log: %.300s", mac_val, original_raw)
+        rate_limited_warning(logger, 'parsers.invalid_mac_address',
+                             "Invalid mac_address %.64r in log: %.300r", mac_val, original_raw)
         parsed['mac_address'] = None
 
     return parsed
