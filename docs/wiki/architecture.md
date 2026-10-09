@@ -210,7 +210,7 @@ flowchart TD
 
     subgraph CRON["Cron Process"]
         direction TB
-        C1["Wed + Sat 07:00 UTC:<br>geoipupdate<br>Download GeoLite2-City<br>Download GeoLite2-ASN"]
+        C1["Wed + Sat 07:00 container time:<br>geoipupdate<br>Download GeoLite2-City<br>Download GeoLite2-ASN"]
         C1 --> C2["kill -USR1 receiver<br>Trigger reload_geoip()"]
     end
 

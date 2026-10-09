@@ -84,7 +84,7 @@ EditionIDs GeoLite2-City GeoLite2-ASN
 DatabaseDirectory /app/maxmind
 GEOEOF
 
-    # Schedule: Wednesday 07:00 UTC and Saturday 07:00 UTC
+    # Schedule: Wednesday and Saturday 07:00 container time (cron follows TZ)
     echo "0 7 * * 3,6 root /app/geoip-update.sh >> /var/log/geoip-update.log 2>&1" > /etc/cron.d/geoipupdate
     chmod 0644 /etc/cron.d/geoipupdate
 
@@ -94,7 +94,7 @@ GEOEOF
         /app/geoip-update.sh
     fi
 
-    echo "[entrypoint] GeoIP auto-update configured (Wed & Sat @ 07:00 UTC)"
+    echo "[entrypoint] GeoIP auto-update configured (Wed & Sat @ 07:00 container time)"
 else
     echo "[entrypoint] MaxMind credentials not set, skipping GeoIP auto-update"
 fi
