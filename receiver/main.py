@@ -21,7 +21,7 @@ import schedule
 
 from parsers import parse_log
 import parsers
-from log_utils import rate_limited_warning
+from log_utils import flush_suppressed, rate_limited_warning
 from db import Database, get_config, set_config, build_conn_params, is_external_db, wait_for_postgres
 from enrichment import Enricher
 from backfill import BackfillTask
@@ -259,6 +259,9 @@ class SyslogReceiver:
                      self.stats['filtered'], self.stats['inserted'], self.stats['dropped'],
                      self.stats['flush_errors'], self.stats['parse_exceptions'],
                      self.stats['enrich_exceptions'], silence)
+
+        # Surface suppressed counts of rate-limited warnings after a burst ends
+        flush_suppressed()
 
         # Warn if no packets received for a long time (gateway may have stopped sending)
         if self.last_receive_time and silence > 30:

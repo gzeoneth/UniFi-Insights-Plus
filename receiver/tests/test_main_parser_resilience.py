@@ -167,3 +167,46 @@ class TestHandleMessageResilience:
         assert 'failed=5' in heartbeat[0]
         assert 'parse_exc=2' in heartbeat[0]
         assert 'enrich_exc=3' in heartbeat[0]
+
+    def test_heartbeat_flushes_suppressed_count_after_burst(self, receiver, monkeypatch, caplog):
+        # 10 000 invalid-SRC packets, then silence. The suppressed count must
+        # surface from the heartbeat once the window has expired, exactly once.
+        import logging
+        from types import SimpleNamespace
+        import log_utils
+        monkeypatch.setenv('TZ', 'UTC')
+        clock = [2000.0]
+        monkeypatch.setattr(log_utils, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+        bad = (b"Feb  8 16:43:49 host kernel: [WAN_IN-B] IN=ppp0 OUT=br20 "
+               b"SRC=999.1.1.1 DST=10.0.0.5 PROTO=TCP SPT=1234 DPT=80")
+
+        def _lines(text):
+            return [r.getMessage() for r in caplog.records
+                    if r.levelno == logging.WARNING and text in r.getMessage()]
+
+        with caplog.at_level(logging.DEBUG):
+            for i in range(10_000):
+                clock[0] = 2000.0 + i * 0.001  # 10 s burst
+                receiver._handle_message(bad, ('1.2.3.4', 1234))
+            assert len(_lines('Invalid src_ip')) == 1
+
+            # Window not expired yet: the heartbeat must not flush.
+            receiver.last_heartbeat = 0
+            receiver._maybe_log_heartbeat()
+            assert _lines('similar suppressed since the previous warning') == \
+                [_lines('Invalid src_ip')[0]]
+
+            # Silence past the window: one flush line with the full count.
+            clock[0] = 2000.0 + log_utils.WARN_INTERVAL_SECONDS + 1
+            receiver.last_heartbeat = 0
+            receiver._maybe_log_heartbeat()
+            flushed = _lines('parsers.invalid_src_ip: 9999 similar suppressed')
+            assert len(flushed) == 1
+            flushed_record = [r for r in caplog.records if r.getMessage() == flushed[0]][0]
+            assert flushed_record.name == 'parsers'
+
+            # Count cleared: a later heartbeat logs nothing more.
+            clock[0] += 2 * log_utils.WARN_INTERVAL_SECONDS
+            receiver.last_heartbeat = 0
+            receiver._maybe_log_heartbeat()
+            assert len(_lines('similar suppressed since the previous warning')) == 2
