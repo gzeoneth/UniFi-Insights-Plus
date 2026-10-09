@@ -465,25 +465,33 @@ def match_log_to_policy(unifi_api, interface_in, interface_out, rule_name,
                     and p.get('id')]
 
     if len(controllable) == 0:
-        # All matches are uncontrollable
-        policy = all_matches[0]
-        origin = policy.get('metadata', {}).get('origin', '')
-        if origin == 'DERIVED':
+        # All matches are uncontrollable. Report the one most likely to have
+        # produced this log: a disabled rule does not log, so an enabled
+        # id-less rule (#112) wins, then a DERIVED rule, then a disabled one.
+        def _is_derived(p):
+            return p.get('metadata', {}).get('origin', '') == 'DERIVED'
+
+        idless = next((p for p in all_matches
+                       if not _is_derived(p) and p.get('enabled') is not False
+                       and not p.get('id')), None)
+        if idless:
+            return {
+                "status": "uncontrollable",
+                "message": _IDLESS_POLICY_MESSAGE,
+                "policy": {"id": None, "name": idless.get('name', '')}
+            }
+        derived = next((p for p in all_matches if _is_derived(p)), None)
+        if derived:
             return {
                 "status": "uncontrollable",
                 "message": "This rule is auto-generated and cannot be modified.",
-                "policy": {"id": policy.get('id'), "name": policy.get('name', '')}
+                "policy": {"id": derived.get('id'), "name": derived.get('name', '')}
             }
-        if policy.get('enabled') is False:
-            return {
-                "status": "uncontrollable",
-                "message": "This rule is disabled and cannot be toggled.",
-                "policy": {"id": policy.get('id'), "name": policy.get('name', '')}
-            }
+        policy = all_matches[0]  # only disabled rules remain
         return {
             "status": "uncontrollable",
-            "message": _IDLESS_POLICY_MESSAGE,
-            "policy": {"id": policy.get('id') or None, "name": policy.get('name', '')}
+            "message": "This rule is disabled and cannot be toggled.",
+            "policy": {"id": policy.get('id'), "name": policy.get('name', '')}
         }
 
     if len(controllable) > 1:

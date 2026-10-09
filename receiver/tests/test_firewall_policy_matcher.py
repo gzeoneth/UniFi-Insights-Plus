@@ -418,6 +418,31 @@ class TestMatchLogToPolicy:
         assert result['status'] == 'uncontrollable'
         assert result['message'] == 'This rule is disabled and cannot be toggled.'
 
+    def test_disabled_with_id_and_enabled_idless_reports_idless(self):
+        """A disabled rule does not log, so the enabled id-less rule produced the
+        line: report that one even when the disabled rule comes first."""
+        disabled = _policy('p-off', 'Old rule', 'z-int', 'z-ext', 'BLOCK', 100, enabled=False)
+        api = self._setup_match([disabled, self._idless('Legacy')])
+        result = fpm.match_log_to_policy(
+            api, interface_in='br0', interface_out='eth3',
+            rule_name='LAN_WAN-D-100',
+        )
+        assert result['status'] == 'uncontrollable'
+        assert result['message'] == fpm._IDLESS_POLICY_MESSAGE
+        assert result['policy'] == {'id': None, 'name': 'Legacy'}
+
+    def test_derived_reported_before_disabled(self):
+        disabled = _policy('p-off', 'Old rule', 'z-int', 'z-ext', 'BLOCK', 100, enabled=False)
+        derived = _policy('p-auto', 'Auto', 'z-int', 'z-ext', 'BLOCK', 100, origin='DERIVED')
+        api = self._setup_match([disabled, derived])
+        result = fpm.match_log_to_policy(
+            api, interface_in='br0', interface_out='eth3',
+            rule_name='LAN_WAN-D-100',
+        )
+        assert result['status'] == 'uncontrollable'
+        assert result['message'] == 'This rule is auto-generated and cannot be modified.'
+        assert result['policy']['id'] == 'p-auto'
+
     def test_idless_twin_does_not_block_normal_match(self):
         """A normal policy next to an id-less twin is still matched, not ambiguous."""
         normal = _policy('p1', 'Block IoT', 'z-int', 'z-ext', 'BLOCK', 100)
