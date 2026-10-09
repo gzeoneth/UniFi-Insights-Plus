@@ -75,6 +75,7 @@ class UniFiAPI:
         self._last_poll_error = None
         self._client_count = 0
         self._device_count = 0
+        self._idless_policies_warned = None  # last id-less policy set warned about (#112)
         try:
             self._resolve_config()
         except Exception as e:
@@ -844,9 +845,17 @@ class UniFiAPI:
             offset += len(page)
         return all_policies
 
-    def get_firewall_data(self) -> dict:
-        """Fetch policies + zones in one call for the frontend."""
+    def get_firewall_data(self, include_idless: bool = False) -> dict:
+        """Fetch policies + zones in one call for the frontend.
+
+        Policies without an ``id`` cannot be patched (the UI would send
+        ``/firewall/policies/undefined``, issue #112), so they are hidden
+        unless ``include_idless`` is set. The log-to-policy matcher sets it
+        because rule-action resolution only needs zone/index/action metadata.
+        """
         policies = self.get_firewall_policies()
+        if not include_idless:
+            policies = self._drop_idless_policies(policies)
         zones = self.get_firewall_zones()
 
         logging_enabled = sum(1 for p in policies if p.get('loggingEnabled'))
@@ -859,6 +868,21 @@ class UniFiAPI:
             'loggingEnabled': logging_enabled,
             'loggingDisabled': logging_disabled,
         }
+
+    def _drop_idless_policies(self, policies: list) -> list:
+        """Remove policies without an id, warning once per distinct set."""
+        idless = [p for p in policies if not p.get('id')]
+        if not idless:
+            self._idless_policies_warned = None
+            return policies
+        names = tuple(sorted(str(p.get('name')) for p in idless))
+        if names != self._idless_policies_warned:
+            self._idless_policies_warned = names
+            logger.warning(
+                "Integration API returned %d firewall policies without an id; hidden from the UI "
+                "(first names: %s). Likely un-migrated legacy rules on the controller, see issue #112.",
+                len(idless), list(names[:5]))
+        return [p for p in policies if p.get('id')]
 
     def patch_firewall_policy(self, policy_id: str, logging_enabled: bool) -> dict:
         """Update loggingEnabled on a single policy."""
@@ -956,7 +980,8 @@ class UniFiAPI:
                     logger.debug("progress_callback failed during verification", exc_info=True)
             try:
                 actual_policies = self.get_firewall_policies()
-                actual_map = {p['id']: p.get('loggingEnabled', False) for p in actual_policies}
+                actual_map = {p['id']: p.get('loggingEnabled', False)
+                              for p in actual_policies if p.get('id')}
                 for item in work_items:
                     pid = item['id']
                     if pid in successful_ids and actual_map.get(pid) != item['loggingEnabled']:

@@ -439,7 +439,9 @@ function PolicyRow({ policy, zoneMap, onToggle, toggling, isSubRow }) {
           checked={logging}
           disabled={!canToggle}
           onChange={(val) => onToggle(policy.id, val, origin)}
-          title={isDerived ? 'Derived policies cannot be changed' : undefined}
+          title={isDerived ? 'Derived policies cannot be changed'
+            : !policy.id ? 'This policy has no id from the controller and cannot be changed'
+            : undefined}
         />
       </td>
     </tr>

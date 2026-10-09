@@ -236,6 +236,15 @@ class TestResolveRuleAction:
         assert parsed['resolved_action'] == 'block'
         assert parsed['action_source'] == 'rule_desc'
 
+    def test_idless_policy_still_resolves_action(self):
+        """Rule-action lookup needs no policy id (#112): the snapshot requests
+        id-less policies too, so their action metadata keeps working."""
+        api = self._setup(action='BLOCK', index=30004)
+        api.get_firewall_data.return_value['policies'][0].pop('id')
+        parsed = fpm.parse_firewall_rule('GUEST_WAN-30004')
+        assert fpm.resolve_rule_action(parsed, api, 'br50', 'eth3') == 'block'
+        api.get_firewall_data.assert_called_with(include_idless=True)
+
     def test_policy_overrides_desc_hint(self):
         """Policy metadata takes precedence over desc_hint."""
         api = self._setup(action='ALLOW', index=30004)
@@ -382,6 +391,17 @@ class TestMatchLogToPolicy:
         assert result['status'] == 'matched'
         assert result['policy']['id'] == 'p1'
         assert result['policy']['loggingEnabled'] is True
+
+    def test_idless_policy_is_never_matched(self):
+        """An id-less policy cannot be toggled (#112), so it is skipped."""
+        idless = _policy(None, 'Legacy', 'z-int', 'z-ext', 'BLOCK', 100)
+        idless.pop('id')
+        api = self._setup_match([idless])
+        result = fpm.match_log_to_policy(
+            api, interface_in='br0', interface_out='eth3',
+            rule_name='LAN_WAN-D-100',
+        )
+        assert result['status'] == 'unmatched'
 
     def test_unmatched_no_policy(self):
         api = self._setup_match(policies=[])

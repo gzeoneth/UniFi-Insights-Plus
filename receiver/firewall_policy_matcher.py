@@ -162,7 +162,7 @@ def _get_snapshot(unifi_api, vpn_networks=None):
     # Multiple threads may race to build; the last write wins (safe — all produce
     # equivalent data from the same UniFi state).
     zone_data = build_zone_map(unifi_api, vpn_networks=vpn_networks)
-    fw_data = unifi_api.get_firewall_data()
+    fw_data = unifi_api.get_firewall_data(include_idless=True)  # action lookup works without ids
 
     snapshot = {
         'zone_data': zone_data,
@@ -435,6 +435,8 @@ def match_log_to_policy(unifi_api, interface_in, interface_out, rule_name,
 
     all_matches = []
     for p in policies:
+        if not p.get('id'):
+            continue  # id-less policies cannot be toggled (#112)
         if p.get('source', {}).get('zoneId') != src_zone_id:
             continue
         if p.get('destination', {}).get('zoneId') != dst_zone_id:
@@ -463,12 +465,12 @@ def match_log_to_policy(unifi_api, interface_in, interface_out, rule_name,
             return {
                 "status": "uncontrollable",
                 "message": "This rule is auto-generated and cannot be modified.",
-                "policy": {"id": policy['id'], "name": policy.get('name', '')}
+                "policy": {"id": policy.get('id'), "name": policy.get('name', '')}
             }
         return {
             "status": "uncontrollable",
             "message": "This rule is disabled and cannot be toggled.",
-            "policy": {"id": policy['id'], "name": policy.get('name', '')}
+            "policy": {"id": policy.get('id'), "name": policy.get('name', '')}
         }
 
     if len(controllable) > 1:
@@ -482,7 +484,7 @@ def match_log_to_policy(unifi_api, interface_in, interface_out, rule_name,
     return {
         "status": "matched",
         "policy": {
-            "id": policy['id'],
+            "id": policy.get('id'),
             "name": policy.get('name', ''),
             "loggingEnabled": policy.get('loggingEnabled', False),
             "origin": origin,
