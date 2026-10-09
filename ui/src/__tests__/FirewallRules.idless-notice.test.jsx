@@ -4,8 +4,8 @@
  * explanatory tooltip.
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { render, screen, waitFor, cleanup } from '@testing-library/react'
 
 const mockFetch = vi.fn()
 
@@ -48,8 +48,22 @@ function payload(policies) {
 
 const DOCS = 'https://insightsplus.dev/docs/troubleshooting#firewall-policies-without-an-id'
 
+const IDLESS_TITLE = /^Logging cannot be toggled here: the UniFi controller returned this policy without an id/
+
 describe('FirewallRules id-less policies', () => {
-  beforeEach(() => mockFetch.mockReset())
+  let consoleError
+  beforeEach(() => {
+    mockFetch.mockReset()
+    consoleError = vi.spyOn(console, 'error')
+  })
+  afterEach(() => {
+    // Id-less rows must get stable keys: no React "unique key" warning.
+    // Unmount and restore first so a failure here cannot leak into the next test.
+    cleanup()
+    const keyWarnings = consoleError.mock.calls.filter(args => String(args[0]).includes('unique "key"'))
+    consoleError.mockRestore()
+    expect(keyWarnings).toEqual([])
+  })
 
   it('shows one singular notice with the docs link and disables only the id-less toggle', async () => {
     mockFetch.mockResolvedValue(payload([
@@ -68,7 +82,7 @@ describe('FirewallRules id-less policies', () => {
     const toggles = screen.getAllByTestId('toggle')
     const disabled = toggles.filter(t => t.disabled)
     expect(disabled).toHaveLength(1)
-    expect(disabled[0].getAttribute('title')).toMatch(/^Logging cannot be toggled here: the UniFi controller returned this policy without an id/)
+    expect(disabled[0].getAttribute('title')).toMatch(IDLESS_TITLE)
   })
 
   it('pluralises the notice', async () => {

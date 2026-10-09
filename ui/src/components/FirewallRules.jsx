@@ -973,7 +973,7 @@ export default function FirewallRules() {
                 const p = group.policies[0]
                 return (
                   <PolicyRow
-                    key={p.id}
+                    key={p.id || `idless-${group.name}-0`}
                     policy={p}
                     zoneMap={zoneMap}
                     onToggle={handleToggle}
@@ -991,9 +991,9 @@ export default function FirewallRules() {
                     onToggleExpand={toggleGroup}
                     toggling={toggling}
                   />
-                  {expanded && group.policies.map(p => (
+                  {expanded && group.policies.map((p, i) => (
                     <PolicyRow
-                      key={p.id}
+                      key={p.id || `idless-${group.name}-${i}`}
                       policy={p}
                       zoneMap={zoneMap}
                       onToggle={handleToggle}
