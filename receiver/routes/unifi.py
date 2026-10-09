@@ -31,7 +31,8 @@ _ERR_POLICY_ID = "Invalid firewall policy id"
 # Integration API firewall policy ids are UUIDs. Anything else (notably the
 # literal "undefined" from id-less legacy policies, issue #112) is rejected
 # before it reaches the controller.
-_POLICY_ID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+# Always use fullmatch(): match() with a '$' anchor would accept a trailing newline.
+_POLICY_ID_RE = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 
 router = APIRouter()
 
@@ -305,7 +306,7 @@ def get_firewall_policies():
 @router.patch("/api/firewall/policies/{policy_id}")
 def patch_firewall_policy(policy_id: str, body: dict):
     """Update a single policy's loggingEnabled."""
-    if not _POLICY_ID_RE.match(policy_id):
+    if not _POLICY_ID_RE.fullmatch(policy_id):
         raise HTTPException(status_code=400, detail=_ERR_POLICY_ID)
     if not unifi_api.enabled:
         raise HTTPException(status_code=400, detail="UniFi API not configured")
@@ -356,7 +357,7 @@ def _partition_bulk_policies(body: dict) -> tuple[list, list]:
     valid, rejected = [], []
     for item in policies:
         pid = item.get('id') if isinstance(item, dict) else None
-        if isinstance(pid, str) and _POLICY_ID_RE.match(pid):
+        if isinstance(pid, str) and _POLICY_ID_RE.fullmatch(pid):
             valid.append(item)
         else:
             rejected.append({'id': pid, 'error': _ERR_POLICY_ID})

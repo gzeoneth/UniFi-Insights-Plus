@@ -187,6 +187,34 @@ class TestPolicyIdValidation:
         assert resp.json()['detail'] == 'Invalid firewall policy id'
         mock_deps.unifi_api.patch_firewall_policy.assert_not_called()
 
+    def test_patch_rejects_uuid_with_trailing_newline(self, unifi_client):
+        # re.match with a '$' anchor accepts "<uuid>\n"; fullmatch must not.
+        client, mock_deps = unifi_client
+        _enable_unifi_with_features(mock_deps)
+
+        resp = client.patch(f'/api/firewall/policies/{POLICY_ID}%0A', json={
+            'loggingEnabled': True, 'origin': 'USER_DEFINED',
+        })
+        assert resp.status_code == 400
+        mock_deps.unifi_api.patch_firewall_policy.assert_not_called()
+
+    def test_bulk_rejects_uuid_with_trailing_newline(self, unifi_client):
+        client, mock_deps = unifi_client
+        _enable_unifi_with_features(mock_deps)
+        mock_deps.unifi_api.bulk_patch_logging.return_value = {
+            'total': 1, 'success': 1, 'failed': 0, 'skipped': 0, 'retried': 0, 'errors': [],
+        }
+
+        resp = client.post('/api/firewall/policies/bulk-logging', json={'policies': [
+            {'id': POLICY_ID, 'loggingEnabled': True},
+            {'id': POLICY_ID_2 + '\n', 'loggingEnabled': True},
+        ]})
+        assert resp.status_code == 200
+        mock_deps.unifi_api.bulk_patch_logging.assert_called_once_with(
+            [{'id': POLICY_ID, 'loggingEnabled': True}])
+        assert resp.json()['failed'] == 1
+        assert resp.json()['errors'] == [{'id': POLICY_ID_2 + '\n', 'error': 'Invalid firewall policy id'}]
+
     def test_patch_accepts_uuid(self, unifi_client):
         client, mock_deps = unifi_client
         _enable_unifi_with_features(mock_deps)
