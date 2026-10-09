@@ -5,13 +5,19 @@
  * to avoid duplicating controllability checks and confirmation copy.
  */
 
-/** Whether a policy can have its logging toggled. */
-export function isControllablePolicy(policy) {
+/** Whether a policy shapes zone-pair posture: enabled and not a DERIVED auto-rule.
+ *  Id-less policies (#112) count here: they are real rules the gateway enforces. */
+export function isPostureCandidate(policy) {
   if (!policy) return false
-  if (!policy.id) return false // id-less legacy policy (#112): PATCH would target "undefined"
   if (policy.metadata?.origin === 'DERIVED') return false
   if (policy.enabled === false) return false
   return true
+}
+
+/** Whether a policy can have its logging toggled. Needs an id: without one the
+ *  PATCH would target "undefined" (#112). */
+export function isControllablePolicy(policy) {
+  return isPostureCandidate(policy) && !!policy.id
 }
 
 /** Warning text shared by both FirewallRules bulk confirm and LogDetail single confirm. */
