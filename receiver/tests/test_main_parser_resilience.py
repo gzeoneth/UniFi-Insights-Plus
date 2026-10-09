@@ -63,8 +63,9 @@ class TestHandleMessageResilience:
         # Must not raise.
         receiver._handle_message(data, ('1.2.3.4', 1234))
         # The malformed packet should be counted as 'failed' (parse_log
-        # returns None when the timestamp is unparseable).
-        assert receiver.stats['failed'] >= 1
+        # returns None when the timestamp is unparseable), not as an exception.
+        assert receiver.stats['failed'] == 1
+        assert receiver.stats['parse_exceptions'] == 0
 
     def test_parse_log_raising_is_swallowed(self, receiver, monkeypatch):
         # Defense-in-depth: even if parse_log itself raises an unexpected
@@ -134,8 +135,9 @@ class TestHandleMessageResilience:
         receiver._handle_message(good, ('gateway', 514))
 
         # The good packet should have been parsed and added to the batch.
-        assert receiver.stats['parsed'] >= 1
-        assert len(receiver.batch) >= 1
+        assert receiver.stats['failed'] == 1
+        assert receiver.stats['parsed'] == 1
+        assert len(receiver.batch) == 1
 
     def test_heartbeat_includes_exception_counters(self, receiver, caplog):
         import logging
