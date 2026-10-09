@@ -115,7 +115,8 @@ class TestHandleMessageResilience:
         monkeypatch.setattr(main_module, 'parse_log',
                             MagicMock(side_effect=RuntimeError("boom")))
         clock = [1000.0]
-        monkeypatch.setattr(log_utils.time, 'monotonic', lambda: clock[0])
+        from types import SimpleNamespace
+        monkeypatch.setattr(log_utils, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
 
         def _warnings():
             return [r for r in caplog.records

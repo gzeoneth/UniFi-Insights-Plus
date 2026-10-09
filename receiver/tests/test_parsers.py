@@ -583,16 +583,30 @@ class TestParseLog:
 class TestInvalidFieldWarnings:
     PREFIX = 'Feb  8 16:43:49 UDR-UK kernel: [WAN_IN-B-4000000003-D]IN=ppp0 OUT=br20 '
 
+    @pytest.fixture(autouse=True, params=['tzdata', 'no-tzdata'])
+    def _tz(self, request, monkeypatch):
+        """Run every case with and without tzdata. Without it, ZoneInfo('UTC')
+        raises and parsers logs its own "Invalid TZ" warning on every call,
+        which must not be mistaken for the invalid-field warning."""
+        monkeypatch.setenv('TZ', 'UTC')
+        if request.param == 'no-tzdata':
+            from zoneinfo import ZoneInfoNotFoundError
+
+            def _no_tzdata(name):
+                raise ZoneInfoNotFoundError(name)
+            monkeypatch.setattr(parsers, 'ZoneInfo', _no_tzdata)
+
     @staticmethod
-    def _warnings(caplog):
-        return [r for r in caplog.records if r.name == 'parsers' and r.levelname == 'WARNING']
+    def _warnings(caplog, text):
+        return [r for r in caplog.records
+                if r.name == 'parsers' and r.levelname == 'WARNING' and text in r.getMessage()]
 
     def test_invalid_src_flood_logs_one_escaped_line(self, monkeypatch, caplog):
         import logging
+        from types import SimpleNamespace
         import log_utils
-        monkeypatch.setenv('TZ', 'UTC')
         clock = [500.0]
-        monkeypatch.setattr(log_utils.time, 'monotonic', lambda: clock[0])
+        monkeypatch.setattr(log_utils, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
         # A trailing "\n" still matches the header regex and stays in raw_log.
         line = self.PREFIX + 'SRC=999.1.1.1 DST=10.0.20.100 PROTO=TCP SPT=54321 DPT=443\n'
 
@@ -602,16 +616,14 @@ class TestInvalidFieldWarnings:
                 r = parse_log(line)
                 assert r['src_ip'] is None
 
-        warnings = self._warnings(caplog)
+        warnings = self._warnings(caplog, 'Invalid src_ip')
         assert len(warnings) == 1
         msg = warnings[0].getMessage()
-        assert 'Invalid src_ip' in msg
         assert '\n' not in msg   # cannot forge an extra log line
         assert r'\n' in msg      # the newline is shown escaped (repr)
 
     def test_invalid_mac_is_rate_limited_and_escaped(self, monkeypatch, caplog):
         import logging
-        monkeypatch.setenv('TZ', 'UTC')
         monkeypatch.setattr(parsers, 'MAC_RE', parsers.re.compile(r'(?!)'))  # reject every MAC
         line = (self.PREFIX + 'MAC=aa:bb:cc:dd:ee:ff:11:22:33:44:55:66:08:00 '
                 'SRC=203.0.113.5 DST=10.0.20.100 PROTO=TCP SPT=54321 DPT=443\n')
@@ -621,8 +633,6 @@ class TestInvalidFieldWarnings:
                 r = parse_log(line)
                 assert r['mac_address'] is None
 
-        warnings = self._warnings(caplog)
+        warnings = self._warnings(caplog, 'Invalid mac_address')
         assert len(warnings) == 1
-        msg = warnings[0].getMessage()
-        assert 'Invalid mac_address' in msg
-        assert '\n' not in msg
+        assert '\n' not in warnings[0].getMessage()
