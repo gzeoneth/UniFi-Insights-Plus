@@ -550,7 +550,7 @@ def _tool_set_firewall_syslog(args: dict) -> dict:
         if not policy:
             errors.append({'id': policy_id, 'error': 'Unknown policy id'})
             continue
-        if policy and policy.get('origin') == 'DERIVED':
+        if policy.get('metadata', {}).get('origin', '') == 'DERIVED':
             errors.append({'id': policy_id, 'error': 'Derived policy cannot be modified'})
             continue
         cleaned.append({'id': policy_id, 'loggingEnabled': logging_enabled})
