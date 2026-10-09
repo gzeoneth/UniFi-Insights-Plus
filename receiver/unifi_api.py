@@ -931,7 +931,8 @@ class UniFiAPI:
         failed = 0
         skipped = 0
         retried = 0
-        errors = []
+        errors = []               # per-policy patch failures, capped at 20 in the result
+        verification_errors = []  # at most one entry, always kept after the cap
 
         # Filter out items with no loggingEnabled value
         work_items = []
@@ -990,13 +991,13 @@ class UniFiAPI:
                                    len(mismatched), success)
                     failed += len(mismatched)
                     success = max(0, success - len(mismatched))
-                    errors.append({
+                    verification_errors.append({
                         'verification': f'{len(mismatched)} policies did not reflect the requested state',
                         'ids': mismatched[:20],
                     })
             except Exception as e:
                 logger.warning("Bulk patch: verification failed: %s", e)
-                errors.append({'verification': f'Could not verify: {e}'})
+                verification_errors.append({'verification': f'Could not verify: {e}'})
 
         logger.info("Bulk patch complete: %d total, %d success, %d failed, %d skipped, %d retried, %d mismatched",
                      total, success, failed, skipped, retried, len(mismatched))
@@ -1007,7 +1008,7 @@ class UniFiAPI:
             'failed': failed,
             'skipped': skipped,
             'retried': retried,
-            'errors': errors[:20],
+            'errors': errors[:20] + verification_errors,
         }
 
     # ── Phase 2: Client/Device Polling ───────────────────────────────────────

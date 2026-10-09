@@ -352,6 +352,28 @@ class TestBulkPatchLogging:
         assert result['success'] == 2
         assert result['retried'] == 2  # each policy retried once
 
+    def test_verification_entry_survives_error_cap(self, api):
+        """25 patch failures fill the 20-entry cap; the verification entry is kept after it."""
+        def mock_patch(pid, val):
+            if pid.startswith('bad'):
+                raise _make_http_error(500, 'server error')
+            return {}
+
+        api.patch_firewall_policy = mock_patch
+        # 'ok' patched "successfully" but the controller still reports the old state
+        api.get_firewall_policies = MagicMock(return_value=[{'id': 'ok', 'loggingEnabled': False}])
+
+        updates = [{'id': f'bad{i}', 'loggingEnabled': True} for i in range(25)]
+        updates.append({'id': 'ok', 'loggingEnabled': True})
+        result = api.bulk_patch_logging(updates)
+
+        assert result['failed'] == 26
+        assert result['success'] == 0
+        assert len(result['errors']) == 21
+        assert all('id' in e and 'error' in e for e in result['errors'][:20])
+        assert result['errors'][20]['verification'] == '1 policies did not reflect the requested state'
+        assert result['errors'][20]['ids'] == ['ok']
+
     def test_verification_ignores_idless_policies(self, api):
         """An id-less policy in the verification fetch (#112) must not abort verification."""
         api.patch_firewall_policy = MagicMock(return_value={})
