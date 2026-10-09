@@ -4,8 +4,7 @@ Welcome to the UniFi Log Insight wiki. These guides cover advanced topics beyond
 
 ## Prerequisites: gateway syslog on UniFi Network 10.x
 
-<!-- toggle names to be verified by the owner on a Network 10.x controller -->
-> **UniFi Network 10.x: enable SIEM-mode activity logging.** The gateway only emits the firewall and system syslog that Insights Plus parses when **Activity Logging** is set to **SIEM Server** (pointed at the Docker host, UDP port 514) with **Devices: Gateway** and **System Log: Firewall Default Policy** enabled. These settings live under **Settings > Integrations > Syslog** (`https://<controller-hostname-or-ip>/network/default/integrations/syslog`). If Insights Plus shows raw packet counts but nothing parses, disable SIEM, reboot the gateway, re-enable it, and re-check those two toggles.
+> **UniFi Network 10.x: enable SIEM-mode activity logging.** Open **Settings > Integrations > Syslog** in the UniFi Network controller (on the default site: `https://<controller-hostname-or-ip>/network/default/integrations/syslog`; multi-site controllers use their own site id in place of `default`). Under **Activity Logging** choose **SIEM Server** and point it at the Insights Plus host, UDP port 514. Then select the log categories to forward. As of UniFi Network 10.6.106 they are **Client**, **Security Detections**, **VPN** and **Firewall Default Policy** (older 10.x builds may label them differently). Insights Plus needs **Firewall Default Policy** for firewall logs; the other categories are optional and forward those event types as well. If Insights Plus shows raw packet counts but nothing parses, disable SIEM, reboot the gateway, re-enable it, and re-check the categories.
 
 See the [README prerequisites](https://github.com/jmasarweh/UniFi-Insights-Plus#-prerequisites) for the full list.
 
