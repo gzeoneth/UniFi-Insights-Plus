@@ -929,7 +929,7 @@ export default function FirewallRules() {
             {idlessCount === 1
               ? '1 firewall policy was returned by the UniFi controller without an id and cannot be toggled from Insights Plus. It still counts toward the zone matrix.'
               : `${idlessCount} firewall policies were returned by the UniFi controller without an id and cannot be toggled from Insights Plus. They still count toward the zone matrix.`}{' '}
-            <a href={IDLESS_DOCS_URL} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 underline text-yellow-300 hover:text-yellow-200">
+            <a href={IDLESS_DOCS_URL} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 underline text-yellow-300 hover:text-yellow-200 transition-colors">
               Learn why and how to fix it
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" /></svg>
             </a>
