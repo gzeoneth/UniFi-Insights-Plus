@@ -85,8 +85,9 @@ class BackfillTask:
         """Pull due IPs from the backfill queue, look them up, patch logs."""
         from db import get_wan_ips_from_config
 
-        # Check the budget before pulling, so an exhausted quota never
-        # touches threat_backfill_queue (#103).
+        # Check the budget before the queue pull, so an exhausted quota skips
+        # the FOR UPDATE SKIP LOCKED read (#103). Queue inserts from
+        # _orphan_queue_seed() earlier in the cycle are not budget-gated.
         budget = self.abuseipdb.remaining_budget
         # Bootstrap rule: when rate-limit state is unknown (startup),
         # remaining_budget returns 0 but _check_rate_limit allows one call.
