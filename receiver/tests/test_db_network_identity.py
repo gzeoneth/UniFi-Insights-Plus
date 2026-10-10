@@ -3,15 +3,16 @@
 Covers:
 - extract_network_identity_from_net_config()
 - Database.persist_network_identity()
-- Database.get_wan_ips_by_interface() / detect_gateway_ips() query window
+- recent_firewall_cutoff() and the windowed detection/candidate queries
 - Database.detect_wan_ip() / detect_gateway_ips() merge persistence (#103)
 """
 
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
 
-from db import Database
+from db import Database, recent_firewall_cutoff
 from unifi_api import UniFiAPI
 
 
@@ -171,18 +172,27 @@ class TestPersistNetworkIdentity:
 
 # ── Log-based detection (issue #103) ────────────────────────────────────────
 
-def _config_db(config, rows=()):
+CUTOFF = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)
+
+
+def _sql(text):
+    return ' '.join(text.split())
+
+
+def _config_db(config, rows=(), cutoff=CUTOFF):
     """MagicMock Database backed by a config dict; set_config writes through.
 
-    `rows` is what the detection query's cursor returns from fetchall().
+    The cursor's fetchone() answers the cutoff query (no row when `cutoff`
+    is None, like the HAVING clause on an empty table); fetchall() returns
+    `rows` for the detection query.
     """
     db = MagicMock()
-    # SQL fragments are class attributes read through `self`
-    db._RECENT_FIREWALL_CTE = Database._RECENT_FIREWALL_CTE
+    # SQL fragment is a class attribute read through `self`
     db._PRIVATE_IP_FILTER = Database._PRIVATE_IP_FILTER
     db.get_config.side_effect = lambda key, default=None: config.get(key, default)
     db.set_config.side_effect = config.__setitem__
     cur = MagicMock()
+    cur.fetchone.return_value = (cutoff,) if cutoff is not None else None
     cur.fetchall.return_value = list(rows)
     conn = db.get_conn.return_value.__enter__.return_value
     conn.cursor.return_value.__enter__.return_value = cur
@@ -193,24 +203,85 @@ def _keys_written(db):
     return [c.args[0] for c in db.set_config.call_args_list]
 
 
-class TestDetectionQueryWindow:
-    """Detection queries are bounded to 7 days before the newest firewall row."""
+class TestRecentFirewallCutoff:
+    """recent_firewall_cutoff(): 7 days before the newest firewall row, capped at NOW()."""
 
-    def test_wan_query_is_windowed(self):
+    def test_cutoff_query_caps_newest_row_at_now(self):
+        cur = MagicMock()
+        cur.fetchone.return_value = (CUTOFF,)
+        assert recent_firewall_cutoff(cur) == CUTOFF
+        sql = _sql(cur.execute.call_args.args[0])
+        assert 'LEAST(MAX(timestamp), NOW())' in sql
+        assert "INTERVAL '7 days'" in sql
+        assert "log_type = 'firewall'" in sql
+
+    def test_none_without_firewall_rows(self):
+        cur = MagicMock()
+        cur.fetchone.return_value = None
+        assert recent_firewall_cutoff(cur) is None
+
+
+class TestDetectionQueryWindow:
+    """Detection queries bind the cutoff as a parameter so the planner can use
+    idx_logs_type_time, and observe nothing when there is no cutoff."""
+
+    def test_wan_query_binds_cutoff(self):
         db, cur = _config_db({}, rows=[('eth8', '1.1.1.1')])
         assert Database.get_wan_ips_by_interface(db, ['eth8', 'eth9']) == {'eth8': '1.1.1.1'}
-        sql, params = cur.execute.call_args.args
-        assert 'MAX(timestamp)' in sql
-        assert "INTERVAL '7 days'" in sql
+        assert 'LEAST(MAX(timestamp), NOW())' in _sql(cur.execute.call_args_list[0].args[0])
+        sql, params = cur.execute.call_args_list[1].args
+        assert 'timestamp >= %s' in _sql(sql)
         assert 'host(dst_ip)' in sql
-        assert params == ['eth8', 'eth9']
+        assert params == [CUTOFF, 'eth8', 'eth9']
 
-    def test_gateway_query_is_windowed(self):
+    def test_wan_query_skipped_without_cutoff(self):
+        db, cur = _config_db({}, cutoff=None)
+        assert Database.get_wan_ips_by_interface(db, ['eth8']) == {}
+        assert cur.execute.call_count == 1  # cutoff lookup only
+
+    def test_detect_wan_ip_persists_nothing_without_cutoff(self):
+        config = {
+            'wan_interfaces': ['eth8'],
+            'wan_ip_by_iface': {'eth8': '1.1.1.1'},
+            'wan_ips': ['1.1.1.1'],
+            'wan_ip': '1.1.1.1',
+        }
+        db, _ = _config_db(config, cutoff=None)
+        db.get_wan_ips_by_interface.side_effect = (
+            lambda ifaces: Database.get_wan_ips_by_interface(db, ifaces))
+        assert Database.detect_wan_ip(db) == '1.1.1.1'
+        db.set_config.assert_not_called()
+
+    def test_gateway_query_binds_cutoff(self):
         db, cur = _config_db({'gateway_ips': []}, rows=[('192.168.1.1',)])
-        Database.detect_gateway_ips(db)
-        sql = cur.execute.call_args.args[0]
-        assert 'MAX(timestamp)' in sql
-        assert "INTERVAL '7 days'" in sql
+        assert Database.detect_gateway_ips(db) == ['192.168.1.1']
+        assert 'LEAST(MAX(timestamp), NOW())' in _sql(cur.execute.call_args_list[0].args[0])
+        sql, params = cur.execute.call_args_list[1].args
+        assert 'timestamp >= %s' in _sql(sql)
+        assert params == [CUTOFF]
+
+    def test_gateway_persists_nothing_without_cutoff(self):
+        config = {'gateway_ips': ['10.0.0.1']}
+        db, cur = _config_db(config, cutoff=None)
+        assert Database.detect_gateway_ips(db) == ['10.0.0.1']
+        assert cur.execute.call_count == 1
+        db.set_config.assert_not_called()
+
+    def test_candidates_query_binds_cutoff(self):
+        db, cur = _config_db({}, rows=[('eth8', 12, '1.1.1.1'), ('eth9', 3, None)])
+        assert Database.get_wan_ip_candidates(db) == [
+            {'interface': 'eth8', 'event_count': 12, 'wan_ip': '1.1.1.1'},
+            {'interface': 'eth9', 'event_count': 3, 'wan_ip': ''},
+        ]
+        assert 'LEAST(MAX(timestamp), NOW())' in _sql(cur.execute.call_args_list[0].args[0])
+        sql, params = cur.execute.call_args_list[1].args
+        assert 'timestamp >= %s' in _sql(sql)
+        assert params == [CUTOFF]
+
+    def test_candidates_empty_without_cutoff(self):
+        db, cur = _config_db({}, cutoff=None)
+        assert Database.get_wan_ip_candidates(db) == []
+        assert cur.execute.call_count == 1
 
 
 class TestDetectWanIpMerge:

@@ -166,6 +166,32 @@ LOGS_ROW_ESTIMATE_SQL = """
 """
 
 
+def recent_firewall_cutoff(cur):
+    """Lower time bound for log-based WAN/gateway detection (#103).
+
+    Returns 7 days before the newest firewall row, or None when there are no
+    firewall rows (HAVING drops the single aggregate row; LEAST() alone would
+    ignore the NULL MAX and return NOW()). Anchored on the newest row rather
+    than wall-clock time so a gateway that stopped sending still has a
+    window. LEAST(..., NOW()) caps the anchor so a single future-dated row
+    (gateway clock skew; retention never deletes it) cannot push the window
+    into the future and disable detection.
+
+    MAX() is an index-only edge lookup on idx_logs_type_time. Callers bind
+    the result as a parameter (`timestamp >= %s`): a literal bound lets the
+    planner range-scan the index, whereas a CTE/subquery bound is applied
+    as a join filter after scanning every firewall row.
+    """
+    cur.execute("""
+        SELECT LEAST(MAX(timestamp), NOW()) - INTERVAL '7 days'
+        FROM logs
+        WHERE log_type = 'firewall'
+        HAVING MAX(timestamp) IS NOT NULL
+    """)
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
 # ── Retention configuration — parsers and result types ───────────────────────
 
 def parse_retention_time(raw) -> str | None:
@@ -1921,41 +1947,32 @@ END $$;""",
           OR host(dst_ip) = '255.255.255.255')
     """
 
-    # Detection queries only look at firewall rows from the 7 days before the
-    # newest firewall row (not wall-clock time, so a gateway that stopped
-    # sending still has a window). MAX() and the range both use
-    # idx_logs_type_time instead of scanning every firewall row (#103).
-    # With no firewall rows the CTE yields NULL and the query returns nothing.
-    _RECENT_FIREWALL_CTE = """
-        WITH recent AS (
-            SELECT MAX(timestamp) AS t FROM logs WHERE log_type = 'firewall'
-        )
-    """
-
     def get_wan_ips_by_interface(self, interfaces: list) -> dict:
         """Detect WAN IP for each interface using the most common public dst_ip.
 
-        Only firewall rows in the recent window are considered (see
-        _RECENT_FIREWALL_CTE). Returns dict of {interface: wan_ip_str} for
-        each interface that has one.
+        Only firewall rows since recent_firewall_cutoff() are considered;
+        with no firewall rows nothing is observed. Returns dict of
+        {interface: wan_ip_str} for each interface that has one.
         """
         if not interfaces:
             return {}
         with self.get_conn() as conn:
             with conn.cursor() as cur:
+                cutoff = recent_firewall_cutoff(cur)
+                if cutoff is None:
+                    return {}
                 placeholders = ','.join(['%s'] * len(interfaces))
                 cur.execute(f"""
-                    {self._RECENT_FIREWALL_CTE}
                     SELECT interface_in AS iface,
                            MODE() WITHIN GROUP (ORDER BY host(dst_ip)) AS wan_ip
-                    FROM logs, recent
+                    FROM logs
                     WHERE log_type = 'firewall'
-                      AND timestamp >= recent.t - INTERVAL '7 days'
+                      AND timestamp >= %s
                       AND interface_in IN ({placeholders})
                       AND dst_ip IS NOT NULL
                       AND {self._PRIVATE_IP_FILTER}
                     GROUP BY interface_in
-                """, interfaces)
+                """, [cutoff, *interfaces])
                 return {row[0]: row[1] for row in cur.fetchall() if row[1]}
 
     def detect_wan_ip(self) -> str | None:
@@ -2026,7 +2043,7 @@ END $$;""",
         UniFi zone-based rules ending in '_LOCAL' target traffic destined for
         the gateway itself. The dst_ip on those rules (excluding broadcast/
         multicast) gives us the gateway's internal IP per VLAN. Only firewall
-        rows in the recent window are considered (see _RECENT_FIREWALL_CTE).
+        rows since recent_firewall_cutoff() are considered.
 
         Observed IPs are merged into the persisted 'gateway_ips' list
         (sorted union), written only when the union grows. Addresses are
@@ -2039,19 +2056,23 @@ END $$;""",
         """
         with self.get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(f"""
-                    {self._RECENT_FIREWALL_CTE}
-                    SELECT DISTINCT host(dst_ip) AS gateway_ip
-                    FROM logs, recent
-                    WHERE log_type = 'firewall'
-                      AND timestamp >= recent.t - INTERVAL '7 days'
-                      AND rule_name LIKE '%%\\_LOCAL%%'
-                      AND (dst_ip << '10.0.0.0/8' OR dst_ip << '172.16.0.0/12'
-                           OR dst_ip << '192.168.0.0/16'
-                           OR dst_ip << 'fc00::/7')
-                      AND host(dst_ip) NOT IN ('224.0.0.251', '255.255.255.255')
-                """)
-                detected = [row[0] for row in cur.fetchall()]
+                cutoff = recent_firewall_cutoff(cur)
+                if cutoff is None:
+                    detected = []
+                else:
+                    # Bound parameter: psycopg2 turns %% into % in the LIKE.
+                    cur.execute("""
+                        SELECT DISTINCT host(dst_ip) AS gateway_ip
+                        FROM logs
+                        WHERE log_type = 'firewall'
+                          AND timestamp >= %s
+                          AND rule_name LIKE '%%\\_LOCAL%%'
+                          AND (dst_ip << '10.0.0.0/8' OR dst_ip << '172.16.0.0/12'
+                               OR dst_ip << '192.168.0.0/16'
+                               OR dst_ip << 'fc00::/7')
+                          AND host(dst_ip) NOT IN ('224.0.0.251', '255.255.255.255')
+                    """, [cutoff])
+                    detected = [row[0] for row in cur.fetchall()]
 
         current = self.get_config('gateway_ips', []) or []
         merged = sorted(set(current) | set(detected))
@@ -2064,7 +2085,10 @@ END $$;""",
     def get_wan_ip_candidates(self) -> list[dict]:
         """Return non-bridge, non-VPN firewall interfaces with their WAN IPs.
 
-        Used by the setup wizard to discover candidate WAN interfaces.
+        Used by the setup wizard to discover candidate WAN interfaces. Only
+        firewall rows since recent_firewall_cutoff() are considered, so
+        event_count and wan_ip reflect the last 7 days of firewall logs;
+        with no firewall rows the list is empty.
 
         .. deprecated:: Phase 1 transition
             Retained for phase-1 transition only (log-detection wizard).
@@ -2076,6 +2100,10 @@ END $$;""",
         )
         with self.get_conn() as conn:
             with conn.cursor() as cur:
+                cutoff = recent_firewall_cutoff(cur)
+                if cutoff is None:
+                    return []
+                # Bound parameter: psycopg2 turns %% into % in the LIKEs.
                 cur.execute(f"""
                     SELECT
                         interface_in AS interface,
@@ -2085,12 +2113,13 @@ END $$;""",
                         ) AS wan_ip
                     FROM logs
                     WHERE log_type = 'firewall'
+                      AND timestamp >= %s
                       AND interface_in IS NOT NULL
                       AND interface_in NOT LIKE 'br%%'
                       {vpn_excludes}
                     GROUP BY interface_in
                     ORDER BY event_count DESC
-                """)
+                """, [cutoff])
                 return [
                     {'interface': r[0], 'event_count': int(r[1]), 'wan_ip': r[2] or ''}
                     for r in cur.fetchall()
