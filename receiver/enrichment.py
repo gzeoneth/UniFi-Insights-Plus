@@ -797,21 +797,38 @@ class Enricher:
         # Pre-load WAN/gateway exclusions and pihole config from DB so
         # background threads (backfill) have exclusions before the first
         # enrich() call
+        self._load_identity_exclusions()
         if db:
             try:
-                from db import get_config, get_wan_ips_from_config
-                for ip in get_wan_ips_from_config(db):
-                    self._excluded_ips.add(ip)
-                    self.abuseipdb.exclude_ip(ip)
-                for ip in get_config(db, 'gateway_ips') or []:
-                    self._excluded_ips.add(ip)
+                from db import get_config
                 value = get_config(db, 'pihole_enrichment', 'both')
                 self._pihole_enrichment = value if value in ('none', 'geoip', 'threat', 'both') else 'both'
             except Exception:
-                logger.debug("Failed to pre-load exclusions from DB", exc_info=True)
+                logger.debug("Failed to pre-load pihole_enrichment from DB", exc_info=True)
 
         # rDNS opt-out toggle: env > system_config > default(True)
         self._rdns_enabled = _resolve_rdns_enabled(db)
+
+    def _load_identity_exclusions(self):
+        """Add persisted WAN and gateway IPs to the exclusion sets (additive).
+
+        WAN IPs go to both this enricher's and the AbuseIPDB enricher's
+        exclusions; gateway IPs only to this enricher's. Called at init, when
+        enrich() sees a new WAN IP, and from reload_config(). No-op without a
+        db; DB errors are logged at debug and leave the sets unchanged.
+        """
+        if not self._db:
+            return
+        try:
+            from db import get_config, get_wan_ips_from_config
+            for ip in get_wan_ips_from_config(self._db):
+                self._excluded_ips.add(ip)
+                if ip not in self.abuseipdb._excluded_ips:
+                    self.abuseipdb.exclude_ip(ip)
+            for ip in get_config(self._db, 'gateway_ips') or []:
+                self._excluded_ips.add(ip)
+        except Exception:
+            logger.debug("Failed to load WAN/gateway exclusions from DB", exc_info=True)
 
     def _is_remote_ip(self, ip_str: str) -> bool:
         """Check if IP is remote (enrichable): public, not our WAN, not gateway."""
@@ -867,14 +884,7 @@ class Enricher:
             self._excluded_ips.add(wan_ip)
             self.abuseipdb.exclude_ip(wan_ip)
             # Refresh full wan_ips + gateway_ips from DB
-            if self._db:
-                from db import get_config, get_wan_ips_from_config
-                for ip in get_wan_ips_from_config(self._db):
-                    self._excluded_ips.add(ip)
-                    if ip not in self.abuseipdb._excluded_ips:
-                        self.abuseipdb.exclude_ip(ip)
-                for ip in get_config(self._db, 'gateway_ips') or []:
-                    self._excluded_ips.add(ip)
+            self._load_identity_exclusions()
 
         # Determine which IP to enrich — the remote party, not our infrastructure
         ip_to_enrich = None
@@ -1003,6 +1013,8 @@ class Enricher:
                 logger.debug("Failed to reload pihole_enrichment config", exc_info=True)
         # rDNS toggle reload — env stays authoritative on reload as well.
         self._rdns_enabled = _resolve_rdns_enabled(self._db)
+        # Pick up WAN/gateway identity learned since start (detection or UniFi)
+        self._load_identity_exclusions()
 
     def reload_geoip(self):
         """Reload GeoIP databases (called via SIGUSR1)."""

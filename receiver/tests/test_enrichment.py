@@ -952,6 +952,70 @@ class TestEnricherRdnsToggle:
 
 # ── Backfill toggle gate ─────────────────────────────────────────────────────
 
+class TestEnricherIdentityExclusions:
+    """WAN/gateway exclusions load at init, on a WAN IP change in enrich(),
+    and on reload_config() (#103: learned identity reaches the enricher)."""
+
+    @staticmethod
+    def _make(monkeypatch, config):
+        monkeypatch.setattr('enrichment.GeoIPEnricher', MagicMock)
+        abuse = MagicMock()
+        abuse._excluded_ips = set()
+        abuse.exclude_ip.side_effect = abuse._excluded_ips.add
+        monkeypatch.setattr('enrichment.AbuseIPDBEnricher', lambda **_kw: abuse)
+        db = None
+        if config is not None:
+            db = MagicMock()
+            db.get_config.side_effect = lambda key, default=None: config.get(key, default)
+        return Enricher(db=db), abuse
+
+    def test_init_preloads_exclusions(self, monkeypatch):
+        config = {'wan_interfaces': ['eth8'], 'wan_ip_by_iface': {'eth8': '1.1.1.1'},
+                  'gateway_ips': ['192.168.1.1']}
+        e, abuse = self._make(monkeypatch, config)
+        assert {'1.1.1.1', '192.168.1.1'} <= e._excluded_ips
+        assert abuse._excluded_ips == {'1.1.1.1'}
+
+    def test_reload_config_adds_learned_identity(self, monkeypatch):
+        config = {'wan_interfaces': ['eth8']}
+        e, abuse = self._make(monkeypatch, config)
+        assert e._excluded_ips == set()
+
+        config.update({
+            'wan_interfaces': ['eth8', 'eth9'],
+            'wan_ip_by_iface': {'eth8': '1.1.1.1', 'eth9': '2.2.2.2'},
+            'gateway_ips': ['192.168.1.1', '10.0.50.1'],
+        })
+        e.reload_config()
+
+        assert e._excluded_ips == {'1.1.1.1', '2.2.2.2', '192.168.1.1', '10.0.50.1'}
+        assert abuse._excluded_ips == {'1.1.1.1', '2.2.2.2'}
+
+    def test_reload_config_without_db_does_not_raise(self, monkeypatch):
+        e, abuse = self._make(monkeypatch, None)
+        e.reload_config()
+        assert e._excluded_ips == set()
+        assert abuse._excluded_ips == set()
+
+    def test_reload_config_survives_db_error(self, monkeypatch):
+        e, _ = self._make(monkeypatch, {})
+        e._db.get_config.side_effect = Exception('db down')
+        e.reload_config()  # must not raise
+
+    def test_wan_ip_change_in_enrich_loads_identity(self, monkeypatch):
+        config = {'wan_interfaces': ['eth8']}
+        e, abuse = self._make(monkeypatch, config)
+        e.geoip.lookup = MagicMock(return_value={})
+        e.rdns.lookup = MagicMock(return_value={})
+        config.update({'wan_ip_by_iface': {'eth8': '1.1.1.1'}, 'gateway_ips': ['192.168.1.1']})
+        monkeypatch.setattr('parsers._wan_ip', '1.1.1.1')
+
+        e.enrich({'log_type': 'dhcp'})
+
+        assert {'1.1.1.1', '192.168.1.1'} <= e._excluded_ips
+        assert abuse._excluded_ips == {'1.1.1.1'}
+
+
 class TestBackfillRdnsToggle:
     """Drive the actual BackfillTask._fix_wan_ip_enrichment loop and assert
     `RDNSEnricher.lookup` is gated by `enricher._rdns_enabled`. The earlier
