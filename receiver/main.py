@@ -418,11 +418,20 @@ def _reload_config(db: Database, unifi_api, pihole, enricher, receiver):
     removed interface does not trigger: pruning waits for the scheduled run.
     """
     old_unifi = bool(unifi_api.enabled)
-    parsers.reload_config_from_db(db)
-    unifi_api.reload_config()
-    pihole.reload_config()
-    enricher.reload_config()
-    receiver._load_disabled_types()
+    # Each step runs on its own: a transient DB error in one must not leave
+    # the others (or the scheduler follow-ups below) stale.
+    steps = (
+        ('parsers', lambda: parsers.reload_config_from_db(db)),
+        ('unifi_api', unifi_api.reload_config),
+        ('pihole', pihole.reload_config),
+        ('enricher', enricher.reload_config),
+        ('disabled log types', receiver._load_disabled_types),
+    )
+    for name, step in steps:
+        try:
+            step()
+        except Exception as e:
+            logger.error("Config reload step '%s' failed: %s", name, e)
     # scheduler thread will rebuild the retention job on its next tick
     _retention_reload_requested.set()
     if (bool(unifi_api.enabled) != old_unifi

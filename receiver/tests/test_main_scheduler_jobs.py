@@ -251,6 +251,23 @@ def test_unrelated_reload_does_not_request_identity_refresh(main_module, monkeyp
     assert main_module._retention_reload_requested.is_set()
 
 
+def test_reload_step_failure_does_not_skip_later_steps(main_module, monkeypatch):
+    """One failing step (transient DB error) must not leave the rest stale."""
+    parsers = SimpleNamespace(WAN_INTERFACES={'eth8'}, WAN_IP_BY_IFACE={'eth8': '1.1.1.1'})
+    parsers.reload_config_from_db = MagicMock(side_effect=Exception('db down'))
+    monkeypatch.setattr(main_module, 'parsers', parsers)
+    unifi_api, pihole, enricher, receiver = MagicMock(), MagicMock(), MagicMock(), MagicMock()
+    unifi_api.enabled = False
+
+    main_module._reload_config(MagicMock(), unifi_api, pihole, enricher, receiver)
+
+    unifi_api.reload_config.assert_called_once()
+    pihole.reload_config.assert_called_once()
+    enricher.reload_config.assert_called_once()
+    receiver._load_disabled_types.assert_called_once()
+    assert main_module._retention_reload_requested.is_set()
+
+
 def test_config_reload_signal_never_raises(main_module, monkeypatch, caplog):
     """A failing reload must not unwind into the receiver's recvfrom loop."""
     monkeypatch.setattr(main_module, '_reload_config',
