@@ -155,19 +155,31 @@ def test_tick_runs_identity_refresh_when_requested(main_module, monkeypatch):
     assert not main_module._identity_refresh_requested.is_set()
 
 
-def test_tick_survives_failing_identity_refresh(main_module, monkeypatch):
-    """A DB error in the refresh gate must not kill the scheduler loop."""
-    monkeypatch.setattr(main_module, '_refresh_network_identity_from_logs',
-                        MagicMock(side_effect=Exception('db down')))
+def _db_down():
+    db = MagicMock()
+    db.get_config.side_effect = Exception('db down')
+    return db
+
+
+def test_tick_survives_failing_identity_gate(main_module):
+    """A DB error in the UniFi gate must not kill the scheduler loop."""
     ran = MagicMock()
     schedule.every(1).seconds.do(ran)
     schedule.jobs[0].next_run = schedule.jobs[0].next_run.replace(year=2000)
 
     main_module._identity_refresh_requested.set()
-    main_module._scheduler_tick(MagicMock())
+    main_module._scheduler_tick(_db_down())
 
     ran.assert_called_once()
     assert not main_module._identity_refresh_requested.is_set()
+
+
+def test_scheduled_wan_refresh_survives_failing_identity_gate(main_module, monkeypatch):
+    """schedule.run_pending() does not catch job exceptions, so the job must not raise."""
+    db = _db_down()
+    _register_jobs(main_module, monkeypatch, db)
+    _job('refresh_wan_ip').job_func()  # must not raise
+    db.detect_wan_ip.assert_not_called()
 
 
 def test_tick_skips_identity_refresh_when_not_requested(main_module, monkeypatch):

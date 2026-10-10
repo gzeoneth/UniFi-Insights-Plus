@@ -304,8 +304,17 @@ def _use_log_identity_detection(db: Database) -> bool:
 
 
 def _refresh_network_identity_from_logs(db: Database):
-    """Run log-based WAN/gateway detection only when UniFi is not authoritative."""
-    if not _use_log_identity_detection(db):
+    """Run log-based WAN/gateway detection only when UniFi is not authoritative.
+
+    Never raises: it runs at startup, as a scheduled job (schedule.run_pending()
+    does not catch job exceptions, so one would end the scheduler thread) and
+    from the scheduler tick.
+    """
+    try:
+        if not _use_log_identity_detection(db):
+            return
+    except Exception as e:
+        logger.error("Network identity refresh skipped (UniFi gate check failed): %s", e)
         return
     try:
         db.detect_wan_ip()
@@ -376,10 +385,7 @@ def _scheduler_tick(db: Database):
         _register_retention_job(db)
     if _identity_refresh_requested.is_set():
         _identity_refresh_requested.clear()
-        try:
-            _refresh_network_identity_from_logs(db)
-        except Exception as e:  # the UniFi gate reads the DB outside its try
-            logger.error("Requested identity refresh failed: %s", e)
+        _refresh_network_identity_from_logs(db)
     schedule.run_pending()
 
 

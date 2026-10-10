@@ -70,6 +70,14 @@ class TestRefreshNetworkIdentityFromLogs:
         db.detect_wan_ip.assert_called_once()
         db.detect_gateway_ips.assert_called_once()
 
+    def test_gate_failure_does_not_propagate(self):
+        """unifi_enabled read failing (DB down) is logged, never raised."""
+        db = MagicMock()
+        db.get_config.side_effect = Exception("db down")
+        _refresh_network_identity_from_logs(db)
+        db.detect_wan_ip.assert_not_called()
+        db.detect_gateway_ips.assert_not_called()
+
     def test_gateway_still_runs_when_wan_detection_fails(self):
         db = MagicMock()
         db.get_config.return_value = False
