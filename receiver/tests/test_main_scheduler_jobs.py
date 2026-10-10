@@ -4,6 +4,9 @@ Covers:
 - log_stats only touches the database when DEBUG logging is enabled
 - the WAN/gateway refresh job runs on WAN_REFRESH_INTERVAL_MINUTES,
   independently of STATS_INTERVAL_MINUTES
+- a SIGUSR2 config reload requests an identity refresh (WAN set changed,
+  UniFi enabled flag changed, or no identity learned yet), and the
+  scheduler tick runs it on the scheduler thread
 """
 import logging
 import sys
@@ -128,3 +131,82 @@ def test_wan_refresh_interval_invalid_falls_back_with_warning(monkeypatch, caplo
     caplog.set_level(logging.WARNING)
     assert _import_main(monkeypatch, env_value).WAN_REFRESH_INTERVAL_MINUTES == 360
     assert len(_interval_warnings(caplog)) == 1
+
+
+# ── Identity refresh on config reload ───────────────────────────────────────
+
+def test_tick_runs_identity_refresh_when_requested(main_module, monkeypatch):
+    refresh = MagicMock()
+    monkeypatch.setattr(main_module, '_refresh_network_identity_from_logs', refresh)
+    db = MagicMock()
+
+    main_module._identity_refresh_requested.set()
+    main_module._scheduler_tick(db)
+
+    refresh.assert_called_once_with(db)
+    assert not main_module._identity_refresh_requested.is_set()
+
+
+def test_tick_survives_failing_identity_refresh(main_module, monkeypatch):
+    """A DB error in the refresh gate must not kill the scheduler loop."""
+    monkeypatch.setattr(main_module, '_refresh_network_identity_from_logs',
+                        MagicMock(side_effect=Exception('db down')))
+    ran = MagicMock()
+    schedule.every(1).seconds.do(ran)
+    schedule.jobs[0].next_run = schedule.jobs[0].next_run.replace(year=2000)
+
+    main_module._identity_refresh_requested.set()
+    main_module._scheduler_tick(MagicMock())
+
+    ran.assert_called_once()
+    assert not main_module._identity_refresh_requested.is_set()
+
+
+def test_tick_skips_identity_refresh_when_not_requested(main_module, monkeypatch):
+    refresh = MagicMock()
+    monkeypatch.setattr(main_module, '_refresh_network_identity_from_logs', refresh)
+
+    main_module._scheduler_tick(MagicMock())
+
+    refresh.assert_not_called()
+
+
+def _reload(main_module, monkeypatch, *, wan_before, wan_after,
+            unifi_before=False, unifi_after=False, wan_ip_by_iface=None):
+    """Run _reload_config() with parsers/unifi reloads that apply the 'after' state."""
+    parsers = SimpleNamespace(WAN_INTERFACES=set(wan_before))
+    parsers.reload_config_from_db = lambda _db: setattr(parsers, 'WAN_INTERFACES', set(wan_after))
+    monkeypatch.setattr(main_module, 'parsers', parsers)
+
+    unifi_api = MagicMock()
+    unifi_api.enabled = unifi_before
+    unifi_api.reload_config.side_effect = lambda: setattr(unifi_api, 'enabled', unifi_after)
+
+    db = MagicMock()
+    config = {'wan_ip_by_iface': wan_ip_by_iface}
+    db.get_config.side_effect = lambda key, default=None: config.get(key, default)
+
+    main_module._reload_config(db, unifi_api, MagicMock(), MagicMock(), MagicMock())
+    return main_module._identity_refresh_requested.is_set()
+
+
+def test_reload_requests_identity_refresh_when_wan_set_changes(main_module, monkeypatch):
+    assert _reload(main_module, monkeypatch, wan_before={'ppp0'}, wan_after={'eth8'},
+                   wan_ip_by_iface={'ppp0': '1.1.1.1'})
+
+
+def test_reload_requests_identity_refresh_when_unifi_flag_changes(main_module, monkeypatch):
+    assert _reload(main_module, monkeypatch, wan_before={'eth8'}, wan_after={'eth8'},
+                   unifi_before=True, unifi_after=False,
+                   wan_ip_by_iface={'eth8': '1.1.1.1'})
+
+
+def test_reload_requests_identity_refresh_when_identity_unknown(main_module, monkeypatch):
+    assert _reload(main_module, monkeypatch, wan_before={'eth8'}, wan_after={'eth8'},
+                   wan_ip_by_iface={})
+
+
+def test_unrelated_reload_does_not_request_identity_refresh(main_module, monkeypatch):
+    assert not _reload(main_module, monkeypatch, wan_before={'eth8'}, wan_after={'eth8'},
+                       wan_ip_by_iface={'eth8': '1.1.1.1'})
+    assert main_module._retention_reload_requested.is_set()

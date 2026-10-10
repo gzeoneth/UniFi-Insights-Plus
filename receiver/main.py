@@ -36,6 +36,12 @@ from routes.auth import auth_cleanup
 # All `schedule` registry mutation stays on the scheduler thread.
 _retention_reload_requested = threading.Event()
 
+# Set by the SIGUSR2 handler when log-based WAN/gateway identity should be
+# re-detected now rather than at the next WAN_REFRESH_INTERVAL_MINUTES run
+# (WAN set or UniFi flag changed, or identity never learned). Consumed by the
+# scheduler loop, so detection never runs inside the signal handler.
+_identity_refresh_requested = threading.Event()
+
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 SYSLOG_PORT = 514
@@ -354,11 +360,40 @@ def _scheduler_tick(db: Database):
     deterministically. Observes the retention-reload Event (set by the signal
     handler on another thread) and rebuilds the job before dispatching pending
     runs. All `schedule` registry mutation therefore stays on this thread.
+    Also runs a requested identity refresh (see _identity_refresh_requested).
     """
     if _retention_reload_requested.is_set():
         _retention_reload_requested.clear()
         _register_retention_job(db)
+    if _identity_refresh_requested.is_set():
+        _identity_refresh_requested.clear()
+        try:
+            _refresh_network_identity_from_logs(db)
+        except Exception as e:  # the UniFi gate reads the DB outside its try
+            logger.error("Requested identity refresh failed: %s", e)
     schedule.run_pending()
+
+
+def _reload_config(db: Database, unifi_api, pihole, enricher, receiver):
+    """Reload runtime config from the database (SIGUSR2 body, testable).
+
+    Requests the scheduler-thread follow-ups: the retention job rebuild
+    always, and an identity refresh when the WAN interface set or the UniFi
+    enabled flag changed, or when no wan_ip_by_iface has been learned yet.
+    """
+    old_wan = set(parsers.WAN_INTERFACES)
+    old_unifi = bool(unifi_api.enabled)
+    parsers.reload_config_from_db(db)
+    unifi_api.reload_config()
+    pihole.reload_config()
+    enricher.reload_config()
+    receiver._load_disabled_types()
+    # scheduler thread will rebuild the retention job on its next tick
+    _retention_reload_requested.set()
+    if (set(parsers.WAN_INTERFACES) != old_wan
+            or bool(unifi_api.enabled) != old_unifi
+            or not db.get_config('wan_ip_by_iface')):
+        _identity_refresh_requested.set()
 
 
 def run_scheduler(db: Database, enricher: Enricher, blacklist_fetcher: BlacklistFetcher = None):
@@ -495,13 +530,7 @@ def main():
     def reload_config(signum, frame):
         """Reload config from database when signaled by API process."""
         logger.info("Received SIGUSR2, reloading config from database...")
-        parsers.reload_config_from_db(db)
-        unifi_api.reload_config()
-        pihole.reload_config()
-        enricher.reload_config()
-        receiver._load_disabled_types()
-        # scheduler thread will rebuild the retention job on its next tick
-        _retention_reload_requested.set()
+        _reload_config(db, unifi_api, pihole, enricher, receiver)
 
         # Write timestamp to confirm reload completed
         try:
