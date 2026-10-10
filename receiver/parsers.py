@@ -565,21 +565,24 @@ def reload_config_from_db(db):
     global WAN_INTERFACES, INTERFACE_LABELS, _wan_ip, WAN_IPS, WAN_IP_BY_IFACE
     from db import get_config, get_wan_ips_from_config
 
-    wan_list = get_config(db, 'wan_interfaces', ['ppp0'])
-    WAN_INTERFACES = set(wan_list)
-    INTERFACE_LABELS = get_config(db, 'interface_labels', {})
-
-    # Populate WAN_IPS from wan_ip_by_iface (preferred) or legacy wan_ips
-    wan_ips_list = get_wan_ips_from_config(db)
-    WAN_IPS = set(wan_ips_list)
-
-    # Keep the authoritative wan_ip_by_iface map (gates WAN_LOCAL auto-learn
-    # and lets main.py see which configured interfaces have no learned IP)
-    WAN_IP_BY_IFACE = get_config(db, 'wan_ip_by_iface') or {}
-
+    # Read everything into locals first, then publish all globals together:
+    # main.py may run this on the scheduler thread while derive_direction()
+    # reads them on the receiver thread, so no reader should see a half-
+    # reloaded mix, and the published WAN_IPS set is never mutated in place.
+    wan_interfaces = set(get_config(db, 'wan_interfaces', ['ppp0']))
+    interface_labels = get_config(db, 'interface_labels', {})
+    # WAN_IPS from wan_ip_by_iface (preferred) or legacy wan_ips
+    wan_ips = set(get_wan_ips_from_config(db))
+    # Authoritative wan_ip_by_iface map (gates WAN_LOCAL auto-learn and lets
+    # main.py see which configured interfaces have no learned IP)
+    wan_ip_by_iface = get_config(db, 'wan_ip_by_iface') or {}
+    wan_ip = _wan_ip
     saved_wan_ip = get_config(db, 'wan_ip')
     if saved_wan_ip:
-        _wan_ip = saved_wan_ip
-        WAN_IPS.add(saved_wan_ip)
+        wan_ip = saved_wan_ip
+        wan_ips.add(saved_wan_ip)
+
+    (WAN_INTERFACES, INTERFACE_LABELS, WAN_IPS, WAN_IP_BY_IFACE, _wan_ip) = (
+        wan_interfaces, interface_labels, wan_ips, wan_ip_by_iface, wan_ip)
     logger.info("Config reloaded: WAN=%s, WAN_IPS=%s, Labels=%d",
                 WAN_INTERFACES, WAN_IPS, len(INTERFACE_LABELS))
