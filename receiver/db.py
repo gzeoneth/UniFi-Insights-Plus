@@ -2025,7 +2025,10 @@ END $$;""",
 
         if merged != current_map:
             self.set_config('wan_ip_by_iface', merged)
-            logger.info("wan_ip_by_iface merged from logs: %s", merged)
+            if iface_ips:
+                logger.info("wan_ip_by_iface merged from logs: %s", merged)
+            else:
+                logger.info("wan_ip_by_iface pruned (no observations in window): %s", merged)
 
         wan_ips = _ordered_wan_ips(merged, wan_interfaces)
         primary = wan_ips[0] if wan_ips else None

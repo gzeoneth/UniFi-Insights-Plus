@@ -7,6 +7,7 @@ Covers:
 - Database.detect_wan_ip() / detect_gateway_ips() merge persistence (#103)
 """
 
+import logging
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
@@ -368,6 +369,26 @@ class TestDetectWanIpMerge:
         assert config['wan_ip_by_iface'] == {'eth9': '2.2.2.2'}
         assert config['wan_ips'] == ['2.2.2.2']
         assert config['wan_ip'] == '2.2.2.2'
+
+    def test_prune_and_merge_log_lines(self, caplog):
+        """Prune-only runs must not claim anything was merged from logs."""
+        caplog.set_level(logging.INFO, logger='db')
+        config = {
+            'wan_interfaces': ['eth9'],
+            'wan_ip_by_iface': {'eth8': '1.1.1.1', 'eth9': '2.2.2.2'},
+        }
+        db, _ = _config_db(config)
+        db.get_wan_ips_by_interface.return_value = {}
+        Database.detect_wan_ip(db)
+        messages = [r.getMessage() for r in caplog.records]
+        assert "wan_ip_by_iface pruned (no observations in window): {'eth9': '2.2.2.2'}" in messages
+        assert not [m for m in messages if 'merged from logs' in m]
+
+        caplog.clear()
+        db.get_wan_ips_by_interface.return_value = {'eth9': '3.3.3.3'}
+        Database.detect_wan_ip(db)
+        assert "wan_ip_by_iface merged from logs: {'eth9': '3.3.3.3'}" in [
+            r.getMessage() for r in caplog.records]
 
     def test_prune_to_empty_is_deferred(self):
         """Every persisted interface removed and nothing observed: write nothing.
