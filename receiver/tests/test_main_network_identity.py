@@ -11,6 +11,7 @@ under test.
 """
 
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -39,53 +40,54 @@ for _mod in _stubs:
         sys.modules.pop(_mod, None)
 
 
+def _unifi(enabled):
+    return SimpleNamespace(enabled=enabled)
+
+
 class TestUseLogIdentityDetection:
+    """One source: the running integration's effective enabled flag (env
+    overrides, host and credentials included), not the raw DB flag."""
 
     def test_returns_true_when_unifi_disabled(self):
-        db = MagicMock()
-        db.get_config.return_value = False
-        assert _use_log_identity_detection(db) is True
+        assert _use_log_identity_detection(_unifi(False)) is True
 
     def test_returns_false_when_unifi_enabled(self):
-        db = MagicMock()
-        db.get_config.return_value = True
-        assert _use_log_identity_detection(db) is False
+        assert _use_log_identity_detection(_unifi(True)) is False
 
-    def test_returns_true_when_config_missing(self):
-        db = MagicMock()
-        db.get_config.return_value = None
-        assert _use_log_identity_detection(db) is True
+    def test_db_flag_is_not_consulted(self):
+        """unifi_enabled left on in the DB but the integration cannot poll."""
+        unifi_api = MagicMock()
+        unifi_api.enabled = False
+        unifi_api._db.get_config.return_value = True
+        assert _use_log_identity_detection(unifi_api) is True
 
 
 class TestRefreshNetworkIdentityFromLogs:
 
     def test_noop_when_unifi_enabled(self):
         db = MagicMock()
-        db.get_config.return_value = True
-        _refresh_network_identity_from_logs(db)
+        _refresh_network_identity_from_logs(db, _unifi(True))
         db.detect_wan_ip.assert_not_called()
         db.detect_gateway_ips.assert_not_called()
 
     def test_calls_detection_when_unifi_disabled(self):
         db = MagicMock()
-        db.get_config.return_value = False
-        _refresh_network_identity_from_logs(db)
+        _refresh_network_identity_from_logs(db, _unifi(False))
         db.detect_wan_ip.assert_called_once()
         db.detect_gateway_ips.assert_called_once()
 
-    def test_gate_failure_does_not_propagate(self):
-        """unifi_enabled read failing (DB down) is logged, never raised."""
+    def test_db_errors_do_not_propagate(self):
+        """Detector and config-read failures are logged, never raised."""
         db = MagicMock()
         db.get_config.side_effect = Exception("db down")
-        _refresh_network_identity_from_logs(db)
-        db.detect_wan_ip.assert_not_called()
-        db.detect_gateway_ips.assert_not_called()
+        db.detect_wan_ip.side_effect = Exception("db down")
+        db.detect_gateway_ips.side_effect = Exception("db down")
+        _refresh_network_identity_from_logs(db, _unifi(False))
 
     def test_gateway_still_runs_when_wan_detection_fails(self):
         db = MagicMock()
-        db.get_config.return_value = False
         db.detect_wan_ip.side_effect = Exception("WAN failed")
-        _refresh_network_identity_from_logs(db)
+        _refresh_network_identity_from_logs(db, _unifi(False))
         db.detect_gateway_ips.assert_called_once()
 
 
@@ -119,7 +121,7 @@ class TestRefreshReloadsLearnedIdentity:
         db = self._db({'wan_ip_by_iface': {'eth8': '1.1.1.1'}, 'gateway_ips': ['10.0.0.1']},
                       wan_after={'eth8': '2.2.2.2'})
         enricher = MagicMock()
-        _refresh_network_identity_from_logs(db, enricher)
+        _refresh_network_identity_from_logs(db, _unifi(False), enricher)
         parsers_mock.reload_config_from_db.assert_called_once_with(db)
         enricher.reload_config.assert_called_once()
 
@@ -127,19 +129,19 @@ class TestRefreshReloadsLearnedIdentity:
         db = self._db({'wan_ip_by_iface': {'eth8': '1.1.1.1'}, 'gateway_ips': ['10.0.0.1']},
                       gateways_after=['10.0.0.1', '10.0.50.1'])
         enricher = MagicMock()
-        _refresh_network_identity_from_logs(db, enricher)
+        _refresh_network_identity_from_logs(db, _unifi(False), enricher)
         parsers_mock.reload_config_from_db.assert_called_once_with(db)
         enricher.reload_config.assert_called_once()
 
     def test_unchanged_identity_reloads_nothing(self, parsers_mock):
         db = self._db({'wan_ip_by_iface': {'eth8': '1.1.1.1'}, 'gateway_ips': ['10.0.0.1']})
         enricher = MagicMock()
-        _refresh_network_identity_from_logs(db, enricher)
+        _refresh_network_identity_from_logs(db, _unifi(False), enricher)
         parsers_mock.reload_config_from_db.assert_not_called()
         enricher.reload_config.assert_not_called()
 
     def test_changed_identity_without_enricher_reloads_parsers(self, parsers_mock):
         """Startup passes no enricher (it is built later and preloads from the DB)."""
         db = self._db({}, wan_after={'eth8': '2.2.2.2'})
-        _refresh_network_identity_from_logs(db)
+        _refresh_network_identity_from_logs(db, _unifi(False))
         parsers_mock.reload_config_from_db.assert_called_once_with(db)

@@ -298,12 +298,18 @@ class SyslogReceiver:
 
 # ── Network identity gate ────────────────────────────────────────────────────
 
-def _use_log_identity_detection(db: Database) -> bool:
-    """Return True when log-based WAN/gateway detection should run."""
-    return not bool(db.get_config('unifi_enabled', False))
+def _use_log_identity_detection(unifi_api: UniFiAPI) -> bool:
+    """Return True when log-based WAN/gateway detection should run.
+
+    One source of truth: the integration's effective enabled flag (env
+    overrides, host and credentials included). UniFi is authoritative for
+    identity only when it can actually poll, not merely when the DB flag is on.
+    """
+    return not unifi_api.enabled
 
 
-def _refresh_network_identity_from_logs(db: Database, enricher: Enricher = None):
+def _refresh_network_identity_from_logs(db: Database, unifi_api: UniFiAPI,
+                                        enricher: Enricher = None):
     """Run log-based WAN/gateway detection only when UniFi is not authoritative.
 
     When the run changes the persisted wan_ip_by_iface or gateway_ips, the
@@ -316,7 +322,7 @@ def _refresh_network_identity_from_logs(db: Database, enricher: Enricher = None)
     from the scheduler tick.
     """
     try:
-        if not _use_log_identity_detection(db):
+        if not _use_log_identity_detection(unifi_api):
             return
         before = (db.get_config('wan_ip_by_iface'), db.get_config('gateway_ips'))
     except Exception as e:
@@ -387,7 +393,7 @@ def _register_retention_job(db: Database):
                 cfg.time, cfg.source)
 
 
-def _scheduler_tick(db: Database, enricher: Enricher = None):
+def _scheduler_tick(db: Database, unifi_api: UniFiAPI = None, enricher: Enricher = None):
     """One iteration of the scheduler loop — extracted so tests can run it
     deterministically. Observes the retention-reload Event (set by the signal
     handler on another thread) and rebuilds the job before dispatching pending
@@ -404,7 +410,7 @@ def _scheduler_tick(db: Database, enricher: Enricher = None):
             _retention_reload_requested.set()
     if _identity_refresh_requested.is_set():
         _identity_refresh_requested.clear()
-        _refresh_network_identity_from_logs(db, enricher)
+        _refresh_network_identity_from_logs(db, unifi_api, enricher)
     schedule.run_pending()
 
 
@@ -458,7 +464,8 @@ def _handle_config_reload_signal(db: Database, unifi_api, pihole, enricher, rece
         logger.exception("Config reload failed")
 
 
-def run_scheduler(db: Database, enricher: Enricher, blacklist_fetcher: BlacklistFetcher = None):
+def run_scheduler(db: Database, enricher: Enricher, unifi_api: UniFiAPI,
+                  blacklist_fetcher: BlacklistFetcher = None):
     """Background thread for scheduled tasks (retention cleanup, stats, blacklist)."""
 
     def log_stats():
@@ -481,7 +488,7 @@ def run_scheduler(db: Database, enricher: Enricher, blacklist_fetcher: Blacklist
                 logger.error("Blacklist pull failed: %s", e)
 
     def refresh_wan_ip():
-        _refresh_network_identity_from_logs(db, enricher)
+        _refresh_network_identity_from_logs(db, unifi_api, enricher)
 
     schedule.every(STATS_INTERVAL_MINUTES).minutes.do(log_stats)
     schedule.every(WAN_REFRESH_INTERVAL_MINUTES).minutes.do(refresh_wan_ip)
@@ -499,7 +506,7 @@ def run_scheduler(db: Database, enricher: Enricher, blacklist_fetcher: Blacklist
     pull_blacklist()
 
     while True:
-        _scheduler_tick(db, enricher)
+        _scheduler_tick(db, unifi_api, enricher)
         time.sleep(10)
 
 
@@ -543,18 +550,20 @@ def main():
     parsers.reload_config_from_db(db)
     logger.info("Loaded config: WAN interfaces = %s", parsers.WAN_INTERFACES)
 
+    # Initialize UniFi API client (self-disables when not configured). Built
+    # before the identity refresh, which gates on its effective enabled flag;
+    # construction only resolves config, polling starts further down.
+    unifi_api = UniFiAPI(db=db)
+
     # Detect and persist WAN IP + gateway IPs from existing log data
     # (skipped when UniFi API is authoritative — identity comes from poll)
-    _refresh_network_identity_from_logs(db)
+    _refresh_network_identity_from_logs(db, unifi_api)
 
     # Check config version for future migrations
     current_version = get_config(db, 'config_version', 0)
     if current_version < 1:
         # Future: handle config schema migrations
         pass
-
-    # Initialize UniFi API client (self-disables when not configured)
-    unifi_api = UniFiAPI(db=db)
 
     # Initialize Pi-hole poller
     pihole = PiHolePoller(db=db, enricher=None)  # enricher set after creation
@@ -595,7 +604,8 @@ def main():
 
     # Start scheduler in background thread
     blacklist_fetcher = BlacklistFetcher(db)
-    scheduler_thread = threading.Thread(target=run_scheduler, args=(db, enricher, blacklist_fetcher), daemon=True)
+    scheduler_thread = threading.Thread(target=run_scheduler,
+                                        args=(db, enricher, unifi_api, blacklist_fetcher), daemon=True)
     scheduler_thread.start()
 
     # Start backfill daemon (queue-driven threat enrichment every 5 min)

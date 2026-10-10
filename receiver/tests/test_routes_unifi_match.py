@@ -437,9 +437,11 @@ class TestSetupStatus:
 
 # ── Setup identity seeding ─────────────────────────────────────────────────
 
-def _setup_config(mock_db, *, unifi_enabled):
-    """get_config(db, key, default) backed by a small dict."""
-    config = {'wan_interfaces': ['ppp0'], 'unifi_enabled': unifi_enabled}
+def _setup_config(mock_db, mock_deps, *, unifi_enabled):
+    """Effective UniFi state on the API's unifi_api; the raw DB flag says the
+    opposite to prove it is not consulted."""
+    mock_deps.unifi_api.enabled = unifi_enabled
+    config = {'wan_interfaces': ['ppp0'], 'unifi_enabled': not unifi_enabled}
     mock_db.get_config.side_effect = lambda _db, key, default=None: config.get(key, default)
 
 
@@ -465,6 +467,7 @@ class TestSetupIdentitySeeding:
             })
 
         assert resp.status_code == 200
+        assert resp.json()['identity_source'] == 'unifi'
         mock_deps.enricher_db.persist_network_identity.assert_called_once()
 
     def test_log_detection_branch_merges_identity(self, setup_client):
@@ -474,7 +477,7 @@ class TestSetupIdentitySeeding:
         would drop a quiet WAN2 that detect_wan_ip()'s merge preserves.
         """
         client, mock_deps, mock_db = setup_client
-        _setup_config(mock_db, unifi_enabled=False)
+        _setup_config(mock_db, mock_deps, unifi_enabled=False)
         order = []
         mock_deps.enricher_db.detect_wan_ip.side_effect = lambda: order.append('wan')
         mock_deps.enricher_db.detect_gateway_ips.side_effect = lambda: order.append('gateway')
@@ -487,6 +490,7 @@ class TestSetupIdentitySeeding:
             })
 
         assert resp.status_code == 200
+        assert resp.json()['identity_source'] == 'logs'
         assert order == ['wan', 'gateway', 'signal']
         mock_deps.enricher_db.get_wan_ips_by_interface.assert_not_called()
         mock_deps.enricher_db.persist_network_identity.assert_not_called()
@@ -499,7 +503,7 @@ class TestSetupIdentitySeeding:
     def test_log_detection_failure_does_not_hard_fail(self, setup_client):
         """Detection is best-effort: one detector failing never blocks setup."""
         client, mock_deps, mock_db = setup_client
-        _setup_config(mock_db, unifi_enabled=False)
+        _setup_config(mock_db, mock_deps, unifi_enabled=False)
         mock_deps.enricher_db.detect_wan_ip.side_effect = Exception('db down')
 
         with patch('routes.setup.invalidate_fw_cache'):
@@ -515,7 +519,7 @@ class TestSetupIdentitySeeding:
     def test_log_detection_keeps_unifi_identity_authoritative(self, setup_client):
         """With UniFi enabled, log detection must not merge into UniFi-owned maps."""
         client, mock_deps, mock_db = setup_client
-        _setup_config(mock_db, unifi_enabled=True)
+        _setup_config(mock_db, mock_deps, unifi_enabled=True)
 
         with patch('routes.setup.invalidate_fw_cache'):
             resp = client.post('/api/setup/complete', json={
@@ -524,6 +528,7 @@ class TestSetupIdentitySeeding:
             })
 
         assert resp.status_code == 200
+        assert resp.json()['identity_source'] == 'unifi'
         mock_deps.enricher_db.detect_wan_ip.assert_not_called()
         mock_deps.enricher_db.detect_gateway_ips.assert_not_called()
         # unifi_enabled itself is left alone

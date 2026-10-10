@@ -248,8 +248,14 @@ def complete_setup(body: dict):
     wizard_path = body.get("wizard_path", "log_detection")
     set_config(enricher_db, "wizard_path", wizard_path)
 
+    # Where WAN/gateway identity comes from (reported so a skipped log
+    # detection is visible): the UniFi integration when it is effectively
+    # enabled, which is the same rule the receiver applies, otherwise logs.
+    identity_source = "unifi" if unifi_api.enabled else "logs"
+
     # Enable UniFi API if wizard used the API path, and seed identity
     if wizard_path == "unifi_api":
+        identity_source = "unifi"
         set_config(enricher_db, "unifi_enabled", True)
         unifi_api.reload_config()
         # Seed WAN/gateway identity from UniFi API (best-effort)
@@ -271,7 +277,7 @@ def complete_setup(body: dict):
         # saved above, and identity is persisted before signal_receiver() below.
         # Same gate as the receiver: with UniFi enabled its maps stay authoritative.
         # Phase-1 transition: removal target phase 2 log-detection decommission
-        if get_config(enricher_db, "unifi_enabled", False):
+        if identity_source == "unifi":
             logger.info("Setup: UniFi integration enabled — WAN/gateway identity "
                         "stays UniFi-authoritative, skipping log detection")
         else:
@@ -297,7 +303,7 @@ def complete_setup(body: dict):
     # Signal receiver process to reload config
     signal_receiver()
 
-    return {"success": True}
+    return {"success": True, "identity_source": identity_source}
 
 
 def _get_configured_interfaces(labels, wan_list, vpn_networks):
