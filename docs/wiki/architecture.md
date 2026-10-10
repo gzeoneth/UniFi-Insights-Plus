@@ -186,8 +186,8 @@ flowchart TD
 flowchart TD
     subgraph SCHEDULER["Scheduler Thread (run_scheduler)"]
         direction TB
-        S1["Every 15 min:<br>log_stats()<br>db.get_stats() + enricher.get_stats()"]
-        S2["Every 15 min:<br>refresh_wan_ip()<br>db.detect_wan_ip()<br>db.detect_gateway_ips()"]
+        S1["Every 15 min (DEBUG only):<br>log_stats()<br>db.get_stats() + enricher.get_stats()"]
+        S2["Every WAN_REFRESH_INTERVAL_MINUTES (6 h):<br>refresh_wan_ip(), UniFi disabled only<br>db.detect_wan_ip()<br>db.detect_gateway_ips()"]
         S3["Daily 03:00:<br>retention_cleanup()<br>Delete logs > 60d<br>Delete DNS > 10d"]
         S4["Daily 03:30:<br>auth_cleanup()<br>Clean audit_log"]
         S5["Daily 04:00:<br>pull_blacklist()<br>AbuseIPDB top 10k IPs"]
