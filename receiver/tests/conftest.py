@@ -36,3 +36,12 @@ def _reset_legacy_retention_time_warned():
         # db module not importable in this test env (e.g. route-only tests
         # that mock sys.modules['db']). Nothing to reset.
         pass
+
+
+@pytest.fixture(autouse=True)
+def _reset_log_rate_limits():
+    """Rate-limited warnings keep module-level state; isolate each test."""
+    import log_utils
+    log_utils.reset_rate_limits()
+    yield
+    log_utils.reset_rate_limits()

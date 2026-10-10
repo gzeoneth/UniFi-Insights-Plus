@@ -498,6 +498,9 @@ select:-webkit-autofill {
 [data-theme="light"] .text-yellow-400\/80 { color: #713f12; }
 [data-theme="light"] .text-yellow-400\/90 { color: #713f12; }
 [data-theme="light"] .text-yellow-500 { color: #5b2c0a; }
+/* Links inside yellow warning boxes (text-yellow-300 hover:text-yellow-200) */
+[data-theme="light"] .text-yellow-300 { color: #713f12; }
+[data-theme="light"] .hover\:text-yellow-200:hover { color: #422006; }
 
 /* Blue info boxes & badges */
 [data-theme="light"] .text-blue-400 { color: #1d4ed8; }

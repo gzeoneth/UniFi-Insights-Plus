@@ -28,8 +28,9 @@
 
   <rect x="540" y="460" width="280" height="120" rx="10" fill="#111827" stroke="#c9d1d9" stroke-width="2"/>
   <text x="560" y="490" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#e6edf3">Cron</text>
-  <text x="560" y="516" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#c9d1d9">geoip-update.sh (Wed/Sat 07:00 UTC)</text>
-  <text x="560" y="538" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#c9d1d9">Signals receiver to reload GeoIP</text>
+  <text x="560" y="516" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#c9d1d9">geoip-update.sh</text>
+  <text x="560" y="538" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#c9d1d9">Wed/Sat 07:00 container time</text>
+  <text x="560" y="560" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#c9d1d9">Signals receiver to reload GeoIP</text>
 
   <rect x="20" y="190" width="130" height="60" rx="8" fill="#111827" stroke="#c9d1d9" stroke-width="2"/>
   <text x="32" y="218" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#e6edf3">UDP 514</text>

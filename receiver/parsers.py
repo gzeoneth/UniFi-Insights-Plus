@@ -12,6 +12,7 @@ import logging
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+from log_utils import rate_limited_warning
 from services import get_service_name
 
 logger = logging.getLogger(__name__)
@@ -188,7 +189,7 @@ def _get_syslog_tz():
         return timezone.utc
 
 
-def parse_syslog_timestamp(month: str, day: str, time_str: str) -> datetime:
+def parse_syslog_timestamp(month: str, day: str, time_str: str) -> datetime | None:
     """Parse syslog timestamp. Syslog doesn't include year, so we use current year.
 
     Syslog RFC3164 timestamps carry no timezone — they are in the sender's
@@ -200,18 +201,24 @@ def parse_syslog_timestamp(month: str, day: str, time_str: str) -> datetime:
     A simple ``ts > now`` check is too aggressive — if the gateway clock is
     even a few seconds ahead of the container clock, same-day logs get stamped
     with the previous year.
+
+    Returns None when the components don't form a valid datetime — an attacker
+    on the LAN can send a syslog packet with ``Feb 99 99:99:99`` that passes
+    the header regex but fails ``datetime()`` construction, and an unhandled
+    ValueError here would crash the receiver thread.
     """
     local_tz = _get_syslog_tz()
     now = datetime.now(local_tz)
     month_num = MONTHS.get(month, 1)
-    h, m, s = time_str.split(':')
-    year = now.year
-    # Handle year rollover: only when the log month is far ahead of now
-    # (e.g. log says December but we're in January → previous year's December)
-    if month_num - now.month > 6:
-        year -= 1
-    ts = datetime(year, month_num, int(day), int(h), int(m), int(s), tzinfo=local_tz)
-    return ts.astimezone(timezone.utc)
+    try:
+        h, m, s = time_str.split(':')
+        year = now.year
+        if month_num - now.month > 6:
+            year -= 1
+        ts = datetime(year, month_num, int(day), int(h), int(m), int(s), tzinfo=local_tz)
+        return ts.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return None
 
 
 def derive_direction(iface_in: str, iface_out: str, rule_name: str, src_ip: str = None, dst_ip: str = None) -> str:
@@ -503,6 +510,8 @@ def parse_log(raw_log: str) -> dict | None:
         raw_log = stripped
 
     timestamp = parse_syslog_timestamp(m.group('month'), m.group('day'), m.group('time'))
+    if timestamp is None:
+        return None
     body = m.group('body')
 
     log_type = detect_log_type(body)
@@ -530,13 +539,17 @@ def parse_log(raw_log: str) -> dict | None:
             try:
                 ipaddress.ip_address(ip_val)
             except ValueError:
-                logger.warning("Invalid %s '%s' in log: %.300s", ip_field, ip_val, original_raw)
+                # Packet content is attacker-controlled: rate-limit, and use
+                # %r so embedded newlines cannot forge extra log lines.
+                rate_limited_warning(logger, f'parsers.invalid_{ip_field}',
+                                     "Invalid %s %.64r in log: %.300r", ip_field, ip_val, original_raw)
                 parsed[ip_field] = None
 
     # Validate MAC field — reject invalid macaddr values before DB insert
     mac_val = parsed.get('mac_address')
     if mac_val and not MAC_RE.fullmatch(mac_val):
-        logger.warning("Invalid mac_address '%s' in log: %.300s", mac_val, original_raw)
+        rate_limited_warning(logger, 'parsers.invalid_mac_address',
+                             "Invalid mac_address %.64r in log: %.300r", mac_val, original_raw)
         parsed['mac_address'] = None
 
     return parsed

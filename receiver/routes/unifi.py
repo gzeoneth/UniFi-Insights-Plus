@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 
 import requests as _requests
@@ -25,6 +26,13 @@ logger = logging.getLogger('api.unifi')
 _ERR_SSL = "SSL certificate verification failed. If using a self-signed certificate, enable 'Skip SSL verification' in UniFi settings."
 _ERR_CONNECTION = "Could not connect to the UniFi Controller. Check that the host is reachable and the URL is correct."
 _ERR_BULK = "Bulk update failed. One or more policies could not be processed. Check the container logs for details."
+_ERR_POLICY_ID = "Invalid firewall policy id"
+
+# Integration API firewall policy ids are UUIDs. Anything else (notably the
+# literal "undefined" from id-less legacy policies, issue #112) is rejected
+# before it reaches the controller.
+# Always use fullmatch(): match() with a '$' anchor would accept a trailing newline.
+_POLICY_ID_RE = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 
 router = APIRouter()
 
@@ -298,6 +306,8 @@ def get_firewall_policies():
 @router.patch("/api/firewall/policies/{policy_id}")
 def patch_firewall_policy(policy_id: str, body: dict):
     """Update a single policy's loggingEnabled."""
+    if not _POLICY_ID_RE.fullmatch(policy_id):
+        raise HTTPException(status_code=400, detail=_ERR_POLICY_ID)
     if not unifi_api.enabled:
         raise HTTPException(status_code=400, detail="UniFi API not configured")
     if not unifi_api.features.get('firewall_management', True):
@@ -335,6 +345,43 @@ def patch_firewall_policy(policy_id: str, body: dict):
         raise HTTPException(status_code=status, detail=msg) from e
 
 
+def _partition_bulk_policies(body: dict) -> tuple[list, list]:
+    """Split bulk items into (valid, rejected) by policy id shape.
+
+    Raises 400 when the list is missing, empty, or holds no valid id.
+    Rejected items become error entries reported as failed in the result.
+    """
+    policies = body.get('policies', [])
+    if not policies:
+        raise HTTPException(status_code=400, detail="policies list is required")
+    valid, rejected = [], []
+    for item in policies:
+        pid = item.get('id') if isinstance(item, dict) else None
+        if isinstance(pid, str) and _POLICY_ID_RE.fullmatch(pid):
+            valid.append(item)
+        else:
+            rejected.append({'id': pid, 'error': _ERR_POLICY_ID})
+    if not valid:
+        raise HTTPException(status_code=400, detail=_ERR_POLICY_ID)
+    if rejected:
+        logger.warning("Bulk firewall update: rejected %d policies with an invalid id", len(rejected))
+    return valid, rejected
+
+
+def _add_rejected(result: dict, rejected: list) -> dict:
+    """Count rejected (invalid-id) items as failed in a bulk_patch_logging result.
+
+    Rejected entries are appended after the controller errors, untruncated:
+    bulk_patch_logging already bounds its own list, and truncating here
+    could drop its trailing verification entry.
+    """
+    if rejected:
+        result['total'] = result.get('total', 0) + len(rejected)
+        result['failed'] = result.get('failed', 0) + len(rejected)
+        result['errors'] = (result.get('errors') or []) + rejected
+    return result
+
+
 @router.post("/api/firewall/policies/bulk-logging")
 def bulk_update_logging(body: dict):
     """Batch-update loggingEnabled for multiple policies."""
@@ -344,14 +391,12 @@ def bulk_update_logging(body: dict):
         raise HTTPException(status_code=400,
             detail="Firewall management requires a UniFi OS gateway (not available on self-hosted controllers)")
 
-    policies = body.get('policies', [])
-    if not policies:
-        raise HTTPException(status_code=400, detail="policies list is required")
+    policies, rejected = _partition_bulk_policies(body)
 
     try:
         result = unifi_api.bulk_patch_logging(policies)
         invalidate_fw_cache()
-        return result
+        return _add_rejected(result, rejected)
     except UniFiPermissionError as e:
         raise HTTPException(status_code=e.status_code, detail=str(e)) from e
     except Exception as e:
@@ -368,9 +413,7 @@ def bulk_update_logging_stream(body: dict):
         raise HTTPException(status_code=400,
             detail="Firewall management requires a UniFi OS gateway (not available on self-hosted controllers)")
 
-    policies = body.get('policies', [])
-    if not policies:
-        raise HTTPException(status_code=400, detail="policies list is required")
+    policies, rejected = _partition_bulk_policies(body)
 
     def _event_stream():
         q = queue.Queue()
@@ -383,7 +426,7 @@ def bulk_update_logging_stream(body: dict):
             try:
                 result = unifi_api.bulk_patch_logging(policies, progress_callback=on_progress)
                 invalidate_fw_cache()
-                q.put({'event': 'complete', **result})
+                q.put({'event': 'complete', **_add_rejected(result, rejected)})
             except UniFiPermissionError as e:
                 q.put({'event': 'error', 'detail': str(e)})
             except Exception as e:

@@ -5,13 +5,27 @@
  * to avoid duplicating controllability checks and confirmation copy.
  */
 
-/** Whether a policy can have its logging toggled. */
-export function isControllablePolicy(policy) {
+/** Whether a policy shapes zone-pair posture: enabled and not a DERIVED auto-rule.
+ *  Id-less policies (#112) count here: they are real rules the gateway enforces. */
+export function isPostureCandidate(policy) {
   if (!policy) return false
   if (policy.metadata?.origin === 'DERIVED') return false
   if (policy.enabled === false) return false
   return true
 }
+
+/** Whether a policy can have its logging toggled. Needs an id: without one the
+ *  PATCH would target "undefined" (#112). */
+export function isControllablePolicy(policy) {
+  return isPostureCandidate(policy) && !!policy.id
+}
+
+/** Troubleshooting page for policies the controller returns without an id (#112).
+ *  Linked from the FirewallRules notice and the LogDetail Rule Logging message. */
+export const IDLESS_DOCS_URL = 'https://insightsplus.dev/docs/troubleshooting#firewall-policies-without-an-id'
+
+/** Phrase in the backend's id-less match message that LogDetail renders as the docs link. */
+export const IDLESS_DOCS_LINK_TEXT = 'Troubleshooting on the docs site'
 
 /** Warning text shared by both FirewallRules bulk confirm and LogDetail single confirm. */
 export const SYSLOG_DELAY_WARNING =

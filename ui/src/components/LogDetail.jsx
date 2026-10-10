@@ -1,12 +1,35 @@
 import React, { useState, useEffect } from 'react'
 import { FlagIcon, getInterfaceName, decodeThreatCategories, isPrivateIP, formatServiceName, normalizeRuleDesc } from '../utils'
 import { getThreatLevel } from '../lib/threatPresentation'
-import { parseRuleName } from '../lib/firewallPolicyLogging'
+import { parseRuleName, IDLESS_DOCS_URL, IDLESS_DOCS_LINK_TEXT } from '../lib/firewallPolicyLogging'
 import { fetchAbuseIPDBStatus, enrichIP, matchFirewallPolicyForLog, patchFirewallPolicy } from '../api'
 import SyslogToggle from './SyslogToggle'
 import CopyButton from './CopyButton'
 
 const TEAL = 'text-teal-500 hover:text-teal-400'
+
+/** Rule Logging text for a log whose only matching policy has no id (#112):
+ *  policy name first, and the docs phrase in the backend message as a link. */
+export function IdlessPolicyMessage({ name, message }) {
+  const at = message.indexOf(IDLESS_DOCS_LINK_TEXT)
+  const link = (
+    <a href={IDLESS_DOCS_URL} target="_blank" rel="noopener noreferrer"
+      className="inline-flex items-center gap-1 text-blue-400 hover:text-blue-300 transition-colors">
+      {IDLESS_DOCS_LINK_TEXT}
+      <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+      </svg>
+    </a>
+  )
+  return (
+    <span className="text-sm text-gray-500">
+      {`Legacy rule${name ? ` ${name}` : ''}: `}
+      {at < 0
+        ? <>{message} {link}</>
+        : <>{message.slice(0, at)}{link}{message.slice(at + IDLESS_DOCS_LINK_TEXT.length)}</>}
+    </span>
+  )
+}
 
 export default function LogDetail({ log, hiddenColumns = new Set() }) {
   const [enriching, setEnriching] = useState(false)
@@ -306,7 +329,9 @@ export default function LogDetail({ log, hiddenColumns = new Set() }) {
                 <span className="text-sm text-yellow-400/80">{policyMatch.message}</span>
               )}
               {!policyLoading && policyMatch?.status === 'uncontrollable' && (
-                <span className="text-sm text-gray-500">{policyMatch.message}{policyMatch.policy?.name ? ` (${policyMatch.policy.name})` : ''}</span>
+                policyMatch.reason === 'no_id'
+                  ? <IdlessPolicyMessage name={policyMatch.policy?.name} message={policyMatch.message || ''} />
+                  : <span className="text-sm text-gray-500">{policyMatch.message}{policyMatch.policy?.name ? ` (${policyMatch.policy.name})` : ''}</span>
               )}
               {!policyLoading && policyMatch?.status === 'unsupported' && (
                 <span className="text-sm text-gray-500">{policyMatch.message}</span>

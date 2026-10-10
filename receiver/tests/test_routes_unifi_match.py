@@ -3,8 +3,10 @@
 Covers:
 - POST /api/firewall/policies/match-log disabled states
 - Cache invalidation on PATCH, setup complete, and VPN save
+- Policy id validation on PATCH and bulk routes (#112)
 """
 
+import json
 import sys
 from unittest.mock import MagicMock, patch
 
@@ -40,6 +42,10 @@ def _make_base_db_mock():
     mock_db.encrypt_api_key = MagicMock()
     mock_db.decrypt_api_key = MagicMock()
     return mock_db
+
+
+POLICY_ID = '11111111-2222-4333-8444-555555555555'
+POLICY_ID_2 = '66666666-7777-4888-9999-aaaaaaaaaaaa'
 
 
 def _enable_unifi_with_features(mock_deps, firewall_management=True):
@@ -159,11 +165,143 @@ class TestPermissionError:
         mock_deps.unifi_api.patch_firewall_policy.side_effect = \
             _UniFiPermissionError('Insufficient permissions', status_code=403)
 
-        resp = client.patch('/api/firewall/policies/p1', json={
+        resp = client.patch(f'/api/firewall/policies/{POLICY_ID}', json={
             'loggingEnabled': True, 'origin': 'USER_DEFINED',
         })
         assert resp.status_code == 403
         assert 'Insufficient permissions' in resp.json()['detail']
+
+
+# ── Policy id validation (#112) ──────────────────────────────────────────────
+
+class TestPolicyIdValidation:
+    @pytest.mark.parametrize('bad_id', ['undefined', 'null', 'p1', POLICY_ID + 'x'])
+    def test_patch_rejects_invalid_id(self, unifi_client, bad_id):
+        client, mock_deps = unifi_client
+        _enable_unifi_with_features(mock_deps)
+
+        resp = client.patch(f'/api/firewall/policies/{bad_id}', json={
+            'loggingEnabled': True, 'origin': 'USER_DEFINED',
+        })
+        assert resp.status_code == 400
+        assert resp.json()['detail'] == 'Invalid firewall policy id'
+        mock_deps.unifi_api.patch_firewall_policy.assert_not_called()
+
+    def test_patch_rejects_uuid_with_trailing_newline(self, unifi_client):
+        # re.match with a '$' anchor accepts "<uuid>\n"; fullmatch must not.
+        client, mock_deps = unifi_client
+        _enable_unifi_with_features(mock_deps)
+
+        resp = client.patch(f'/api/firewall/policies/{POLICY_ID}%0A', json={
+            'loggingEnabled': True, 'origin': 'USER_DEFINED',
+        })
+        assert resp.status_code == 400
+        mock_deps.unifi_api.patch_firewall_policy.assert_not_called()
+
+    def test_bulk_rejects_uuid_with_trailing_newline(self, unifi_client):
+        client, mock_deps = unifi_client
+        _enable_unifi_with_features(mock_deps)
+        mock_deps.unifi_api.bulk_patch_logging.return_value = {
+            'total': 1, 'success': 1, 'failed': 0, 'skipped': 0, 'retried': 0, 'errors': [],
+        }
+
+        resp = client.post('/api/firewall/policies/bulk-logging', json={'policies': [
+            {'id': POLICY_ID, 'loggingEnabled': True},
+            {'id': POLICY_ID_2 + '\n', 'loggingEnabled': True},
+        ]})
+        assert resp.status_code == 200
+        mock_deps.unifi_api.bulk_patch_logging.assert_called_once_with(
+            [{'id': POLICY_ID, 'loggingEnabled': True}])
+        assert resp.json()['failed'] == 1
+        assert resp.json()['errors'] == [{'id': POLICY_ID_2 + '\n', 'error': 'Invalid firewall policy id'}]
+
+    def test_bulk_rejected_ids_do_not_drop_controller_errors(self, unifi_client):
+        # 20 controller failures plus the verification entry must all survive
+        # alongside one rejected id; rejected entries are appended last.
+        client, mock_deps = unifi_client
+        _enable_unifi_with_features(mock_deps)
+        controller_errors = [{'id': f'c{i}', 'error': 'HTTP 500'} for i in range(20)]
+        verification = {'verification': '1 policies did not reflect the requested state', 'ids': ['x']}
+        mock_deps.unifi_api.bulk_patch_logging.return_value = {
+            'total': 21, 'success': 0, 'failed': 21, 'skipped': 0, 'retried': 0,
+            'errors': controller_errors + [verification],
+        }
+
+        resp = client.post('/api/firewall/policies/bulk-logging', json={'policies': [
+            {'id': POLICY_ID, 'loggingEnabled': True},
+            {'id': 'undefined', 'loggingEnabled': True},
+        ]})
+        assert resp.status_code == 200
+        errors = resp.json()['errors']
+        assert len(errors) == 22
+        assert errors[:21] == controller_errors + [verification]
+        assert errors[21] == {'id': 'undefined', 'error': 'Invalid firewall policy id'}
+        assert resp.json()['failed'] == 22
+        assert resp.json()['total'] == 22
+
+    def test_patch_accepts_uuid(self, unifi_client):
+        client, mock_deps = unifi_client
+        _enable_unifi_with_features(mock_deps)
+        mock_deps.unifi_api.patch_firewall_policy.return_value = {'id': POLICY_ID}
+
+        resp = client.patch(f'/api/firewall/policies/{POLICY_ID.upper()}', json={
+            'loggingEnabled': False, 'origin': 'USER_DEFINED',
+        })
+        assert resp.status_code == 200
+        mock_deps.unifi_api.patch_firewall_policy.assert_called_once_with(POLICY_ID.upper(), False)
+
+    def test_bulk_drops_invalid_ids_and_reports_them_failed(self, unifi_client):
+        client, mock_deps = unifi_client
+        _enable_unifi_with_features(mock_deps)
+        mock_deps.unifi_api.bulk_patch_logging.return_value = {
+            'total': 1, 'success': 1, 'failed': 0, 'skipped': 0, 'retried': 0, 'errors': [],
+        }
+
+        resp = client.post('/api/firewall/policies/bulk-logging', json={'policies': [
+            {'id': POLICY_ID, 'loggingEnabled': True},
+            {'id': 'undefined', 'loggingEnabled': True},
+            {'loggingEnabled': True},
+        ]})
+        assert resp.status_code == 200
+        mock_deps.unifi_api.bulk_patch_logging.assert_called_once_with(
+            [{'id': POLICY_ID, 'loggingEnabled': True}])
+        body = resp.json()
+        assert body['total'] == 3
+        assert body['success'] == 1
+        assert body['failed'] == 2
+        assert [e['id'] for e in body['errors']] == ['undefined', None]
+
+    def test_bulk_all_invalid_is_400(self, unifi_client):
+        client, mock_deps = unifi_client
+        _enable_unifi_with_features(mock_deps)
+
+        resp = client.post('/api/firewall/policies/bulk-logging', json={'policies': [
+            {'id': 'undefined', 'loggingEnabled': True},
+        ]})
+        assert resp.status_code == 400
+        mock_deps.unifi_api.bulk_patch_logging.assert_not_called()
+
+    def test_bulk_stream_reports_invalid_ids_failed(self, unifi_client):
+        client, mock_deps = unifi_client
+        _enable_unifi_with_features(mock_deps)
+        mock_deps.unifi_api.bulk_patch_logging.return_value = {
+            'total': 1, 'success': 1, 'failed': 0, 'skipped': 0, 'retried': 0, 'errors': [],
+        }
+
+        resp = client.post('/api/firewall/policies/bulk-logging-stream', json={'policies': [
+            {'id': POLICY_ID_2, 'loggingEnabled': False},
+            {'id': 'undefined', 'loggingEnabled': False},
+        ]})
+        assert resp.status_code == 200
+        events = [json.loads(line[len('data: '):])
+                  for line in resp.text.splitlines() if line.startswith('data: ')]
+        complete = [e for e in events if e['event'] == 'complete']
+        assert len(complete) == 1
+        assert complete[0]['total'] == 2
+        assert complete[0]['failed'] == 1
+        assert complete[0]['errors'][0]['id'] == 'undefined'
+        args, _ = mock_deps.unifi_api.bulk_patch_logging.call_args
+        assert args[0] == [{'id': POLICY_ID_2, 'loggingEnabled': False}]
 
 
 # ── Cache invalidation hooks ─────────────────────────────────────────────────
@@ -172,10 +310,10 @@ class TestCacheInvalidation:
     def test_patch_policy_invalidates_cache(self, unifi_client):
         client, mock_deps = unifi_client
         _enable_unifi_with_features(mock_deps)
-        mock_deps.unifi_api.patch_firewall_policy.return_value = {'id': 'p1'}
+        mock_deps.unifi_api.patch_firewall_policy.return_value = {'id': POLICY_ID}
 
         with patch('routes.unifi.invalidate_fw_cache') as mock_inv:
-            resp = client.patch('/api/firewall/policies/p1', json={
+            resp = client.patch(f'/api/firewall/policies/{POLICY_ID}', json={
                 'loggingEnabled': True, 'origin': 'USER_DEFINED',
             })
             assert resp.status_code == 200

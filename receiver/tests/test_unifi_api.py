@@ -351,3 +351,88 @@ class TestBulkPatchLogging:
 
         assert result['success'] == 2
         assert result['retried'] == 2  # each policy retried once
+
+    def test_verification_entry_survives_error_cap(self, api):
+        """25 patch failures fill the 20-entry cap; the verification entry is kept after it."""
+        def mock_patch(pid, val):
+            if pid.startswith('bad'):
+                raise _make_http_error(500, 'server error')
+            return {}
+
+        api.patch_firewall_policy = mock_patch
+        # 'ok' patched "successfully" but the controller still reports the old state
+        api.get_firewall_policies = MagicMock(return_value=[{'id': 'ok', 'loggingEnabled': False}])
+
+        updates = [{'id': f'bad{i}', 'loggingEnabled': True} for i in range(25)]
+        updates.append({'id': 'ok', 'loggingEnabled': True})
+        result = api.bulk_patch_logging(updates)
+
+        assert result['failed'] == 26
+        assert result['success'] == 0
+        assert len(result['errors']) == 21
+        assert all('id' in e and 'error' in e for e in result['errors'][:20])
+        assert result['errors'][20]['verification'] == '1 policies did not reflect the requested state'
+        assert result['errors'][20]['ids'] == ['ok']
+
+    def test_verification_ignores_idless_policies(self, api):
+        """An id-less policy in the verification fetch (#112) must not abort verification."""
+        api.patch_firewall_policy = MagicMock(return_value={})
+        api.get_firewall_policies = MagicMock(return_value=[
+            {'name': 'Legacy rule', 'loggingEnabled': False},
+            {'id': 'p1', 'loggingEnabled': True},
+        ])
+
+        result = api.bulk_patch_logging([{'id': 'p1', 'loggingEnabled': True}])
+
+        assert result['success'] == 1
+        assert result['failed'] == 0
+        assert result['errors'] == []
+
+
+# ── get_firewall_data: id-less policies (#112) ───────────────────────────────
+
+
+class TestGetFirewallDataIdless:
+    POLICIES = [
+        {'id': 'p1', 'name': 'Allow LAN', 'loggingEnabled': True},
+        {'name': 'Legacy rule', 'loggingEnabled': False},
+        {'id': '', 'name': 'Empty id', 'loggingEnabled': True},
+    ]
+
+    def _setup(self, api, policies):
+        api.get_firewall_policies = MagicMock(return_value=[dict(p) for p in policies])
+        api.get_firewall_zones = MagicMock(return_value=[])
+
+    def test_get_firewall_data_keeps_idless_policies(self, api, caplog):
+        """Option A (#112): id-less policies stay visible and are counted."""
+        self._setup(api, self.POLICIES)
+        with caplog.at_level('WARNING', logger='unifi_api'):
+            data = api.get_firewall_data()
+
+        assert [p.get('name') for p in data['policies']] == ['Allow LAN', 'Legacy rule', 'Empty id']
+        assert data['totalCount'] == 3
+        assert data['loggingEnabled'] == 2
+        assert data['loggingDisabled'] == 1
+        warnings = [r for r in caplog.records if 'without an id' in r.getMessage()]
+        assert len(warnings) == 1
+        assert '2 firewall policies' in warnings[0].getMessage()
+        assert 'hidden' not in warnings[0].getMessage()
+
+    def test_warns_once_per_distinct_idless_set(self, api, caplog):
+        self._setup(api, self.POLICIES)
+        with caplog.at_level('WARNING', logger='unifi_api'):
+            api.get_firewall_data()
+            api.get_firewall_data()
+            self._setup(api, self.POLICIES[:2])
+            api.get_firewall_data()
+
+        warnings = [r for r in caplog.records if 'without an id' in r.getMessage()]
+        assert len(warnings) == 2
+
+    def test_no_warning_without_idless_policies(self, api, caplog):
+        self._setup(api, self.POLICIES[:1])
+        with caplog.at_level('WARNING', logger='unifi_api'):
+            data = api.get_firewall_data()
+
+        assert data['totalCount'] == 1
+        assert not [r for r in caplog.records if 'without an id' in r.getMessage()]

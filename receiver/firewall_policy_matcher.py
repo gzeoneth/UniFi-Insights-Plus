@@ -37,6 +37,14 @@ _ACTION_CODE_MAP = {'A': 'allow', 'B': 'block', 'D': 'block', 'R': 'block'}
 _ACTION_CODE_TO_POLICY = {'A': 'ALLOW', 'B': 'BLOCK', 'D': 'BLOCK'}
 _DESC_ACTION_MAP = {'block': 'block', 'drop': 'block', 'reject': 'block', 'allow': 'allow'}
 
+# Shown in LogDetail when a log's only matching policy has no id (#112). The UI
+# turns "Troubleshooting on the docs site" into a link (IDLESS_DOCS_LINK_TEXT).
+_IDLESS_POLICY_MESSAGE = (
+    "The UniFi controller returned this policy without an id, so its logging cannot be "
+    "toggled here. Toggle syslog for this rule in the UniFi Network app, or see "
+    "Troubleshooting on the docs site."
+)
+
 
 def _action_from_desc(rule_desc):
     """Extract action from rule description text (e.g. 'Block Unauthorized Traffic').
@@ -449,26 +457,43 @@ def match_log_to_policy(unifi_api, interface_in, interface_out, rule_name,
         return {"status": "unmatched",
                 "message": "No matching policy found"}
 
-    # Build controllable candidate set — filter DERIVED and disabled BEFORE
-    # deciding ambiguity, so an uncontrollable twin doesn't block a valid match.
+    # Build controllable candidate set: filter DERIVED, disabled and id-less
+    # (#112, cannot be patched) BEFORE deciding ambiguity, so an
+    # uncontrollable twin doesn't block a valid match.
     controllable = [p for p in all_matches
                     if p.get('metadata', {}).get('origin', '') != 'DERIVED'
-                    and p.get('enabled') is not False]
+                    and p.get('enabled') is not False
+                    and p.get('id')]
 
     if len(controllable) == 0:
-        # All matches are uncontrollable
-        policy = all_matches[0]
-        origin = policy.get('metadata', {}).get('origin', '')
-        if origin == 'DERIVED':
+        # All matches are uncontrollable. Report the one most likely to have
+        # produced this log: a disabled rule does not log, so an enabled
+        # id-less rule (#112) wins, then a DERIVED rule, then a disabled one.
+        def _is_derived(p):
+            return p.get('metadata', {}).get('origin', '') == 'DERIVED'
+
+        idless = next((p for p in all_matches
+                       if not _is_derived(p) and p.get('enabled') is not False
+                       and not p.get('id')), None)
+        if idless:
+            return {
+                "status": "uncontrollable",
+                "message": _IDLESS_POLICY_MESSAGE,
+                "reason": "no_id",
+                "policy": {"id": None, "name": idless.get('name', '')}
+            }
+        derived = next((p for p in all_matches if _is_derived(p)), None)
+        if derived:
             return {
                 "status": "uncontrollable",
                 "message": "This rule is auto-generated and cannot be modified.",
-                "policy": {"id": policy['id'], "name": policy.get('name', '')}
+                "policy": {"id": derived.get('id'), "name": derived.get('name', '')}
             }
+        policy = all_matches[0]  # only disabled rules remain
         return {
             "status": "uncontrollable",
             "message": "This rule is disabled and cannot be toggled.",
-            "policy": {"id": policy['id'], "name": policy.get('name', '')}
+            "policy": {"id": policy.get('id'), "name": policy.get('name', '')}
         }
 
     if len(controllable) > 1:
@@ -482,7 +507,7 @@ def match_log_to_policy(unifi_api, interface_in, interface_out, rule_name,
     return {
         "status": "matched",
         "policy": {
-            "id": policy['id'],
+            "id": policy.get('id'),
             "name": policy.get('name', ''),
             "loggingEnabled": policy.get('loggingEnabled', False),
             "origin": origin,

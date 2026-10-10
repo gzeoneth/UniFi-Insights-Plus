@@ -236,6 +236,14 @@ class TestResolveRuleAction:
         assert parsed['resolved_action'] == 'block'
         assert parsed['action_source'] == 'rule_desc'
 
+    def test_idless_policy_still_resolves_action(self):
+        """Rule-action lookup needs no policy id (#112): id-less policies stay
+        in the snapshot, so their action metadata keeps working."""
+        api = self._setup(action='BLOCK', index=30004)
+        api.get_firewall_data.return_value['policies'][0].pop('id')
+        parsed = fpm.parse_firewall_rule('GUEST_WAN-30004')
+        assert fpm.resolve_rule_action(parsed, api, 'br50', 'eth3') == 'block'
+
     def test_policy_overrides_desc_hint(self):
         """Policy metadata takes precedence over desc_hint."""
         api = self._setup(action='ALLOW', index=30004)
@@ -382,6 +390,71 @@ class TestMatchLogToPolicy:
         assert result['status'] == 'matched'
         assert result['policy']['id'] == 'p1'
         assert result['policy']['loggingEnabled'] is True
+
+    @staticmethod
+    def _idless(name='Legacy', enabled=True):
+        policy = _policy(None, name, 'z-int', 'z-ext', 'BLOCK', 100, enabled=enabled)
+        policy.pop('id')
+        return policy
+
+    def test_idless_only_match_is_uncontrollable(self):
+        """An id-less policy cannot be toggled (#112): report it, don't hide it."""
+        api = self._setup_match([self._idless()])
+        result = fpm.match_log_to_policy(
+            api, interface_in='br0', interface_out='eth3',
+            rule_name='LAN_WAN-D-100',
+        )
+        assert result['status'] == 'uncontrollable'
+        assert result['message'] == fpm._IDLESS_POLICY_MESSAGE
+        assert 'without an id' in result['message']
+        assert 'Troubleshooting on the docs site' in result['message']  # linked by LogDetail
+        assert result['reason'] == 'no_id'
+        assert result['policy'] == {'id': None, 'name': 'Legacy'}
+
+    def test_disabled_idless_reports_disabled_first(self):
+        api = self._setup_match([self._idless(enabled=False)])
+        result = fpm.match_log_to_policy(
+            api, interface_in='br0', interface_out='eth3',
+            rule_name='LAN_WAN-D-100',
+        )
+        assert result['status'] == 'uncontrollable'
+        assert result['message'] == 'This rule is disabled and cannot be toggled.'
+
+    def test_disabled_with_id_and_enabled_idless_reports_idless(self):
+        """A disabled rule does not log, so the enabled id-less rule produced the
+        line: report that one even when the disabled rule comes first."""
+        disabled = _policy('p-off', 'Old rule', 'z-int', 'z-ext', 'BLOCK', 100, enabled=False)
+        api = self._setup_match([disabled, self._idless('Legacy')])
+        result = fpm.match_log_to_policy(
+            api, interface_in='br0', interface_out='eth3',
+            rule_name='LAN_WAN-D-100',
+        )
+        assert result['status'] == 'uncontrollable'
+        assert result['message'] == fpm._IDLESS_POLICY_MESSAGE
+        assert result['policy'] == {'id': None, 'name': 'Legacy'}
+
+    def test_derived_reported_before_disabled(self):
+        disabled = _policy('p-off', 'Old rule', 'z-int', 'z-ext', 'BLOCK', 100, enabled=False)
+        derived = _policy('p-auto', 'Auto', 'z-int', 'z-ext', 'BLOCK', 100, origin='DERIVED')
+        api = self._setup_match([disabled, derived])
+        result = fpm.match_log_to_policy(
+            api, interface_in='br0', interface_out='eth3',
+            rule_name='LAN_WAN-D-100',
+        )
+        assert result['status'] == 'uncontrollable'
+        assert result['message'] == 'This rule is auto-generated and cannot be modified.'
+        assert result['policy']['id'] == 'p-auto'
+
+    def test_idless_twin_does_not_block_normal_match(self):
+        """A normal policy next to an id-less twin is still matched, not ambiguous."""
+        normal = _policy('p1', 'Block IoT', 'z-int', 'z-ext', 'BLOCK', 100)
+        api = self._setup_match([self._idless(), normal])
+        result = fpm.match_log_to_policy(
+            api, interface_in='br0', interface_out='eth3',
+            rule_name='LAN_WAN-D-100',
+        )
+        assert result['status'] == 'matched'
+        assert result['policy']['id'] == 'p1'
 
     def test_unmatched_no_policy(self):
         api = self._setup_match(policies=[])

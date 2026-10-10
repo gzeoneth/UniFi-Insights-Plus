@@ -72,6 +72,8 @@
 - **MaxMind GeoLite2 account** ([free signup](https://www.maxmind.com/en/geolite2/signup)) - for GeoIP/ASN lookups
 - **AbuseIPDB API key** ([free tier](https://www.abuseipdb.com/register?plan=free), recommended but optional) - for threat scoring
 
+> **UniFi Network 10.x: enable SIEM-mode activity logging.** Open **Settings > Integrations > Syslog** in the UniFi Network controller (on the default site: `https://<controller-hostname-or-ip>/network/default/integrations/syslog`; multi-site controllers use their own site id in place of `default`). Under **Activity Logging** choose **SIEM Server** and point it at the Insights Plus host, UDP port 514. Then select the log categories to forward. As of UniFi Network 10.6.106 they are **Client**, **Security Detections**, **VPN** and **Firewall Default Policy** (older 10.x builds may label them differently). Insights Plus needs **Firewall Default Policy** for firewall logs; the other categories are optional and forward those event types as well. If Insights Plus shows raw packet counts but nothing parses, disable SIEM, reboot the gateway, re-enable it, and re-check the categories.
+
 **Minimum host resources (estimated):**
 
 - **CPU:** 4 cores/threads minimum (PostgreSQL + receiver + API run concurrently)
