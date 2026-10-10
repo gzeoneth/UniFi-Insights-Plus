@@ -77,7 +77,7 @@ def client(monkeypatch):
     mock_db_module.parse_retention_time = _real_parse_retention_time
     mock_db_module.get_config = MagicMock(return_value=None)
     mock_db_module.set_config = MagicMock()
-    mock_db_module.count_logs = MagicMock(return_value=0)
+    mock_db_module.has_logs = MagicMock(return_value=False)
     mock_db_module.encrypt_api_key = MagicMock()
     mock_db_module.decrypt_api_key = MagicMock()
     monkeypatch.setitem(sys.modules, 'db', mock_db_module)

@@ -101,7 +101,7 @@ def setup_client(monkeypatch):
     monkeypatch.setitem(sys.modules, 'deps', mock_deps)
 
     mock_db_module = _make_base_db_mock()
-    mock_db_module.count_logs = MagicMock(return_value=100)
+    mock_db_module.has_logs = MagicMock(return_value=True)
     mock_db_module.is_external_db = MagicMock(return_value=False)
     monkeypatch.setitem(sys.modules, 'db', mock_db_module)
 
@@ -417,6 +417,22 @@ class TestImportCacheInvalidation:
             assert resp.status_code == 200
             assert 'wan_interfaces' in resp.json()['failed_keys']
             mock_inv.assert_not_called()
+
+
+# ── Setup status ───────────────────────────────────────────────────────────
+
+class TestSetupStatus:
+    def test_reports_log_presence_not_count(self, setup_client):
+        """Public endpoint: an EXISTS probe, never a full COUNT(*) (#103)."""
+        client, _mock_deps, mock_db = setup_client
+        mock_db.get_config.return_value = True
+
+        resp = client.get('/api/setup/status')
+
+        assert resp.status_code == 200
+        assert resp.json() == {'setup_complete': True, 'has_logs': True}
+        mock_db.has_logs.assert_called_once()
+        assert mock_db.has_logs.call_args.args[1] == 'firewall'
 
 
 # ── Setup identity seeding ─────────────────────────────────────────────────

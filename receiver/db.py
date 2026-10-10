@@ -2195,9 +2195,13 @@ def parse_vpn_config(raw) -> dict:
     return {}
 
 
-def count_logs(db, log_type='firewall'):
-    """Count logs by type."""
+def has_logs(db, log_type='firewall') -> bool:
+    """True if any log of this type exists.
+
+    EXISTS stops at the first matching row (idx_logs_type_time), where a
+    COUNT(*) read every row of the type on each call (#103).
+    """
     with db.get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM logs WHERE log_type = %s", [log_type])
-            return cur.fetchone()[0]
+            cur.execute("SELECT EXISTS (SELECT 1 FROM logs WHERE log_type = %s)", [log_type])
+            return bool(cur.fetchone()[0])

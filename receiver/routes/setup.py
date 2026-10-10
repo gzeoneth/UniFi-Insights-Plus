@@ -10,7 +10,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from psycopg2.extras import RealDictCursor, Json
 
-from db import Database, get_config, set_config, count_logs, encrypt_api_key, decrypt_api_key, parse_retention_time
+from db import Database, get_config, set_config, has_logs, encrypt_api_key, decrypt_api_key, parse_retention_time
 from deps import get_conn, put_conn, enricher_db, unifi_api, signal_receiver, APP_VERSION, ttl_cache
 from unifi_api import UniFiAPI
 from firewall_policy_matcher import invalidate_cache as invalidate_fw_cache
@@ -83,7 +83,7 @@ def setup_status():
     """Check if setup wizard is complete."""
     return {
         "setup_complete": get_config(enricher_db, "setup_complete", False),
-        "logs_count": count_logs(enricher_db, 'firewall'),
+        "has_logs": has_logs(enricher_db, 'firewall'),
     }
 
 

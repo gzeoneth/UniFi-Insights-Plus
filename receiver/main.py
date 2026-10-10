@@ -23,7 +23,7 @@ from parsers import parse_log
 import parsers
 from log_utils import flush_suppressed, rate_limited_warning
 from db import (Database, get_config, set_config, build_conn_params, is_external_db,
-                wait_for_postgres, parse_positive_int)
+                wait_for_postgres, parse_positive_int, has_logs)
 from enrichment import Enricher
 from backfill import BackfillTask
 from blacklist import BlacklistFetcher
@@ -464,13 +464,8 @@ def main():
     # Check for existing user migration
     setup_complete = get_config(db, "setup_complete", None)
     if setup_complete is None:
-        # Count firewall logs to detect existing installation
-        with db.get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM logs WHERE log_type = 'firewall'")
-                log_count = cur.fetchone()[0]
-
-        if log_count > 0:
+        # Any firewall log means an existing installation
+        if has_logs(db, 'firewall'):
             # Auto-migrate existing installation with safe defaults
             logger.info("Migrating existing installation to dynamic config...")
             set_config(db, "wan_interfaces", ["ppp0"])
