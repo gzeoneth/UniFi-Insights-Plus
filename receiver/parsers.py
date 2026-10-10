@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # ── WAN IP auto-detection ────────────────────────────────────────────────────
 _wan_ip = None
 WAN_IPS = set()  # All known WAN IPs (derived from config); replaces single _wan_ip for exclusion
-_wan_ip_by_iface_present = False  # True when authoritative wan_ip_by_iface exists
+WAN_IP_BY_IFACE: dict = {}  # loaded wan_ip_by_iface; non-empty = authoritative
 
 
 def get_wan_ip() -> str:
@@ -230,7 +230,7 @@ def derive_direction(iface_in: str, iface_out: str, rule_name: str, src_ip: str 
 
     # Auto-learn WAN IP from WAN_LOCAL rules (IN=WAN interface, public DST)
     # Only when UniFi API is unavailable and no wan_ip_by_iface is present
-    if (not _wan_ip_by_iface_present
+    if (not WAN_IP_BY_IFACE
             and iface_in in WAN_INTERFACES and 'WAN_LOCAL' in (rule_name or '') and dst_ip):
         try:
             ip = ipaddress.ip_address(dst_ip)
@@ -559,9 +559,10 @@ def reload_config_from_db(db):
     """Reload WAN interfaces, labels, and WAN IPs from system_config table.
 
     Called by main.py on startup and via SIGUSR2 signal after reconfiguration.
-    Updates module-level WAN_INTERFACES, INTERFACE_LABELS, WAN_IPS, and _wan_ip.
+    Updates module-level WAN_INTERFACES, INTERFACE_LABELS, WAN_IPS,
+    WAN_IP_BY_IFACE and _wan_ip.
     """
-    global WAN_INTERFACES, INTERFACE_LABELS, _wan_ip, WAN_IPS, _wan_ip_by_iface_present
+    global WAN_INTERFACES, INTERFACE_LABELS, _wan_ip, WAN_IPS, WAN_IP_BY_IFACE
     from db import get_config, get_wan_ips_from_config
 
     wan_list = get_config(db, 'wan_interfaces', ['ppp0'])
@@ -572,8 +573,9 @@ def reload_config_from_db(db):
     wan_ips_list = get_wan_ips_from_config(db)
     WAN_IPS = set(wan_ips_list)
 
-    # Track whether authoritative wan_ip_by_iface exists
-    _wan_ip_by_iface_present = bool(get_config(db, 'wan_ip_by_iface'))
+    # Keep the authoritative wan_ip_by_iface map (gates WAN_LOCAL auto-learn
+    # and lets main.py see which configured interfaces have no learned IP)
+    WAN_IP_BY_IFACE = get_config(db, 'wan_ip_by_iface') or {}
 
     saved_wan_ip = get_config(db, 'wan_ip')
     if saved_wan_ip:

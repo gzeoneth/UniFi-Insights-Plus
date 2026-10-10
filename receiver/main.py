@@ -407,10 +407,11 @@ def _reload_config(db: Database, unifi_api, pihole, enricher, receiver):
     """Reload runtime config from the database (SIGUSR2 body, testable).
 
     Requests the scheduler-thread follow-ups: the retention job rebuild
-    always, and an identity refresh when the WAN interface set or the UniFi
-    enabled flag changed, or when no wan_ip_by_iface has been learned yet.
+    always, and an identity refresh when the UniFi enabled flag changed or a
+    configured WAN interface has no learned IP. The trigger reads only the
+    reloaded in-memory state (no extra DB IO in the signal handler). A
+    removed interface does not trigger: pruning waits for the scheduled run.
     """
-    old_wan = set(parsers.WAN_INTERFACES)
     old_unifi = bool(unifi_api.enabled)
     parsers.reload_config_from_db(db)
     unifi_api.reload_config()
@@ -419,10 +420,28 @@ def _reload_config(db: Database, unifi_api, pihole, enricher, receiver):
     receiver._load_disabled_types()
     # scheduler thread will rebuild the retention job on its next tick
     _retention_reload_requested.set()
-    if (set(parsers.WAN_INTERFACES) != old_wan
-            or bool(unifi_api.enabled) != old_unifi
-            or not db.get_config('wan_ip_by_iface')):
+    if (bool(unifi_api.enabled) != old_unifi
+            or set(parsers.WAN_INTERFACES) - set(parsers.WAN_IP_BY_IFACE)):
         _identity_refresh_requested.set()
+
+
+def _handle_config_reload_signal(db: Database, unifi_api, pihole, enricher, receiver):
+    """SIGUSR2 handler body. Never raises: the handler runs on the main thread
+    inside the receiver's recvfrom loop, which an exception would unwind."""
+    try:
+        logger.info("Received SIGUSR2, reloading config from database...")
+        _reload_config(db, unifi_api, pihole, enricher, receiver)
+
+        # Write timestamp to confirm reload completed
+        try:
+            from pathlib import Path
+            Path('/tmp/config_reloaded').write_text(str(time.time()))
+        except Exception as e:
+            logger.debug("Failed to write reload timestamp: %s", e)
+
+        logger.info("Config reloaded: WAN=%s", parsers.WAN_INTERFACES)
+    except Exception:
+        logger.exception("Config reload failed")
 
 
 def run_scheduler(db: Database, enricher: Enricher, blacklist_fetcher: BlacklistFetcher = None):
@@ -553,17 +572,7 @@ def main():
     # Handle config reload
     def reload_config(signum, frame):
         """Reload config from database when signaled by API process."""
-        logger.info("Received SIGUSR2, reloading config from database...")
-        _reload_config(db, unifi_api, pihole, enricher, receiver)
-
-        # Write timestamp to confirm reload completed
-        try:
-            from pathlib import Path
-            Path('/tmp/config_reloaded').write_text(str(time.time()))
-        except Exception as e:
-            logger.debug("Failed to write reload timestamp: %s", e)
-
-        logger.info("Config reloaded: WAN=%s", parsers.WAN_INTERFACES)
+        _handle_config_reload_signal(db, unifi_api, pihole, enricher, receiver)
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)

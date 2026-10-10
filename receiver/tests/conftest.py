@@ -9,7 +9,7 @@ def _reset_parser_globals(monkeypatch):
     import parsers
     monkeypatch.setattr(parsers, '_wan_ip', None)
     monkeypatch.setattr(parsers, 'WAN_IPS', set())
-    monkeypatch.setattr(parsers, '_wan_ip_by_iface_present', False)
+    monkeypatch.setattr(parsers, 'WAN_IP_BY_IFACE', {})
     monkeypatch.setattr(parsers, 'WAN_INTERFACES', {'ppp0'})
     monkeypatch.setattr(parsers, 'INTERFACE_LABELS', {})
 

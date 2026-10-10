@@ -203,11 +203,19 @@ def test_tick_skips_identity_refresh_when_not_requested(main_module, monkeypatch
     refresh.assert_not_called()
 
 
-def _reload(main_module, monkeypatch, *, wan_before, wan_after,
-            unifi_before=False, unifi_after=False, wan_ip_by_iface=None):
-    """Run _reload_config() with parsers/unifi reloads that apply the 'after' state."""
-    parsers = SimpleNamespace(WAN_INTERFACES=set(wan_before))
-    parsers.reload_config_from_db = lambda _db: setattr(parsers, 'WAN_INTERFACES', set(wan_after))
+def _reload(main_module, monkeypatch, *, wan_after, map_after,
+            unifi_before=False, unifi_after=False):
+    """Run _reload_config() with parsers/unifi reloads that apply the 'after' state.
+
+    The trigger reads only reloaded in-memory state, never the DB.
+    """
+    parsers = SimpleNamespace(WAN_INTERFACES={'ppp0'}, WAN_IP_BY_IFACE={})
+
+    def reload_from_db(_db):
+        parsers.WAN_INTERFACES = set(wan_after)
+        parsers.WAN_IP_BY_IFACE = dict(map_after)
+
+    parsers.reload_config_from_db = reload_from_db
     monkeypatch.setattr(main_module, 'parsers', parsers)
 
     unifi_api = MagicMock()
@@ -215,30 +223,42 @@ def _reload(main_module, monkeypatch, *, wan_before, wan_after,
     unifi_api.reload_config.side_effect = lambda: setattr(unifi_api, 'enabled', unifi_after)
 
     db = MagicMock()
-    config = {'wan_ip_by_iface': wan_ip_by_iface}
-    db.get_config.side_effect = lambda key, default=None: config.get(key, default)
-
     main_module._reload_config(db, unifi_api, MagicMock(), MagicMock(), MagicMock())
+    db.get_config.assert_not_called()
     return main_module._identity_refresh_requested.is_set()
 
 
-def test_reload_requests_identity_refresh_when_wan_set_changes(main_module, monkeypatch):
-    assert _reload(main_module, monkeypatch, wan_before={'ppp0'}, wan_after={'eth8'},
-                   wan_ip_by_iface={'ppp0': '1.1.1.1'})
-
-
 def test_reload_requests_identity_refresh_when_unifi_flag_changes(main_module, monkeypatch):
-    assert _reload(main_module, monkeypatch, wan_before={'eth8'}, wan_after={'eth8'},
-                   unifi_before=True, unifi_after=False,
-                   wan_ip_by_iface={'eth8': '1.1.1.1'})
+    assert _reload(main_module, monkeypatch, wan_after={'eth8'}, map_after={'eth8': '1.1.1.1'},
+                   unifi_before=True, unifi_after=False)
 
 
-def test_reload_requests_identity_refresh_when_identity_unknown(main_module, monkeypatch):
-    assert _reload(main_module, monkeypatch, wan_before={'eth8'}, wan_after={'eth8'},
-                   wan_ip_by_iface={})
+def test_reload_requests_identity_refresh_when_interface_has_no_ip(main_module, monkeypatch):
+    assert _reload(main_module, monkeypatch, wan_after={'eth8', 'eth9'},
+                   map_after={'eth8': '1.1.1.1'})
+
+
+def test_reload_skips_identity_refresh_when_every_interface_known(main_module, monkeypatch):
+    """WAN set changed (ppp0 -> eth8), but eth8 already has a learned IP:
+    the wizard already ran detection, so the receiver does not repeat it."""
+    assert not _reload(main_module, monkeypatch, wan_after={'eth8'},
+                       map_after={'eth8': '1.1.1.1', 'ppp0': '9.9.9.9'})
 
 
 def test_unrelated_reload_does_not_request_identity_refresh(main_module, monkeypatch):
-    assert not _reload(main_module, monkeypatch, wan_before={'eth8'}, wan_after={'eth8'},
-                       wan_ip_by_iface={'eth8': '1.1.1.1'})
+    assert not _reload(main_module, monkeypatch, wan_after={'ppp0'},
+                       map_after={'ppp0': '1.1.1.1'})
     assert main_module._retention_reload_requested.is_set()
+
+
+def test_config_reload_signal_never_raises(main_module, monkeypatch, caplog):
+    """A failing reload must not unwind into the receiver's recvfrom loop."""
+    monkeypatch.setattr(main_module, '_reload_config',
+                        MagicMock(side_effect=Exception('db down')))
+    caplog.set_level(logging.ERROR)
+
+    main_module._handle_config_reload_signal(
+        MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock())
+
+    assert any(r.getMessage() == 'Config reload failed' and r.exc_info
+               for r in caplog.records)
