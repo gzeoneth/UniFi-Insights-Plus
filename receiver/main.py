@@ -22,7 +22,8 @@ import schedule
 from parsers import parse_log
 import parsers
 from log_utils import flush_suppressed, rate_limited_warning
-from db import Database, get_config, set_config, build_conn_params, is_external_db, wait_for_postgres
+from db import (Database, get_config, set_config, build_conn_params, is_external_db,
+                wait_for_postgres, parse_positive_int)
 from enrichment import Enricher
 from backfill import BackfillTask
 from blacklist import BlacklistFetcher
@@ -62,16 +63,12 @@ logger = logging.getLogger('receiver')
 # negative value would make schedule.every() loop forever. Blank/unset -> 360.
 WAN_REFRESH_INTERVAL_MINUTES = 360
 _wan_refresh_env = os.environ.get('WAN_REFRESH_INTERVAL_MINUTES', '').strip()
-if _wan_refresh_env:
-    try:
-        _wan_refresh_parsed = int(_wan_refresh_env)
-    except ValueError:
-        _wan_refresh_parsed = 0
-    if _wan_refresh_parsed >= 1:
-        WAN_REFRESH_INTERVAL_MINUTES = _wan_refresh_parsed
-    else:
-        logger.warning("Invalid WAN_REFRESH_INTERVAL_MINUTES '%s' (must be a whole number >= 1), "
-                       "using default %d", _wan_refresh_env, WAN_REFRESH_INTERVAL_MINUTES)
+_wan_refresh_parsed = parse_positive_int(_wan_refresh_env)
+if _wan_refresh_parsed is not None:
+    WAN_REFRESH_INTERVAL_MINUTES = _wan_refresh_parsed
+elif _wan_refresh_env:
+    logger.warning("Invalid WAN_REFRESH_INTERVAL_MINUTES '%s' (must be a whole number >= 1), "
+                   "using default %d", _wan_refresh_env, WAN_REFRESH_INTERVAL_MINUTES)
 
 
 # ── Syslog Receiver ───────────────────────────────────────────────────────────

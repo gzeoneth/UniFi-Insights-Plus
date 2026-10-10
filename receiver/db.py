@@ -245,12 +245,13 @@ class RetentionTimeConfig(NamedTuple):
 _legacy_retention_time_warned = False
 
 
-def parse_retention_days(raw) -> int | None:
-    """Parse and range-validate a retention-days input value.
+def parse_positive_int(raw) -> int | None:
+    """Parse a positive integer from an untrusted input value.
 
     Returns positive int or None for any non-coercible / non-positive input.
     Accepts coercible values (including string digits) — this is for inputs
-    from untrusted sources (API bodies, env vars, DB values).
+    from untrusted sources (API bodies, env vars, DB values). Used by the
+    retention-days resolver and for WAN_REFRESH_INTERVAL_MINUTES in main.py.
 
     Related but distinct: `Database.validate_retention_days` is a stricter
     post-resolution invariant check (type: must already be `int`, not just
@@ -1109,10 +1110,10 @@ END $$;""",
         """Post-resolution invariant check: the given values must already be
         positive Python ints. Raises ValueError on bad input.
 
-        This is stricter than `parse_retention_days` by design:
-          - `parse_retention_days` is the input-validation entry point —
-            accepts any coercible value (strings, ints), used by the resolver
-            and the POST/import route handlers.
+        This is stricter than `parse_positive_int` by design:
+          - `parse_positive_int` is the input-validation entry point —
+            accepts any coercible value (strings, ints), used by the
+            retention-days resolver.
           - `validate_retention_days` is a post-resolution sanity check —
             used by `run_retention_cleanup` and `run_retention_cleanup_now`
             to catch wiring bugs where a non-int value somehow reached a
@@ -1138,7 +1139,7 @@ END $$;""",
 
         Invalid values at any level fall through to the next level. General and
         DNS resolve independently and may come from different sources in the
-        same call. Uses the shared `parse_retention_days` helper so the parse
+        same call. Uses the shared `parse_positive_int` helper so the parse
         and range logic lives in exactly one place.
 
         Returns a NamedTuple so callers write `cfg.general` / `cfg.dns_source`
@@ -1147,10 +1148,10 @@ END $$;""",
         (e.g. `== (60, 'default', 10, 'default')`) keep working unchanged.
         """
         def _resolve_one(ui_key: str, env_key: str, default: int) -> tuple[int, str]:
-            ui = parse_retention_days(db.get_config(ui_key))
+            ui = parse_positive_int(db.get_config(ui_key))
             if ui is not None:
                 return (ui, 'ui')
-            env = parse_retention_days(os.environ.get(env_key))
+            env = parse_positive_int(os.environ.get(env_key))
             if env is not None:
                 return (env, 'env')
             return (default, 'default')

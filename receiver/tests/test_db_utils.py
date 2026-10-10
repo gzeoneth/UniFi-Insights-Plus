@@ -1,4 +1,5 @@
-"""Tests for db.py utility functions — encryption, connection params, external DB detection."""
+"""Tests for db.py utility functions — encryption, connection params, external DB detection,
+positive-int parsing."""
 
 import pytest
 
@@ -8,6 +9,7 @@ from db import (
     decrypt_api_key,
     encrypt_api_key,
     is_external_db,
+    parse_positive_int,
 )
 
 
@@ -121,3 +123,15 @@ class TestIsExternalDb:
     def test_whitespace_stripped(self, monkeypatch):
         monkeypatch.setenv('DB_HOST', '  localhost  ')
         assert is_external_db() is False
+
+
+# ── parse_positive_int ───────────────────────────────────────────────────────
+
+class TestParsePositiveInt:
+    @pytest.mark.parametrize('raw, expected', [(60, 60), ('90', 90), (' 7 ', 7), (1, 1)])
+    def test_accepts_positive_coercible(self, raw, expected):
+        assert parse_positive_int(raw) == expected
+
+    @pytest.mark.parametrize('raw', [0, '0', -5, '-5', '', 'abc', None, '1.5', [1]])
+    def test_rejects_non_positive_or_non_coercible(self, raw):
+        assert parse_positive_int(raw) is None
