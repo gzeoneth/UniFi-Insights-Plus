@@ -41,7 +41,8 @@ SYSLOG_PORT = 514
 SYSLOG_BUFFER_SIZE = 8192      # Max UDP packet size
 BATCH_SIZE = 50                 # Insert logs in batches
 BATCH_TIMEOUT = 2.0             # Flush batch after N seconds even if not full
-STATS_INTERVAL_MINUTES = 15     # Log stats every N minutes
+STATS_INTERVAL_MINUTES = 15     # Log stats every N minutes (DEBUG only)
+WAN_REFRESH_INTERVAL_MINUTES = int(os.environ.get('WAN_REFRESH_INTERVAL_MINUTES', 360))  # Log-based WAN/gateway detection
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -352,6 +353,9 @@ def run_scheduler(db: Database, enricher: Enricher, blacklist_fetcher: Blacklist
     """Background thread for scheduled tasks (retention cleanup, stats, blacklist)."""
 
     def log_stats():
+        # Output is DEBUG-only; skip the DB work when nobody can see it (#103).
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
         try:
             db_stats = db.get_stats()
             enrich_stats = enricher.get_stats()
@@ -371,14 +375,15 @@ def run_scheduler(db: Database, enricher: Enricher, blacklist_fetcher: Blacklist
         _refresh_network_identity_from_logs(db)
 
     schedule.every(STATS_INTERVAL_MINUTES).minutes.do(log_stats)
-    schedule.every(STATS_INTERVAL_MINUTES).minutes.do(refresh_wan_ip)
+    schedule.every(WAN_REFRESH_INTERVAL_MINUTES).minutes.do(refresh_wan_ip)
     _register_retention_job(db)
     schedule.every().day.at("04:00").do(pull_blacklist)
     # auth_cleanup has its own internal try/except — no wrapper needed here.
     schedule.every().day.at("03:30").do(auth_cleanup)
 
-    logger.info("Scheduler started — stats every %dm, blacklist daily at 04:00, auth cleanup daily at 03:30",
-                 STATS_INTERVAL_MINUTES)
+    logger.info("Scheduler started — stats every %dm (DEBUG only), WAN refresh every %dm, "
+                "blacklist daily at 04:00, auth cleanup daily at 03:30",
+                STATS_INTERVAL_MINUTES, WAN_REFRESH_INTERVAL_MINUTES)
 
     # Initial blacklist pull after 30s startup delay
     time.sleep(30)
