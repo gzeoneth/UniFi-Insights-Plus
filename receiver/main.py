@@ -303,8 +303,13 @@ def _use_log_identity_detection(db: Database) -> bool:
     return not bool(db.get_config('unifi_enabled', False))
 
 
-def _refresh_network_identity_from_logs(db: Database):
+def _refresh_network_identity_from_logs(db: Database, enricher: Enricher = None):
     """Run log-based WAN/gateway detection only when UniFi is not authoritative.
+
+    When the run changes the persisted wan_ip_by_iface or gateway_ips, the
+    running receiver reloads them: parsers always, the enricher when one is
+    passed (startup passes none; the Enricher is built later and preloads
+    from the DB).
 
     Never raises: it runs at startup, as a scheduled job (schedule.run_pending()
     does not catch job exceptions, so one would end the scheduler thread) and
@@ -313,8 +318,9 @@ def _refresh_network_identity_from_logs(db: Database):
     try:
         if not _use_log_identity_detection(db):
             return
+        before = (db.get_config('wan_ip_by_iface'), db.get_config('gateway_ips'))
     except Exception as e:
-        logger.error("Network identity refresh skipped (UniFi gate check failed): %s", e)
+        logger.error("Network identity refresh skipped (config read failed): %s", e)
         return
     try:
         db.detect_wan_ip()
@@ -324,6 +330,14 @@ def _refresh_network_identity_from_logs(db: Database):
         db.detect_gateway_ips()
     except Exception as e:
         logger.error("Gateway IP detection failed: %s", e)
+    try:
+        after = (db.get_config('wan_ip_by_iface'), db.get_config('gateway_ips'))
+        if after != before:
+            parsers.reload_config_from_db(db)
+            if enricher is not None:
+                enricher.reload_config()
+    except Exception as e:
+        logger.error("Reloading detected network identity failed: %s", e)
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
@@ -373,7 +387,7 @@ def _register_retention_job(db: Database):
                 cfg.time, cfg.source)
 
 
-def _scheduler_tick(db: Database):
+def _scheduler_tick(db: Database, enricher: Enricher = None):
     """One iteration of the scheduler loop — extracted so tests can run it
     deterministically. Observes the retention-reload Event (set by the signal
     handler on another thread) and rebuilds the job before dispatching pending
@@ -385,7 +399,7 @@ def _scheduler_tick(db: Database):
         _register_retention_job(db)
     if _identity_refresh_requested.is_set():
         _identity_refresh_requested.clear()
-        _refresh_network_identity_from_logs(db)
+        _refresh_network_identity_from_logs(db, enricher)
     schedule.run_pending()
 
 
@@ -434,7 +448,7 @@ def run_scheduler(db: Database, enricher: Enricher, blacklist_fetcher: Blacklist
                 logger.error("Blacklist pull failed: %s", e)
 
     def refresh_wan_ip():
-        _refresh_network_identity_from_logs(db)
+        _refresh_network_identity_from_logs(db, enricher)
 
     schedule.every(STATS_INTERVAL_MINUTES).minutes.do(log_stats)
     schedule.every(WAN_REFRESH_INTERVAL_MINUTES).minutes.do(refresh_wan_ip)
@@ -452,7 +466,7 @@ def run_scheduler(db: Database, enricher: Enricher, blacklist_fetcher: Blacklist
     pull_blacklist()
 
     while True:
-        _scheduler_tick(db)
+        _scheduler_tick(db, enricher)
         time.sleep(10)
 
 

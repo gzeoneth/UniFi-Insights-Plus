@@ -147,12 +147,24 @@ def test_tick_runs_identity_refresh_when_requested(main_module, monkeypatch):
     refresh = MagicMock()
     monkeypatch.setattr(main_module, '_refresh_network_identity_from_logs', refresh)
     db = MagicMock()
+    enricher = MagicMock()
 
     main_module._identity_refresh_requested.set()
-    main_module._scheduler_tick(db)
+    main_module._scheduler_tick(db, enricher)
 
-    refresh.assert_called_once_with(db)
+    refresh.assert_called_once_with(db, enricher)
     assert not main_module._identity_refresh_requested.is_set()
+
+
+def test_scheduled_wan_refresh_passes_enricher(main_module, monkeypatch):
+    refresh = MagicMock()
+    monkeypatch.setattr(main_module, '_refresh_network_identity_from_logs', refresh)
+    db, enricher = MagicMock(), MagicMock()
+    _register_jobs(main_module, monkeypatch, db, enricher)
+
+    _job('refresh_wan_ip').job_func()
+
+    refresh.assert_called_once_with(db, enricher)
 
 
 def _db_down():
