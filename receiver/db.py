@@ -153,6 +153,18 @@ INSERT_SQL = f"""
     VALUES ({', '.join(['%s'] * len(INSERT_COLUMNS))})
 """
 
+# Row-count estimate for logs from the pg_class catalog. An exact COUNT(*)
+# is a full heap scan (seconds on 100M+ rows, and disk reads on every call);
+# reltuples is maintained by autovacuum/ANALYZE and accurate to ~1% on
+# active tables. Shared by Database.get_stats() and /api/health.
+LOGS_ROW_ESTIMATE_SQL = """
+    SELECT COALESCE(GREATEST(c.reltuples::bigint, 0), 0)
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relname = 'logs'
+      AND n.nspname = 'public'
+"""
+
 
 # ── Retention configuration — parsers and result types ───────────────────────
 
@@ -1245,8 +1257,9 @@ END $$;""",
         """Get basic stats for health check / logging."""
         with self.get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM logs")
-                total = cur.fetchone()[0]
+                cur.execute(LOGS_ROW_ESTIMATE_SQL)
+                row = cur.fetchone()
+                total = row[0] if row else 0
                 cur.execute(
                     "SELECT log_type, COUNT(*) FROM logs "
                     "WHERE timestamp > NOW() - INTERVAL '1 hour' "
