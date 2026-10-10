@@ -250,6 +250,8 @@ class TestRecentFirewallCutoff:
         assert 'LEAST(MAX(timestamp), NOW())' in sql
         assert "INTERVAL '7 days'" in sql
         assert "log_type = 'firewall'" in sql
+        # LEAST() ignores a NULL MAX; HAVING turns "no firewall rows" into no row
+        assert 'HAVING MAX(timestamp) IS NOT NULL' in sql
 
     def test_none_without_firewall_rows(self):
         cur = MagicMock()
