@@ -37,10 +37,17 @@ from routes.auth import auth_cleanup
 _retention_reload_requested = threading.Event()
 
 # Set by the SIGUSR2 handler when log-based WAN/gateway identity should be
-# re-detected now rather than at the next WAN_REFRESH_INTERVAL_MINUTES run
-# (WAN set or UniFi flag changed, or identity never learned). Consumed by the
-# scheduler loop, so detection never runs inside the signal handler.
+# re-detected now rather than at the next WAN_REFRESH_INTERVAL_MINUTES run:
+# the effective UniFi enabled flag flipped, or the set of configured WAN
+# interfaces without a learned IP changed since the previous reload
+# (_last_missing_wan). Decided from reloaded in-memory state only; consumed by
+# the scheduler loop, so detection never runs inside the signal handler.
 _identity_refresh_requested = threading.Event()
+
+# Configured WAN interfaces with no learned IP at the previous SIGUSR2 reload.
+# Starts empty: interfaces already missing at boot were covered by the startup
+# refresh, so they trigger one refresh at most, never one per settings save.
+_last_missing_wan = frozenset()
 
 # The (wan_ip_by_iface, wan_ips, wan_ip, gateway_ips) tuple the receiver last
 # loaded after a log-based identity refresh; None until the first refresh.
@@ -428,11 +435,13 @@ def _reload_config(db: Database, unifi_api, pihole, enricher, receiver):
     """Reload runtime config from the database (SIGUSR2 body, testable).
 
     Requests the scheduler-thread follow-ups: the retention job rebuild
-    always, and an identity refresh when the UniFi enabled flag changed or a
-    configured WAN interface has no learned IP. The trigger reads only the
-    reloaded in-memory state (no extra DB IO in the signal handler). A
-    removed interface does not trigger: pruning waits for the scheduled run.
+    always, and an identity refresh when the UniFi enabled flag changed or
+    the set of configured WAN interfaces without a learned IP differs from
+    the previous reload's. The trigger reads only the reloaded in-memory
+    state (no extra DB IO in the signal handler). A removed interface does
+    not trigger: pruning waits for the scheduled run.
     """
+    global _last_missing_wan
     old_unifi = bool(unifi_api.enabled)
     # Each step runs on its own: a transient DB error in one must not leave
     # the others (or the scheduler follow-ups below) stale.
@@ -450,9 +459,10 @@ def _reload_config(db: Database, unifi_api, pihole, enricher, receiver):
             logger.error("Config reload step '%s' failed: %s", name, e)
     # scheduler thread will rebuild the retention job on its next tick
     _retention_reload_requested.set()
-    if (bool(unifi_api.enabled) != old_unifi
-            or set(parsers.WAN_INTERFACES) - set(parsers.WAN_IP_BY_IFACE)):
+    missing = frozenset(parsers.WAN_INTERFACES - set(parsers.WAN_IP_BY_IFACE))
+    if bool(unifi_api.enabled) != old_unifi or missing != _last_missing_wan:
         _identity_refresh_requested.set()
+    _last_missing_wan = missing
 
 
 def _handle_config_reload_signal(db: Database, unifi_api, pihole, enricher, receiver):

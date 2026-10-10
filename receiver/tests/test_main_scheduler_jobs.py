@@ -4,9 +4,11 @@ Covers:
 - log_stats only touches the database when DEBUG logging is enabled
 - the WAN/gateway refresh job runs on WAN_REFRESH_INTERVAL_MINUTES,
   independently of STATS_INTERVAL_MINUTES
-- a SIGUSR2 config reload requests an identity refresh (WAN set changed,
-  UniFi enabled flag changed, or no identity learned yet), and the
-  scheduler tick runs it on the scheduler thread
+- a SIGUSR2 config reload requests an identity refresh when the effective
+  UniFi enabled flag flipped or the set of configured WAN interfaces without
+  a learned IP changed since the last reload (from in-memory state only, no
+  DB read in the handler), and the scheduler tick runs it on the scheduler
+  thread
 """
 import logging
 import sys
@@ -228,6 +230,7 @@ def _reload(main_module, monkeypatch, *, wan_after, map_after,
     unifi_api.reload_config.side_effect = lambda: setattr(unifi_api, 'enabled', unifi_after)
 
     db = MagicMock()
+    main_module._identity_refresh_requested.clear()
     main_module._reload_config(db, unifi_api, MagicMock(), MagicMock(), MagicMock())
     db.get_config.assert_not_called()
     return main_module._identity_refresh_requested.is_set()
@@ -248,6 +251,33 @@ def test_reload_skips_identity_refresh_when_every_interface_known(main_module, m
     the wizard already ran detection, so the receiver does not repeat it."""
     assert not _reload(main_module, monkeypatch, wan_after={'eth8'},
                        map_after={'eth8': '1.1.1.1', 'ppp0': '9.9.9.9'})
+
+
+def test_unchanged_missing_interface_requests_refresh_once(main_module, monkeypatch):
+    """A cold-standby or typo'd WAN interface that is never observed must not
+    re-run detection on every unrelated settings save."""
+    for expected in (True, False, False):
+        assert _reload(main_module, monkeypatch, wan_after={'eth8', 'eth9'},
+                       map_after={'eth8': '1.1.1.1'}) is expected
+
+
+def test_changed_missing_set_requests_refresh_again(main_module, monkeypatch):
+    assert _reload(main_module, monkeypatch, wan_after={'eth8', 'eth9'},
+                   map_after={'eth8': '1.1.1.1'})
+    assert _reload(main_module, monkeypatch, wan_after={'eth8', 'eth7'},
+                   map_after={'eth8': '1.1.1.1'})
+    # eth7 learned: the missing set shrinks to empty, which is a change too
+    assert _reload(main_module, monkeypatch, wan_after={'eth8', 'eth7'},
+                   map_after={'eth8': '1.1.1.1', 'eth7': '7.7.7.7'})
+    assert not _reload(main_module, monkeypatch, wan_after={'eth8', 'eth7'},
+                       map_after={'eth8': '1.1.1.1', 'eth7': '7.7.7.7'})
+
+
+def test_unifi_flip_requests_refresh_even_with_same_missing_set(main_module, monkeypatch):
+    assert _reload(main_module, monkeypatch, wan_after={'eth8', 'eth9'},
+                   map_after={'eth8': '1.1.1.1'})
+    assert _reload(main_module, monkeypatch, wan_after={'eth8', 'eth9'},
+                   map_after={'eth8': '1.1.1.1'}, unifi_before=False, unifi_after=True)
 
 
 def test_unrelated_reload_does_not_request_identity_refresh(main_module, monkeypatch):
