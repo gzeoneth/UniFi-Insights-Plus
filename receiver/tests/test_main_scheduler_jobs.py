@@ -98,17 +98,33 @@ def test_wan_refresh_runs_on_its_own_interval(main_module, monkeypatch):
     assert job.unit == 'minutes'
 
 
-def test_wan_refresh_interval_defaults_to_six_hours(monkeypatch):
+def _import_main(monkeypatch, env_value):
+    """Fresh import of main with WAN_REFRESH_INTERVAL_MINUTES set (None = unset)."""
     monkeypatch.setitem(sys.modules, 'routes.auth', MagicMock())
-    monkeypatch.delenv('WAN_REFRESH_INTERVAL_MINUTES', raising=False)
+    if env_value is None:
+        monkeypatch.delenv('WAN_REFRESH_INTERVAL_MINUTES', raising=False)
+    else:
+        monkeypatch.setenv('WAN_REFRESH_INTERVAL_MINUTES', env_value)
     monkeypatch.delitem(sys.modules, 'main', raising=False)
     import main
-    assert main.WAN_REFRESH_INTERVAL_MINUTES == 360
+    return main
 
 
-def test_wan_refresh_interval_reads_env(monkeypatch):
-    monkeypatch.setitem(sys.modules, 'routes.auth', MagicMock())
-    monkeypatch.setenv('WAN_REFRESH_INTERVAL_MINUTES', '45')
-    monkeypatch.delitem(sys.modules, 'main', raising=False)
-    import main
-    assert main.WAN_REFRESH_INTERVAL_MINUTES == 45
+def _interval_warnings(caplog):
+    return [r for r in caplog.records
+            if r.levelno == logging.WARNING and 'WAN_REFRESH_INTERVAL_MINUTES' in r.getMessage()]
+
+
+@pytest.mark.parametrize('env_value, expected', [(None, 360), ('', 360), ('90', 90)])
+def test_wan_refresh_interval_valid_or_unset(monkeypatch, caplog, env_value, expected):
+    caplog.set_level(logging.WARNING)
+    assert _import_main(monkeypatch, env_value).WAN_REFRESH_INTERVAL_MINUTES == expected
+    assert not _interval_warnings(caplog)
+
+
+@pytest.mark.parametrize('env_value', ['0', '-5', 'abc'])
+def test_wan_refresh_interval_invalid_falls_back_with_warning(monkeypatch, caplog, env_value):
+    """0 or negative would spin schedule.every() forever; non-integers crashed int()."""
+    caplog.set_level(logging.WARNING)
+    assert _import_main(monkeypatch, env_value).WAN_REFRESH_INTERVAL_MINUTES == 360
+    assert len(_interval_warnings(caplog)) == 1

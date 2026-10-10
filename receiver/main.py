@@ -42,7 +42,6 @@ SYSLOG_BUFFER_SIZE = 8192      # Max UDP packet size
 BATCH_SIZE = 50                 # Insert logs in batches
 BATCH_TIMEOUT = 2.0             # Flush batch after N seconds even if not full
 STATS_INTERVAL_MINUTES = 15     # Log stats every N minutes (DEBUG only)
-WAN_REFRESH_INTERVAL_MINUTES = int(os.environ.get('WAN_REFRESH_INTERVAL_MINUTES', 360))  # Log-based WAN/gateway detection
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -57,6 +56,22 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger('receiver')
+
+# Log-based WAN/gateway detection interval. Validated here, after logging is
+# configured, so a bad value warns instead of crashing at import; 0 or a
+# negative value would make schedule.every() loop forever. Blank/unset -> 360.
+WAN_REFRESH_INTERVAL_MINUTES = 360
+_wan_refresh_env = os.environ.get('WAN_REFRESH_INTERVAL_MINUTES', '').strip()
+if _wan_refresh_env:
+    try:
+        _wan_refresh_parsed = int(_wan_refresh_env)
+    except ValueError:
+        _wan_refresh_parsed = 0
+    if _wan_refresh_parsed >= 1:
+        WAN_REFRESH_INTERVAL_MINUTES = _wan_refresh_parsed
+    else:
+        logger.warning("Invalid WAN_REFRESH_INTERVAL_MINUTES '%s' (must be a whole number >= 1), "
+                       "using default %d", _wan_refresh_env, WAN_REFRESH_INTERVAL_MINUTES)
 
 
 # ── Syslog Receiver ───────────────────────────────────────────────────────────
