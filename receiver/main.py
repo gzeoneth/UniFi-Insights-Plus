@@ -42,6 +42,13 @@ _retention_reload_requested = threading.Event()
 # scheduler loop, so detection never runs inside the signal handler.
 _identity_refresh_requested = threading.Event()
 
+# The (wan_ip_by_iface, wan_ips, wan_ip, gateway_ips) tuple the receiver last
+# loaded after a log-based identity refresh; None until the first refresh.
+# Only _refresh_network_identity_from_logs() reads or writes it, and only after
+# a successful reload, so a failed read or reload is retried on the next run.
+_IDENTITY_KEYS = ('wan_ip_by_iface', 'wan_ips', 'wan_ip', 'gateway_ips')
+_loaded_identity = None
+
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 SYSLOG_PORT = 514
@@ -312,21 +319,23 @@ def _refresh_network_identity_from_logs(db: Database, unifi_api: UniFiAPI,
                                         enricher: Enricher = None):
     """Run log-based WAN/gateway detection only when UniFi is not authoritative.
 
-    When the run changes the persisted wan_ip_by_iface or gateway_ips, the
-    running receiver reloads them: parsers always, the enricher when one is
-    passed (startup passes none; the Enricher is built later and preloads
-    from the DB).
+    After the detectors, the persisted identity (wan_ip_by_iface, wan_ips,
+    wan_ip, gateway_ips) is compared with the tuple the receiver last loaded
+    (_loaded_identity); when it differs, parsers reload and the enricher too
+    when one is passed (startup passes none; the Enricher is built later and
+    preloads from the DB). _loaded_identity is updated only after a
+    successful reload, so a failed read or reload retries on the next run.
 
     Never raises: it runs at startup, as a scheduled job (schedule.run_pending()
     does not catch job exceptions, so one would end the scheduler thread) and
     from the scheduler tick.
     """
+    global _loaded_identity
     try:
         if not _use_log_identity_detection(unifi_api):
             return
-        before = (db.get_config('wan_ip_by_iface'), db.get_config('gateway_ips'))
     except Exception as e:
-        logger.error("Network identity refresh skipped (config read failed): %s", e)
+        logger.error("Network identity refresh skipped (UniFi gate check failed): %s", e)
         return
     try:
         db.detect_wan_ip()
@@ -337,13 +346,14 @@ def _refresh_network_identity_from_logs(db: Database, unifi_api: UniFiAPI,
     except Exception as e:
         logger.error("Gateway IP detection failed: %s", e)
     try:
-        after = (db.get_config('wan_ip_by_iface'), db.get_config('gateway_ips'))
-        if after != before:
+        persisted = tuple(db.get_config(key) for key in _IDENTITY_KEYS)
+        if persisted != _loaded_identity:
             parsers.reload_config_from_db(db)
             if enricher is not None:
                 enricher.reload_config()
+            _loaded_identity = persisted
     except Exception as e:
-        logger.error("Reloading detected network identity failed: %s", e)
+        logger.error("Reloading detected network identity failed, will retry: %s", e)
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────

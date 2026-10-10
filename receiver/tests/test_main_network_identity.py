@@ -92,7 +92,16 @@ class TestRefreshNetworkIdentityFromLogs:
 
 
 class TestRefreshReloadsLearnedIdentity:
-    """Identity persisted by a detection run is pushed into parsers/enricher."""
+    """Identity persisted by a detection run is pushed into parsers/enricher.
+
+    The receiver remembers the identity tuple it last loaded
+    (_loaded_identity); a run reloads when the persisted tuple differs, and
+    a failed read or reload leaves it unchanged so the next run retries.
+    """
+
+    KEYS = ('wan_ip_by_iface', 'wan_ips', 'wan_ip', 'gateway_ips')
+    BASE = {'wan_ip_by_iface': {'eth8': '1.1.1.1'}, 'wan_ips': ['1.1.1.1'],
+            'wan_ip': '1.1.1.1', 'gateway_ips': ['10.0.0.1']}
 
     @pytest.fixture
     def parsers_mock(self, monkeypatch):
@@ -100,48 +109,102 @@ class TestRefreshReloadsLearnedIdentity:
         monkeypatch.setitem(_refresh_network_identity_from_logs.__globals__, 'parsers', mock)
         return mock
 
+    @pytest.fixture
+    def loaded(self, monkeypatch):
+        """Set the receiver's last-loaded identity; returns a reader for it."""
+        g = _refresh_network_identity_from_logs.__globals__
+
+        def set_loaded(config):
+            value = None if config is None else tuple(config.get(k) for k in self.KEYS)
+            monkeypatch.setitem(g, '_loaded_identity', value)
+        set_loaded.current = lambda: g['_loaded_identity']
+        return set_loaded
+
     @staticmethod
-    def _db(config, wan_after=None, gateways_after=None):
+    def _db(config, **after):
+        """Config-backed db; the WAN detector applies `after` to the config."""
         db = MagicMock()
         db.get_config.side_effect = lambda key, default=None: config.get(key, default)
-
-        def detect_wan():
-            if wan_after is not None:
-                config['wan_ip_by_iface'] = wan_after
-
-        def detect_gateways():
-            if gateways_after is not None:
-                config['gateway_ips'] = gateways_after
-
-        db.detect_wan_ip.side_effect = detect_wan
-        db.detect_gateway_ips.side_effect = detect_gateways
+        db.detect_wan_ip.side_effect = lambda: config.update(after)
         return db
 
-    def test_changed_wan_identity_reloads_parsers_and_enricher(self, parsers_mock):
-        db = self._db({'wan_ip_by_iface': {'eth8': '1.1.1.1'}, 'gateway_ips': ['10.0.0.1']},
-                      wan_after={'eth8': '2.2.2.2'})
+    def test_unchanged_identity_reloads_nothing(self, parsers_mock, loaded):
+        config = dict(self.BASE)
+        loaded(config)
         enricher = MagicMock()
-        _refresh_network_identity_from_logs(db, _unifi(False), enricher)
-        parsers_mock.reload_config_from_db.assert_called_once_with(db)
-        enricher.reload_config.assert_called_once()
-
-    def test_changed_gateways_reload_parsers_and_enricher(self, parsers_mock):
-        db = self._db({'wan_ip_by_iface': {'eth8': '1.1.1.1'}, 'gateway_ips': ['10.0.0.1']},
-                      gateways_after=['10.0.0.1', '10.0.50.1'])
-        enricher = MagicMock()
-        _refresh_network_identity_from_logs(db, _unifi(False), enricher)
-        parsers_mock.reload_config_from_db.assert_called_once_with(db)
-        enricher.reload_config.assert_called_once()
-
-    def test_unchanged_identity_reloads_nothing(self, parsers_mock):
-        db = self._db({'wan_ip_by_iface': {'eth8': '1.1.1.1'}, 'gateway_ips': ['10.0.0.1']})
-        enricher = MagicMock()
-        _refresh_network_identity_from_logs(db, _unifi(False), enricher)
+        _refresh_network_identity_from_logs(self._db(config), _unifi(False), enricher)
         parsers_mock.reload_config_from_db.assert_not_called()
         enricher.reload_config.assert_not_called()
 
-    def test_changed_identity_without_enricher_reloads_parsers(self, parsers_mock):
-        """Startup passes no enricher (it is built later and preloads from the DB)."""
-        db = self._db({}, wan_after={'eth8': '2.2.2.2'})
+    def test_changed_wan_map_reloads_parsers_and_enricher(self, parsers_mock, loaded):
+        config = dict(self.BASE)
+        loaded(config)
+        db = self._db(config, wan_ip_by_iface={'eth8': '2.2.2.2'})
+        enricher = MagicMock()
+        _refresh_network_identity_from_logs(db, _unifi(False), enricher)
+        parsers_mock.reload_config_from_db.assert_called_once_with(db)
+        enricher.reload_config.assert_called_once()
+        assert loaded.current()[0] == {'eth8': '2.2.2.2'}
+
+    def test_wan_ip_only_change_reloads(self, parsers_mock, loaded):
+        """detect_wan_ip can rewrite wan_ip/wan_ips without changing the map."""
+        config = dict(self.BASE)
+        loaded(config)
+        db = self._db(config, wan_ip='3.3.3.3', wan_ips=['3.3.3.3'])
+        enricher = MagicMock()
+        _refresh_network_identity_from_logs(db, _unifi(False), enricher)
+        parsers_mock.reload_config_from_db.assert_called_once_with(db)
+        enricher.reload_config.assert_called_once()
+
+    def test_changed_gateways_reload_parsers_and_enricher(self, parsers_mock, loaded):
+        config = dict(self.BASE)
+        loaded(config)
+        db = MagicMock()
+        db.get_config.side_effect = lambda key, default=None: config.get(key, default)
+        db.detect_gateway_ips.side_effect = lambda: config.update(gateway_ips=['10.0.0.1', '10.0.50.1'])
+        enricher = MagicMock()
+        _refresh_network_identity_from_logs(db, _unifi(False), enricher)
+        parsers_mock.reload_config_from_db.assert_called_once_with(db)
+        enricher.reload_config.assert_called_once()
+
+    def test_first_run_reloads_parsers_without_enricher(self, parsers_mock, loaded):
+        """Startup: nothing loaded yet and no enricher (it is built later and
+        preloads from the DB)."""
+        loaded(None)
+        db = self._db(dict(self.BASE))
         _refresh_network_identity_from_logs(db, _unifi(False))
         parsers_mock.reload_config_from_db.assert_called_once_with(db)
+
+    def test_failed_read_retries_on_next_run(self, parsers_mock, loaded):
+        config = dict(self.BASE)
+        loaded(config)
+        db = self._db(config, wan_ip_by_iface={'eth8': '2.2.2.2'})
+        reads = {'fail': True}
+        real_get = db.get_config.side_effect
+
+        def get_config(key, default=None):
+            if reads['fail']:
+                raise Exception('db down')
+            return real_get(key, default)
+
+        db.get_config.side_effect = get_config
+        _refresh_network_identity_from_logs(db, _unifi(False))
+        parsers_mock.reload_config_from_db.assert_not_called()
+
+        reads['fail'] = False  # same data, DB back
+        _refresh_network_identity_from_logs(db, _unifi(False))
+        parsers_mock.reload_config_from_db.assert_called_once_with(db)
+
+    def test_failed_reload_retries_on_next_run(self, parsers_mock, loaded):
+        config = dict(self.BASE)
+        loaded(config)
+        db = self._db(config, wan_ip_by_iface={'eth8': '2.2.2.2'})
+        before = loaded.current()
+        parsers_mock.reload_config_from_db.side_effect = [Exception('db down'), None]
+
+        _refresh_network_identity_from_logs(db, _unifi(False))
+        assert loaded.current() == before
+
+        _refresh_network_identity_from_logs(db, _unifi(False))
+        assert parsers_mock.reload_config_from_db.call_count == 2
+        assert loaded.current()[0] == {'eth8': '2.2.2.2'}
