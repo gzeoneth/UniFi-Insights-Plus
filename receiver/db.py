@@ -1921,10 +1921,23 @@ END $$;""",
           OR host(dst_ip) = '255.255.255.255')
     """
 
+    # Detection queries only look at firewall rows from the 7 days before the
+    # newest firewall row (not wall-clock time, so a gateway that stopped
+    # sending still has a window). MAX() and the range both use
+    # idx_logs_type_time instead of scanning every firewall row (#103).
+    # With no firewall rows the CTE yields NULL and the query returns nothing.
+    _RECENT_FIREWALL_CTE = """
+        WITH recent AS (
+            SELECT MAX(timestamp) AS t FROM logs WHERE log_type = 'firewall'
+        )
+    """
+
     def get_wan_ips_by_interface(self, interfaces: list) -> dict:
         """Detect WAN IP for each interface using the most common public dst_ip.
 
-        Returns dict of {interface: wan_ip_str} for each interface that has one.
+        Only firewall rows in the recent window are considered (see
+        _RECENT_FIREWALL_CTE). Returns dict of {interface: wan_ip_str} for
+        each interface that has one.
         """
         if not interfaces:
             return {}
@@ -1932,10 +1945,12 @@ END $$;""",
             with conn.cursor() as cur:
                 placeholders = ','.join(['%s'] * len(interfaces))
                 cur.execute(f"""
+                    {self._RECENT_FIREWALL_CTE}
                     SELECT interface_in AS iface,
                            MODE() WITHIN GROUP (ORDER BY host(dst_ip)) AS wan_ip
-                    FROM logs
+                    FROM logs, recent
                     WHERE log_type = 'firewall'
+                      AND timestamp >= recent.t - INTERVAL '7 days'
                       AND interface_in IN ({placeholders})
                       AND dst_ip IS NOT NULL
                       AND {self._PRIVATE_IP_FILTER}
@@ -1944,13 +1959,19 @@ END $$;""",
                 return {row[0]: row[1] for row in cur.fetchall() if row[1]}
 
     def detect_wan_ip(self) -> str | None:
-        """Detect WAN IPs from logs and persist to system_config.
+        """Detect WAN IPs from logs and merge them into system_config.
 
         Only called when unifi_enabled is false (gated by caller).
-        Computes per-interface WAN IPs from logs via
-        get_wan_ips_by_interface() and stores wan_ip_by_iface automatically.
+        Observes per-interface WAN IPs via get_wan_ips_by_interface() and
+        merges them into the persisted wan_ip_by_iface:
+          - entries for interfaces no longer in wan_interfaces are pruned;
+          - observed interfaces take the observed IP;
+          - interfaces with no rows in the window keep their persisted IP,
+            so a quiet WAN2 or a quiet gateway never erases identity.
+        wan_ips / wan_ip are derived from the merged map in wan_interfaces
+        order. Each key is written only when its value changes.
 
-        Returns the primary detected WAN IP or None.
+        Returns the primary WAN IP (first in wan_interfaces order) or None.
 
         .. deprecated:: Phase 1 transition
             Retained for phase-1 transition only (non-UniFi installs).
@@ -1960,19 +1981,23 @@ END $$;""",
         if not wan_interfaces:
             return None
 
-        # Compute per-interface WAN IPs from logs
+        current_map = self.get_config('wan_ip_by_iface') or {}
+        # Prune interfaces that are no longer configured (always, even when
+        # nothing was observed in the window).
+        merged = {k: v for k, v in current_map.items() if k in wan_interfaces}
         iface_ips = self.get_wan_ips_by_interface(wan_interfaces)
-
-        # Store wan_ip_by_iface (auto-populate for legacy installs)
         if iface_ips:
-            current_map = self.get_config('wan_ip_by_iface')
-            if current_map != iface_ips:
-                self.set_config('wan_ip_by_iface', iface_ips)
-                logger.info("wan_ip_by_iface auto-populated from logs: %s", iface_ips)
+            merged.update(iface_ips)  # positive observations win
+        else:
+            logger.debug("WAN detection: no observations in window; "
+                         "keeping persisted identity (pruning only)")
+
+        if merged != current_map:
+            self.set_config('wan_ip_by_iface', merged)
+            logger.info("wan_ip_by_iface merged from logs: %s", merged)
 
         # Derive ordered wan_ips following wan_interfaces order
-        wan_ips = [iface_ips[iface] for iface in wan_interfaces
-                   if iface in iface_ips and iface_ips[iface]]
+        wan_ips = [merged[iface] for iface in wan_interfaces if merged.get(iface)]
         primary = wan_ips[0] if wan_ips else None
 
         # Persist primary wan_ip
@@ -2000,15 +2025,26 @@ END $$;""",
 
         UniFi zone-based rules ending in '_LOCAL' target traffic destined for
         the gateway itself. The dst_ip on those rules (excluding broadcast/
-        multicast) gives us the gateway's internal IP per VLAN.
-        Stores result as 'gateway_ips' list in system_config.
+        multicast) gives us the gateway's internal IP per VLAN. Only firewall
+        rows in the recent window are considered (see _RECENT_FIREWALL_CTE).
+
+        Observed IPs are merged into the persisted 'gateway_ips' list
+        (sorted union), written only when the union grows. Addresses are
+        never removed automatically: a VLAN that was quiet in the window
+        keeps its gateway IP. The only removal path is clearing
+        'gateway_ips' through config import or SQL; a Settings reset button
+        is deferred to the Phase 2 settings work.
+
+        Returns the merged list.
         """
         with self.get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
+                cur.execute(f"""
+                    {self._RECENT_FIREWALL_CTE}
                     SELECT DISTINCT host(dst_ip) AS gateway_ip
-                    FROM logs
+                    FROM logs, recent
                     WHERE log_type = 'firewall'
+                      AND timestamp >= recent.t - INTERVAL '7 days'
                       AND rule_name LIKE '%%\\_LOCAL%%'
                       AND (dst_ip << '10.0.0.0/8' OR dst_ip << '172.16.0.0/12'
                            OR dst_ip << '192.168.0.0/16'
@@ -2017,12 +2053,13 @@ END $$;""",
                 """)
                 detected = [row[0] for row in cur.fetchall()]
 
-        current = self.get_config('gateway_ips', [])
-        if sorted(detected) != sorted(current):
-            self.set_config('gateway_ips', detected)
-            logger.info("Gateway IPs detected: %s", detected)
+        current = self.get_config('gateway_ips', []) or []
+        merged = sorted(set(current) | set(detected))
+        if merged != sorted(current):
+            self.set_config('gateway_ips', merged)
+            logger.info("Gateway IPs merged from logs: %s", merged)
 
-        return detected
+        return merged
 
     def get_wan_ip_candidates(self) -> list[dict]:
         """Return non-bridge, non-VPN firewall interfaces with their WAN IPs.

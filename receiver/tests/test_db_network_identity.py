@@ -3,6 +3,8 @@
 Covers:
 - extract_network_identity_from_net_config()
 - Database.persist_network_identity()
+- Database.get_wan_ips_by_interface() / detect_gateway_ips() query window
+- Database.detect_wan_ip() / detect_gateway_ips() merge persistence (#103)
 """
 
 from unittest.mock import MagicMock
@@ -165,3 +167,142 @@ class TestPersistNetworkIdentity:
         keys_written = [c[0][0] for c in mock_db.set_config.call_args_list]
         assert 'wan_ip_by_iface' in keys_written
         assert 'gateway_ip_vlans' in keys_written
+
+
+# ── Log-based detection (issue #103) ────────────────────────────────────────
+
+def _config_db(config, rows=()):
+    """MagicMock Database backed by a config dict; set_config writes through.
+
+    `rows` is what the detection query's cursor returns from fetchall().
+    """
+    db = MagicMock()
+    # SQL fragments are class attributes read through `self`
+    db._RECENT_FIREWALL_CTE = Database._RECENT_FIREWALL_CTE
+    db._PRIVATE_IP_FILTER = Database._PRIVATE_IP_FILTER
+    db.get_config.side_effect = lambda key, default=None: config.get(key, default)
+    db.set_config.side_effect = config.__setitem__
+    cur = MagicMock()
+    cur.fetchall.return_value = list(rows)
+    conn = db.get_conn.return_value.__enter__.return_value
+    conn.cursor.return_value.__enter__.return_value = cur
+    return db, cur
+
+
+def _keys_written(db):
+    return [c.args[0] for c in db.set_config.call_args_list]
+
+
+class TestDetectionQueryWindow:
+    """Detection queries are bounded to 7 days before the newest firewall row."""
+
+    def test_wan_query_is_windowed(self):
+        db, cur = _config_db({}, rows=[('eth8', '1.1.1.1')])
+        assert Database.get_wan_ips_by_interface(db, ['eth8', 'eth9']) == {'eth8': '1.1.1.1'}
+        sql, params = cur.execute.call_args.args
+        assert 'MAX(timestamp)' in sql
+        assert "INTERVAL '7 days'" in sql
+        assert 'host(dst_ip)' in sql
+        assert params == ['eth8', 'eth9']
+
+    def test_gateway_query_is_windowed(self):
+        db, cur = _config_db({'gateway_ips': []}, rows=[('192.168.1.1',)])
+        Database.detect_gateway_ips(db)
+        sql = cur.execute.call_args.args[0]
+        assert 'MAX(timestamp)' in sql
+        assert "INTERVAL '7 days'" in sql
+
+
+class TestDetectWanIpMerge:
+    """detect_wan_ip() merges observations into persisted identity."""
+
+    def test_keeps_wan2_when_only_wan1_observed(self):
+        config = {
+            'wan_interfaces': ['eth8', 'eth9'],
+            'wan_ip_by_iface': {'eth8': '1.1.1.1', 'eth9': '2.2.2.2'},
+            'wan_ips': ['1.1.1.1', '2.2.2.2'],
+            'wan_ip': '1.1.1.1',
+        }
+        db, _ = _config_db(config)
+        db.get_wan_ips_by_interface.return_value = {'eth8': '3.3.3.3'}
+
+        assert Database.detect_wan_ip(db) == '3.3.3.3'
+        assert config['wan_ip_by_iface'] == {'eth8': '3.3.3.3', 'eth9': '2.2.2.2'}
+        assert config['wan_ips'] == ['3.3.3.3', '2.2.2.2']
+        assert config['wan_ip'] == '3.3.3.3'
+
+    def test_empty_observation_persists_nothing(self):
+        config = {
+            'wan_interfaces': ['eth8', 'eth9'],
+            'wan_ip_by_iface': {'eth8': '1.1.1.1', 'eth9': '2.2.2.2'},
+            'wan_ips': ['1.1.1.1', '2.2.2.2'],
+            'wan_ip': '1.1.1.1',
+        }
+        db, _ = _config_db(config)
+        db.get_wan_ips_by_interface.return_value = {}
+
+        assert Database.detect_wan_ip(db) == '1.1.1.1'
+        db.set_config.assert_not_called()
+
+    def test_removed_interface_pruned_even_without_observations(self):
+        config = {
+            'wan_interfaces': ['eth8'],
+            'wan_ip_by_iface': {'eth8': '1.1.1.1', 'eth9': '2.2.2.2'},
+            'wan_ips': ['1.1.1.1', '2.2.2.2'],
+            'wan_ip': '1.1.1.1',
+        }
+        db, _ = _config_db(config)
+        db.get_wan_ips_by_interface.return_value = {}
+
+        assert Database.detect_wan_ip(db) == '1.1.1.1'
+        assert config['wan_ip_by_iface'] == {'eth8': '1.1.1.1'}
+        assert config['wan_ips'] == ['1.1.1.1']
+        assert 'wan_ip' not in _keys_written(db)
+
+    def test_first_detection_populates_identity(self):
+        config = {'wan_interfaces': ['ppp0']}
+        db, _ = _config_db(config)
+        db.get_wan_ips_by_interface.return_value = {'ppp0': '5.5.5.5'}
+
+        assert Database.detect_wan_ip(db) == '5.5.5.5'
+        assert config['wan_ip_by_iface'] == {'ppp0': '5.5.5.5'}
+        assert config['wan_ips'] == ['5.5.5.5']
+        assert config['wan_ip'] == '5.5.5.5'
+
+    def test_unchanged_observation_writes_nothing(self):
+        config = {
+            'wan_interfaces': ['eth8'],
+            'wan_ip_by_iface': {'eth8': '1.1.1.1'},
+            'wan_ips': ['1.1.1.1'],
+            'wan_ip': '1.1.1.1',
+        }
+        db, _ = _config_db(config)
+        db.get_wan_ips_by_interface.return_value = {'eth8': '1.1.1.1'}
+
+        Database.detect_wan_ip(db)
+        db.set_config.assert_not_called()
+
+
+class TestDetectGatewayIpsMerge:
+    """detect_gateway_ips() unions observations and never drops an address."""
+
+    def test_unions_with_persisted(self):
+        config = {'gateway_ips': ['10.0.0.1']}
+        db, _ = _config_db(config, rows=[('192.168.1.1',)])
+
+        assert Database.detect_gateway_ips(db) == ['10.0.0.1', '192.168.1.1']
+        assert config['gateway_ips'] == ['10.0.0.1', '192.168.1.1']
+
+    def test_empty_observation_keeps_persisted(self):
+        config = {'gateway_ips': ['10.0.0.1', '192.168.1.1']}
+        db, _ = _config_db(config, rows=[])
+
+        assert Database.detect_gateway_ips(db) == ['10.0.0.1', '192.168.1.1']
+        db.set_config.assert_not_called()
+
+    def test_partial_observation_never_drops(self):
+        config = {'gateway_ips': ['10.0.0.1', '192.168.1.1']}
+        db, _ = _config_db(config, rows=[('192.168.1.1',)])
+
+        assert Database.detect_gateway_ips(db) == ['10.0.0.1', '192.168.1.1']
+        db.set_config.assert_not_called()
