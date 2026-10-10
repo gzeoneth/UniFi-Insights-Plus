@@ -2017,17 +2017,11 @@ END $$;""",
         iface_ips = self.get_wan_ips_by_interface(wan_interfaces)
         if iface_ips:
             merged.update(iface_ips)  # positive observations win
-        elif not merged:
-            if current_map:
-                logger.debug("WAN detection: no observations in window and no "
-                             "configured interface persisted; pruning deferred "
-                             "until an interface is observed")
-            else:
-                logger.debug("WAN detection: no observations in window")
+        if not merged:
+            # Never write an empty map; prune once an interface is observed.
+            logger.debug("WAN detection: no observations in window%s",
+                         ' (pruning deferred)' if current_map else '')
             return None
-        else:
-            logger.debug("WAN detection: no observations in window; "
-                         "keeping persisted identity (pruning only)")
 
         if merged != current_map:
             self.set_config('wan_ip_by_iface', merged)
