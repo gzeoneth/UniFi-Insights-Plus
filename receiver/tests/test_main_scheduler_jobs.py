@@ -101,16 +101,11 @@ def test_wan_refresh_runs_on_its_own_interval(main_module, monkeypatch):
     assert job.unit == 'minutes'
 
 
-def _import_main(monkeypatch, env_value):
-    """Fresh import of main with WAN_REFRESH_INTERVAL_MINUTES set (None = unset)."""
-    monkeypatch.setitem(sys.modules, 'routes.auth', MagicMock())
+def _set_env(monkeypatch, env_value):
     if env_value is None:
         monkeypatch.delenv('WAN_REFRESH_INTERVAL_MINUTES', raising=False)
     else:
         monkeypatch.setenv('WAN_REFRESH_INTERVAL_MINUTES', env_value)
-    monkeypatch.delitem(sys.modules, 'main', raising=False)
-    import main
-    return main
 
 
 def _interval_warnings(caplog):
@@ -119,18 +114,31 @@ def _interval_warnings(caplog):
 
 
 @pytest.mark.parametrize('env_value, expected', [(None, 360), ('', 360), ('90', 90)])
-def test_wan_refresh_interval_valid_or_unset(monkeypatch, caplog, env_value, expected):
+def test_wan_refresh_interval_valid_or_unset(main_module, monkeypatch, caplog, env_value, expected):
     caplog.set_level(logging.WARNING)
-    assert _import_main(monkeypatch, env_value).WAN_REFRESH_INTERVAL_MINUTES == expected
+    _set_env(monkeypatch, env_value)
+    assert main_module._wan_refresh_interval_from_env() == expected
     assert not _interval_warnings(caplog)
 
 
 @pytest.mark.parametrize('env_value', ['0', '-5', 'abc'])
-def test_wan_refresh_interval_invalid_falls_back_with_warning(monkeypatch, caplog, env_value):
+def test_wan_refresh_interval_invalid_falls_back_with_warning(main_module, monkeypatch, caplog, env_value):
     """0 or negative would spin schedule.every() forever; non-integers crashed int()."""
     caplog.set_level(logging.WARNING)
-    assert _import_main(monkeypatch, env_value).WAN_REFRESH_INTERVAL_MINUTES == 360
+    _set_env(monkeypatch, env_value)
+    assert main_module._wan_refresh_interval_from_env() == 360
     assert len(_interval_warnings(caplog)) == 1
+
+
+def test_wan_refresh_interval_read_at_import(monkeypatch):
+    """The module constant comes from the env parser, with no parse globals left behind."""
+    monkeypatch.setitem(sys.modules, 'routes.auth', MagicMock())
+    _set_env(monkeypatch, '45')
+    monkeypatch.delitem(sys.modules, 'main', raising=False)
+    import main
+    assert main.WAN_REFRESH_INTERVAL_MINUTES == 45
+    assert not hasattr(main, '_wan_refresh_env')
+    assert not hasattr(main, '_wan_refresh_parsed')
 
 
 # ── Identity refresh on config reload ───────────────────────────────────────

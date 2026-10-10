@@ -64,17 +64,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger('receiver')
 
-# Log-based WAN/gateway detection interval. Validated here, after logging is
-# configured, so a bad value warns instead of crashing at import; 0 or a
-# negative value would make schedule.every() loop forever. Blank/unset -> 360.
-WAN_REFRESH_INTERVAL_MINUTES = 360
-_wan_refresh_env = os.environ.get('WAN_REFRESH_INTERVAL_MINUTES', '').strip()
-_wan_refresh_parsed = parse_positive_int(_wan_refresh_env)
-if _wan_refresh_parsed is not None:
-    WAN_REFRESH_INTERVAL_MINUTES = _wan_refresh_parsed
-elif _wan_refresh_env:
-    logger.warning("Invalid WAN_REFRESH_INTERVAL_MINUTES '%s' (must be a whole number >= 1), "
-                   "using default %d", _wan_refresh_env, WAN_REFRESH_INTERVAL_MINUTES)
+
+def _wan_refresh_interval_from_env() -> int:
+    """Minutes between log-based WAN/gateway detections (default 360).
+
+    Parsed after logging is configured, so a bad value warns instead of
+    crashing at import; 0 or a negative value would make schedule.every()
+    loop forever. Blank or unset uses the default silently.
+    """
+    default = 360
+    raw = os.environ.get('WAN_REFRESH_INTERVAL_MINUTES', '').strip()
+    parsed = parse_positive_int(raw)
+    if parsed is not None:
+        return parsed
+    if raw:
+        logger.warning("Invalid WAN_REFRESH_INTERVAL_MINUTES '%s' (must be a whole number >= 1), "
+                       "using default %d", raw, default)
+    return default
+
+
+WAN_REFRESH_INTERVAL_MINUTES = _wan_refresh_interval_from_env()
 
 
 # ── Syslog Receiver ───────────────────────────────────────────────────────────
