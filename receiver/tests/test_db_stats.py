@@ -1,11 +1,11 @@
-"""Tests for Database.get_stats() (issue #103).
+"""Tests for estimate_log_count() and Database.get_stats() (issue #103).
 
 The total must come from the pg_class.reltuples estimate, never from a
 full-table COUNT(*) over logs.
 """
 from unittest.mock import MagicMock
 
-from db import Database
+from db import Database, estimate_log_count
 
 
 def _mock_db(fetchone=(1234,), fetchall=(('firewall', 7),)):
@@ -43,3 +43,18 @@ def test_returns_estimate_and_hourly_breakdown():
 def test_total_zero_when_catalog_row_missing():
     db, _ = _mock_db(fetchone=None, fetchall=())
     assert Database.get_stats(db) == {'total': 0, 'last_hour': {}}
+
+
+def test_estimate_log_count_reads_reltuples():
+    cur = MagicMock()
+    cur.fetchone.return_value = (987,)
+    assert estimate_log_count(cur) == 987
+    sql = _executed_sql(cur)
+    assert len(sql) == 1
+    assert 'reltuples' in sql[0] and 'pg_class' in sql[0]
+
+
+def test_estimate_log_count_zero_without_catalog_row():
+    cur = MagicMock()
+    cur.fetchone.return_value = None
+    assert estimate_log_count(cur) == 0

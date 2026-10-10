@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException
 
-from db import Database, LOGS_ROW_ESTIMATE_SQL, get_config, is_external_db
+from db import Database, estimate_log_count, get_config, is_external_db
 from enrichment import get_abuseipdb_stats
 from deps import get_conn, put_conn, enricher_db, APP_VERSION
 
@@ -24,9 +24,7 @@ def health():
         with conn.cursor() as cur:
             # Catalog estimate, not COUNT(*): on 100M+ rows the exact count takes
             # 5-7s per call and causes /api/health 503s via statement_timeout.
-            cur.execute(LOGS_ROW_ESTIMATE_SQL)
-            row = cur.fetchone()
-            total = row[0] if row else 0
+            total = estimate_log_count(cur)
 
             # MIN/MAX on idx_logs_timestamp btree: two index edge lookups (~1ms)
             cur.execute("SELECT MIN(timestamp), MAX(timestamp) FROM logs")
