@@ -52,6 +52,9 @@ def test_estimate_log_count_reads_reltuples():
     sql = _executed_sql(cur)
     assert len(sql) == 1
     assert 'reltuples' in sql[0] and 'pg_class' in sql[0]
+    # Resolve logs through search_path (external DBs may not use 'public')
+    assert "to_regclass('logs')" in sql[0]
+    assert 'nspname' not in sql[0]
 
 
 def test_estimate_log_count_zero_without_catalog_row():

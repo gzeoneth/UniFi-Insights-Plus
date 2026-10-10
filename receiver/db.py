@@ -153,12 +153,13 @@ INSERT_SQL = f"""
     VALUES ({', '.join(['%s'] * len(INSERT_COLUMNS))})
 """
 
+# to_regclass() resolves logs through search_path, so an external DB that
+# keeps the tables outside 'public' still gets an estimate; it is NULL when
+# the table is missing, which yields no row (estimate 0).
 _LOGS_ROW_ESTIMATE_SQL = """
     SELECT COALESCE(GREATEST(c.reltuples::bigint, 0), 0)
     FROM pg_class c
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE c.relname = 'logs'
-      AND n.nspname = 'public'
+    WHERE c.oid = to_regclass('logs')
 """
 
 
