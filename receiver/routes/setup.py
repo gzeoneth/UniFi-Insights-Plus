@@ -269,17 +269,22 @@ def complete_setup(body: dict):
         # with the same detectors the receiver runs, so a quiet WAN2 outside the
         # detection window keeps its persisted IP. wan_interfaces is already
         # saved above, and identity is persisted before signal_receiver() below.
+        # Same gate as the receiver: with UniFi enabled its maps stay authoritative.
         # Phase-1 transition: removal target phase 2 log-detection decommission
-        try:
-            enricher_db.detect_wan_ip()
-        except Exception:
-            logger.warning("Setup: WAN identity detection from logs failed — "
-                           "receiver refresh will retry", exc_info=True)
-        try:
-            enricher_db.detect_gateway_ips()
-        except Exception:
-            logger.warning("Setup: gateway identity detection from logs failed — "
-                           "receiver refresh will retry", exc_info=True)
+        if get_config(enricher_db, "unifi_enabled", False):
+            logger.info("Setup: UniFi integration enabled — WAN/gateway identity "
+                        "stays UniFi-authoritative, skipping log detection")
+        else:
+            try:
+                enricher_db.detect_wan_ip()
+            except Exception:
+                logger.warning("Setup: WAN identity detection from logs failed — "
+                               "receiver refresh will retry", exc_info=True)
+            try:
+                enricher_db.detect_gateway_ips()
+            except Exception:
+                logger.warning("Setup: gateway identity detection from logs failed — "
+                               "receiver refresh will retry", exc_info=True)
 
     # Trigger direction backfill if WAN interfaces actually changed
     new_wan = set(body["wan_interfaces"])
