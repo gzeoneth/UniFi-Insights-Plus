@@ -1991,9 +1991,14 @@ END $$;""",
           - entries for interfaces no longer in wan_interfaces are pruned;
           - observed interfaces take the observed IP;
           - interfaces with no rows in the window keep their persisted IP,
-            so a quiet WAN2 or a quiet gateway never erases identity.
+            so a quiet WAN2 or a quiet gateway never erases identity;
+          - an empty map is never written: when pruning would leave nothing
+            and nothing was observed, the persisted identity is kept until
+            a configured interface is observed (an empty map would make
+            get_wan_ips_from_config() fall back to the legacy wan_ips).
         wan_ips / wan_ip are derived from the merged map in wan_interfaces
-        order. Each key is written only when its value changes.
+        order and are never written empty. Each key is written only when
+        its value changes.
 
         Returns the primary WAN IP (first in wan_interfaces order) or None.
 
@@ -2006,12 +2011,20 @@ END $$;""",
             return None
 
         current_map = self.get_config('wan_ip_by_iface') or {}
-        # Prune interfaces that are no longer configured (always, even when
-        # nothing was observed in the window).
+        # Prune interfaces that are no longer configured, even when nothing
+        # was observed in the window, as long as something remains.
         merged = {k: v for k, v in current_map.items() if k in wan_interfaces}
         iface_ips = self.get_wan_ips_by_interface(wan_interfaces)
         if iface_ips:
             merged.update(iface_ips)  # positive observations win
+        elif not merged:
+            if current_map:
+                logger.debug("WAN detection: no observations in window and no "
+                             "configured interface persisted; pruning deferred "
+                             "until an interface is observed")
+            else:
+                logger.debug("WAN detection: no observations in window")
+            return None
         else:
             logger.debug("WAN detection: no observations in window; "
                          "keeping persisted identity (pruning only)")

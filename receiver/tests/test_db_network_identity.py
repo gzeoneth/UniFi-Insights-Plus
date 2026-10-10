@@ -316,8 +316,9 @@ class TestDetectWanIpMerge:
         db.set_config.assert_not_called()
 
     def test_removed_interface_pruned_even_without_observations(self):
+        """Pruning applies without observations while the merged map stays non-empty."""
         config = {
-            'wan_interfaces': ['eth8'],
+            'wan_interfaces': ['eth9'],
             'wan_ip_by_iface': {'eth8': '1.1.1.1', 'eth9': '2.2.2.2'},
             'wan_ips': ['1.1.1.1', '2.2.2.2'],
             'wan_ip': '1.1.1.1',
@@ -325,10 +326,43 @@ class TestDetectWanIpMerge:
         db, _ = _config_db(config)
         db.get_wan_ips_by_interface.return_value = {}
 
-        assert Database.detect_wan_ip(db) == '1.1.1.1'
-        assert config['wan_ip_by_iface'] == {'eth8': '1.1.1.1'}
-        assert config['wan_ips'] == ['1.1.1.1']
-        assert 'wan_ip' not in _keys_written(db)
+        assert Database.detect_wan_ip(db) == '2.2.2.2'
+        assert config['wan_ip_by_iface'] == {'eth9': '2.2.2.2'}
+        assert config['wan_ips'] == ['2.2.2.2']
+        assert config['wan_ip'] == '2.2.2.2'
+
+    def test_prune_to_empty_is_deferred(self):
+        """Every persisted interface removed and nothing observed: write nothing.
+
+        An empty wan_ip_by_iface would make get_wan_ips_from_config() fall
+        back to the stale legacy wan_ips, so pruning waits for an observation.
+        """
+        config = {
+            'wan_interfaces': ['eth7'],
+            'wan_ip_by_iface': {'eth8': '1.1.1.1', 'eth9': '2.2.2.2'},
+            'wan_ips': ['1.1.1.1', '2.2.2.2'],
+            'wan_ip': '1.1.1.1',
+        }
+        db, _ = _config_db(config)
+        db.get_wan_ips_by_interface.return_value = {}
+
+        assert Database.detect_wan_ip(db) is None
+        db.set_config.assert_not_called()
+
+    def test_prune_applies_once_new_interface_observed(self):
+        config = {
+            'wan_interfaces': ['eth7'],
+            'wan_ip_by_iface': {'eth8': '1.1.1.1'},
+            'wan_ips': ['1.1.1.1'],
+            'wan_ip': '1.1.1.1',
+        }
+        db, _ = _config_db(config)
+        db.get_wan_ips_by_interface.return_value = {'eth7': '7.7.7.7'}
+
+        assert Database.detect_wan_ip(db) == '7.7.7.7'
+        assert config['wan_ip_by_iface'] == {'eth7': '7.7.7.7'}
+        assert config['wan_ips'] == ['7.7.7.7']
+        assert config['wan_ip'] == '7.7.7.7'
 
     def test_legacy_wan_ips_kept_when_nothing_observed(self):
         """Pre-multi-WAN install: only wan_ips/wan_ip, no wan_ip_by_iface."""
