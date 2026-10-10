@@ -445,11 +445,18 @@ class TestSetupIdentitySeeding:
         assert resp.status_code == 200
         mock_deps.enricher_db.persist_network_identity.assert_called_once()
 
-    def test_log_detection_branch_still_works(self, setup_client):
-        """Log-detection branch persists via inline set_config, not shared helper."""
+    def test_log_detection_branch_merges_identity(self, setup_client):
+        """Log-detection branch runs the merging detectors before the reload signal.
+
+        A wholesale wan_ip_by_iface write from the (windowed) observation
+        would drop a quiet WAN2 that detect_wan_ip()'s merge preserves.
+        """
         client, mock_deps, mock_db = setup_client
         mock_db.get_config.return_value = ['ppp0']
-        mock_deps.enricher_db.get_wan_ips_by_interface.return_value = {'ppp0': '9.9.9.9'}
+        order = []
+        mock_deps.enricher_db.detect_wan_ip.side_effect = lambda: order.append('wan')
+        mock_deps.enricher_db.detect_gateway_ips.side_effect = lambda: order.append('gateway')
+        mock_deps.signal_receiver.side_effect = lambda: order.append('signal')
 
         with patch('routes.setup.invalidate_fw_cache'):
             resp = client.post('/api/setup/complete', json={
@@ -458,9 +465,30 @@ class TestSetupIdentitySeeding:
             })
 
         assert resp.status_code == 200
-        mock_deps.enricher_db.get_wan_ips_by_interface.assert_called_once()
-        # Shared helper NOT called — log path uses inline persistence
+        assert order == ['wan', 'gateway', 'signal']
+        mock_deps.enricher_db.get_wan_ips_by_interface.assert_not_called()
         mock_deps.enricher_db.persist_network_identity.assert_not_called()
+        identity_keys = {'wan_ip_by_iface', 'wan_ips', 'wan_ip', 'gateway_ips'}
+        # set_config(db, key, value) and db.set_config(key, value) alike
+        for setter in (mock_db.set_config, mock_deps.enricher_db.set_config):
+            assert not [c for c in setter.call_args_list
+                        if any(isinstance(a, str) and a in identity_keys for a in c.args)]
+
+    def test_log_detection_failure_does_not_hard_fail(self, setup_client):
+        """Detection is best-effort: one detector failing never blocks setup."""
+        client, mock_deps, mock_db = setup_client
+        mock_db.get_config.return_value = ['ppp0']
+        mock_deps.enricher_db.detect_wan_ip.side_effect = Exception('db down')
+
+        with patch('routes.setup.invalidate_fw_cache'):
+            resp = client.post('/api/setup/complete', json={
+                'wan_interfaces': ['ppp0'],
+                'wizard_path': 'log_detection',
+            })
+
+        assert resp.status_code == 200
+        mock_deps.enricher_db.detect_gateway_ips.assert_called_once()
+        mock_deps.signal_receiver.assert_called_once()
 
     def test_partial_wan_does_not_hard_fail(self, setup_client):
         """UniFi setup succeeds even when get_network_config raises."""

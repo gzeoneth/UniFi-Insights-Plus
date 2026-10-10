@@ -265,16 +265,21 @@ def complete_setup(body: dict):
             logger.warning("Setup: UniFi identity seed incomplete — "
                            "poll will refresh", exc_info=True)
     elif wizard_path == "log_detection":
-        # Log-detection path: compute wan_ip_by_iface from logs
+        # Log-detection path: merge WAN/gateway identity from logs (best-effort)
+        # with the same detectors the receiver runs, so a quiet WAN2 outside the
+        # detection window keeps its persisted IP. wan_interfaces is already
+        # saved above, and identity is persisted before signal_receiver() below.
         # Phase-1 transition: removal target phase 2 log-detection decommission
-        iface_ips = enricher_db.get_wan_ips_by_interface(body["wan_interfaces"])
-        if iface_ips:
-            set_config(enricher_db, "wan_ip_by_iface", iface_ips)
-            wan_ips = [iface_ips[iface] for iface in body["wan_interfaces"]
-                       if iface in iface_ips and iface_ips[iface]]
-            if wan_ips:
-                set_config(enricher_db, "wan_ips", wan_ips)
-                set_config(enricher_db, "wan_ip", wan_ips[0])
+        try:
+            enricher_db.detect_wan_ip()
+        except Exception:
+            logger.warning("Setup: WAN identity detection from logs failed — "
+                           "receiver refresh will retry", exc_info=True)
+        try:
+            enricher_db.detect_gateway_ips()
+        except Exception:
+            logger.warning("Setup: gateway identity detection from logs failed — "
+                           "receiver refresh will retry", exc_info=True)
 
     # Trigger direction backfill if WAN interfaces actually changed
     new_wan = set(body["wan_interfaces"])
