@@ -330,6 +330,19 @@ class TestDetectWanIpMerge:
         assert config['wan_ips'] == ['1.1.1.1']
         assert 'wan_ip' not in _keys_written(db)
 
+    def test_legacy_wan_ips_kept_when_nothing_observed(self):
+        """Pre-multi-WAN install: only wan_ips/wan_ip, no wan_ip_by_iface."""
+        config = {
+            'wan_interfaces': ['ppp0'],
+            'wan_ips': ['1.2.3.4'],
+            'wan_ip': '1.2.3.4',
+        }
+        db, _ = _config_db(config)
+        db.get_wan_ips_by_interface.return_value = {}
+
+        assert Database.detect_wan_ip(db) is None
+        db.set_config.assert_not_called()
+
     def test_first_detection_populates_identity(self):
         config = {'wan_interfaces': ['ppp0']}
         db, _ = _config_db(config)

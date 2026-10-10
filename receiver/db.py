@@ -2024,9 +2024,10 @@ END $$;""",
                 self.set_config('wan_ip', primary)
                 logger.info("WAN IP detected and persisted: %s", primary)
 
-        # Persist wan_ips list
+        # Persist wan_ips list; like wan_ip, never from an empty merge (a legacy
+        # install may hold wan_ips without wan_ip_by_iface).
         current_list = self.get_config('wan_ips') or []
-        if sorted(wan_ips) != sorted(current_list):
+        if wan_ips and sorted(wan_ips) != sorted(current_list):
             self.set_config('wan_ips', wan_ips)
             if len(wan_ips) > 1:
                 logger.info("WAN IPs detected (multi-WAN): %s", wan_ips)
