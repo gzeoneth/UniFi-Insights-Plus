@@ -287,6 +287,12 @@ class TestAbuseIPDBEnricher:
         assert result == {}
         assert enricher._paused_until > _time.time()
 
+    @pytest.mark.parametrize('remaining, known', [(None, False), (0, True), (742, True)])
+    def test_is_rate_limit_known(self, remaining, known):
+        enricher = AbuseIPDBEnricher(api_key='test-key')
+        enricher._rate_limit_remaining = remaining
+        assert enricher.is_rate_limit_known() is known
+
 
 # ── _parse_bool_setting ──────────────────────────────────────────────────────
 

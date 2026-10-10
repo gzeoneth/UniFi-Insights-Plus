@@ -450,6 +450,15 @@ class AbuseIPDBEnricher:
                 return 0  # Unknown — don't let backfill guess
             return max(0, self._rate_limit_remaining - self.SAFETY_BUFFER)
 
+    def is_rate_limit_known(self) -> bool:
+        """True once rate-limit state is bootstrapped from an API response.
+
+        Lets callers tell an exhausted budget (known, 0) from an unknown one
+        (remaining_budget also returns 0 before the first call).
+        """
+        with self._lock:
+            return self._rate_limit_remaining is not None
+
     def _update_rate_limits(self, resp_headers):
         """Update rate limit state from AbuseIPDB response headers."""
         with self._lock:
