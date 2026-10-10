@@ -1,8 +1,8 @@
 """Tests for the AbuseIPDB budget gate in BackfillTask._process_queue() (#103).
 
 The budget is checked before the queue is pulled, so an exhausted quota
-never touches threat_backfill_queue. When the rate-limit state is still
-unknown (startup), one bootstrap pull is allowed.
+skips the queue read. When the rate-limit state is still unknown
+(startup), one bootstrap pull is allowed.
 """
 from unittest.mock import MagicMock
 
