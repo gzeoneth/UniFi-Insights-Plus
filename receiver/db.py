@@ -1931,10 +1931,8 @@ END $$;""",
         """
         if wan_ip_by_iface:
             self.set_config('wan_ip_by_iface', wan_ip_by_iface)
-            # Derive ordered wan_ips following configured wan_interfaces order
-            cfg_wan_ifaces = self.get_config('wan_interfaces') or []
-            wan_ips = [wan_ip_by_iface[iface] for iface in cfg_wan_ifaces
-                       if iface in wan_ip_by_iface]
+            wan_ips = _ordered_wan_ips(wan_ip_by_iface,
+                                       self.get_config('wan_interfaces') or [])
             if wan_ips:
                 self.set_config('wan_ips', wan_ips)
                 self.set_config('wan_ip', wan_ips[0])
@@ -2033,8 +2031,7 @@ END $$;""",
             self.set_config('wan_ip_by_iface', merged)
             logger.info("wan_ip_by_iface merged from logs: %s", merged)
 
-        # Derive ordered wan_ips following wan_interfaces order
-        wan_ips = [merged[iface] for iface in wan_interfaces if merged.get(iface)]
+        wan_ips = _ordered_wan_ips(merged, wan_interfaces)
         primary = wan_ips[0] if wan_ips else None
 
         # Persist primary wan_ip
@@ -2159,6 +2156,14 @@ def set_config(db, key: str, value):
     return db.set_config(key, value)
 
 
+def _ordered_wan_ips(ip_by_iface: dict, wan_interfaces) -> list[str]:
+    """WAN IPs from an {interface: ip} map, in wan_interfaces order.
+
+    Interfaces missing from the map and empty IP values are dropped.
+    """
+    return [ip_by_iface[iface] for iface in wan_interfaces if ip_by_iface.get(iface)]
+
+
 def get_wan_ips_from_config(db) -> list[str]:
     """Derive ordered WAN IP list from wan_ip_by_iface + wan_interfaces.
 
@@ -2168,10 +2173,7 @@ def get_wan_ips_from_config(db) -> list[str]:
     """
     wan_ip_by_iface = db.get_config('wan_ip_by_iface')
     if wan_ip_by_iface:
-        wan_interfaces = db.get_config('wan_interfaces', [])
-        # Derive ordered list following wan_interfaces order
-        return [wan_ip_by_iface[iface] for iface in wan_interfaces
-                if iface in wan_ip_by_iface and wan_ip_by_iface[iface]]
+        return _ordered_wan_ips(wan_ip_by_iface, db.get_config('wan_interfaces', []))
     # Legacy fallback: use wan_ips config key directly
     return db.get_config('wan_ips') or []
 

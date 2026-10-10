@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from db import Database, recent_firewall_cutoff
+from db import Database, _ordered_wan_ips, get_wan_ips_from_config, recent_firewall_cutoff
 from unifi_api import UniFiAPI
 
 
@@ -159,6 +159,15 @@ class TestPersistNetworkIdentity:
         for c in mock_db.set_config.call_args_list:
             assert c[0][0] not in ('gateway_ip_vlans', 'gateway_ips')
 
+    def test_empty_wan_ip_dropped_from_wan_ips(self, mock_db):
+        """Empty IP strings never reach wan_ips/wan_ip (shared _ordered_wan_ips)."""
+        Database.persist_network_identity(
+            mock_db,
+            wan_ip_by_iface={'eth0': '', 'eth1': '5.6.7.8'},
+        )
+        mock_db.set_config.assert_any_call('wan_ips', ['5.6.7.8'])
+        mock_db.set_config.assert_any_call('wan_ip', '5.6.7.8')
+
     def test_both_wan_and_gateway(self, mock_db):
         Database.persist_network_identity(
             mock_db,
@@ -168,6 +177,33 @@ class TestPersistNetworkIdentity:
         keys_written = [c[0][0] for c in mock_db.set_config.call_args_list]
         assert 'wan_ip_by_iface' in keys_written
         assert 'gateway_ip_vlans' in keys_written
+
+
+# ── Ordered WAN IP derivation ───────────────────────────────────────────────
+
+class TestOrderedWanIps:
+    """_ordered_wan_ips(): wan_interfaces order, missing and empty values dropped."""
+
+    def test_follows_wan_interfaces_order(self):
+        assert _ordered_wan_ips({'eth0': '1.1.1.1', 'eth1': '2.2.2.2'},
+                                ['eth1', 'eth0']) == ['2.2.2.2', '1.1.1.1']
+
+    def test_drops_missing_and_empty(self):
+        assert _ordered_wan_ips({'eth0': '', 'eth1': None, 'eth2': '3.3.3.3', 'eth9': '9.9.9.9'},
+                                ['eth0', 'eth1', 'eth2', 'eth3']) == ['3.3.3.3']
+
+    def test_get_wan_ips_from_config_uses_map_order(self):
+        config = {'wan_ip_by_iface': {'eth0': '1.1.1.1', 'eth1': ''},
+                  'wan_interfaces': ['eth1', 'eth0'], 'wan_ips': ['9.9.9.9']}
+        db = MagicMock()
+        db.get_config.side_effect = lambda key, default=None: config.get(key, default)
+        assert get_wan_ips_from_config(db) == ['1.1.1.1']
+
+    def test_get_wan_ips_from_config_legacy_fallback(self):
+        config = {'wan_ips': ['9.9.9.9']}
+        db = MagicMock()
+        db.get_config.side_effect = lambda key, default=None: config.get(key, default)
+        assert get_wan_ips_from_config(db) == ['9.9.9.9']
 
 
 # ── Log-based detection (issue #103) ────────────────────────────────────────
