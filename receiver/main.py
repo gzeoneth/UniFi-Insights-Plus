@@ -22,7 +22,8 @@ import schedule
 from parsers import parse_log
 import parsers
 from log_utils import flush_suppressed, rate_limited_warning
-from db import Database, get_config, set_config, build_conn_params, is_external_db, wait_for_postgres
+from db import (Database, get_config, set_config, build_conn_params, is_external_db,
+                wait_for_postgres, parse_positive_int, has_logs)
 from enrichment import Enricher
 from backfill import BackfillTask
 from blacklist import BlacklistFetcher
@@ -35,13 +36,33 @@ from routes.auth import auth_cleanup
 # All `schedule` registry mutation stays on the scheduler thread.
 _retention_reload_requested = threading.Event()
 
+# Set by the SIGUSR2 handler when log-based WAN/gateway identity should be
+# re-detected now rather than at the next WAN_REFRESH_INTERVAL_MINUTES run:
+# the effective UniFi enabled flag flipped, or the set of configured WAN
+# interfaces without a learned IP changed since the previous reload
+# (_last_missing_wan). Decided from reloaded in-memory state only; consumed by
+# the scheduler loop, so detection never runs inside the signal handler.
+_identity_refresh_requested = threading.Event()
+
+# Configured WAN interfaces with no learned IP at the previous SIGUSR2 reload.
+# Starts empty: interfaces already missing at boot were covered by the startup
+# refresh, so they trigger one refresh at most, never one per settings save.
+_last_missing_wan = frozenset()
+
+# The (wan_ip_by_iface, wan_ips, wan_ip, gateway_ips) tuple the receiver last
+# loaded after a log-based identity refresh; None until the first refresh.
+# Only _refresh_network_identity_from_logs() reads or writes it, and only after
+# a successful reload, so a failed read or reload is retried on the next run.
+_IDENTITY_KEYS = ('wan_ip_by_iface', 'wan_ips', 'wan_ip', 'gateway_ips')
+_loaded_identity = None
+
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 SYSLOG_PORT = 514
 SYSLOG_BUFFER_SIZE = 8192      # Max UDP packet size
 BATCH_SIZE = 50                 # Insert logs in batches
 BATCH_TIMEOUT = 2.0             # Flush batch after N seconds even if not full
-STATS_INTERVAL_MINUTES = 15     # Log stats every N minutes
+STATS_INTERVAL_MINUTES = 15     # Log stats every N minutes (DEBUG only)
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -56,6 +77,27 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger('receiver')
+
+
+def _wan_refresh_interval_from_env() -> int:
+    """Minutes between log-based WAN/gateway detections (default 360).
+
+    Parsed after logging is configured, so a bad value warns instead of
+    crashing at import; 0 or a negative value would make schedule.every()
+    loop forever. Blank or unset uses the default silently.
+    """
+    default = 360
+    raw = os.environ.get('WAN_REFRESH_INTERVAL_MINUTES', '').strip()
+    parsed = parse_positive_int(raw)
+    if parsed is not None:
+        return parsed
+    if raw:
+        logger.warning("Invalid WAN_REFRESH_INTERVAL_MINUTES '%s' (must be a whole number >= 1), "
+                       "using default %d", raw, default)
+    return default
+
+
+WAN_REFRESH_INTERVAL_MINUTES = _wan_refresh_interval_from_env()
 
 
 # ── Syslog Receiver ───────────────────────────────────────────────────────────
@@ -270,14 +312,37 @@ class SyslogReceiver:
 
 # ── Network identity gate ────────────────────────────────────────────────────
 
-def _use_log_identity_detection(db: Database) -> bool:
-    """Return True when log-based WAN/gateway detection should run."""
-    return not bool(db.get_config('unifi_enabled', False))
+def _use_log_identity_detection(unifi_api: UniFiAPI) -> bool:
+    """Return True when log-based WAN/gateway detection should run.
+
+    One source of truth: the integration's effective enabled flag (env
+    overrides, host and credentials included). UniFi is authoritative for
+    identity only when it can actually poll, not merely when the DB flag is on.
+    """
+    return not unifi_api.enabled
 
 
-def _refresh_network_identity_from_logs(db: Database):
-    """Run log-based WAN/gateway detection only when UniFi is not authoritative."""
-    if not _use_log_identity_detection(db):
+def _refresh_network_identity_from_logs(db: Database, unifi_api: UniFiAPI,
+                                        enricher: Enricher = None):
+    """Run log-based WAN/gateway detection only when UniFi is not authoritative.
+
+    After the detectors, the persisted identity (wan_ip_by_iface, wan_ips,
+    wan_ip, gateway_ips) is compared with the tuple the receiver last loaded
+    (_loaded_identity); when it differs, parsers reload and the enricher too
+    when one is passed (startup passes none; the Enricher is built later and
+    preloads from the DB). _loaded_identity is updated only after a
+    successful reload, so a failed read or reload retries on the next run.
+
+    Never raises: it runs at startup, as a scheduled job (schedule.run_pending()
+    does not catch job exceptions, so one would end the scheduler thread) and
+    from the scheduler tick.
+    """
+    global _loaded_identity
+    try:
+        if not _use_log_identity_detection(unifi_api):
+            return
+    except Exception as e:
+        logger.error("Network identity refresh skipped (UniFi gate check failed): %s", e)
         return
     try:
         db.detect_wan_ip()
@@ -287,6 +352,15 @@ def _refresh_network_identity_from_logs(db: Database):
         db.detect_gateway_ips()
     except Exception as e:
         logger.error("Gateway IP detection failed: %s", e)
+    try:
+        persisted = tuple(db.get_config(key) for key in _IDENTITY_KEYS)
+        if persisted != _loaded_identity:
+            parsers.reload_config_from_db(db)
+            if enricher is not None:
+                enricher.reload_config()
+            _loaded_identity = persisted
+    except Exception as e:
+        logger.error("Reloading detected network identity failed, will retry: %s", e)
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
@@ -336,22 +410,88 @@ def _register_retention_job(db: Database):
                 cfg.time, cfg.source)
 
 
-def _scheduler_tick(db: Database):
+def _scheduler_tick(db: Database, unifi_api: UniFiAPI = None, enricher: Enricher = None):
     """One iteration of the scheduler loop — extracted so tests can run it
     deterministically. Observes the retention-reload Event (set by the signal
     handler on another thread) and rebuilds the job before dispatching pending
     runs. All `schedule` registry mutation therefore stays on this thread.
+    Also runs a requested identity refresh (see _identity_refresh_requested).
     """
     if _retention_reload_requested.is_set():
         _retention_reload_requested.clear()
-        _register_retention_job(db)
+        try:
+            _register_retention_job(db)
+        except Exception as e:
+            # An exception here would end the scheduler thread; retry next tick.
+            logger.error("Retention job rebuild failed, retrying next tick: %s", e)
+            _retention_reload_requested.set()
+    if _identity_refresh_requested.is_set():
+        _identity_refresh_requested.clear()
+        _refresh_network_identity_from_logs(db, unifi_api, enricher)
     schedule.run_pending()
 
 
-def run_scheduler(db: Database, enricher: Enricher, blacklist_fetcher: BlacklistFetcher = None):
+def _reload_config(db: Database, unifi_api, pihole, enricher, receiver):
+    """Reload runtime config from the database (SIGUSR2 body, testable).
+
+    Requests the scheduler-thread follow-ups: the retention job rebuild
+    always, and an identity refresh when the UniFi enabled flag changed or
+    the set of configured WAN interfaces without a learned IP differs from
+    the previous reload's. The trigger reads only the reloaded in-memory
+    state (no extra DB IO in the signal handler). A removed interface does
+    not trigger: pruning waits for the scheduled run.
+    """
+    global _last_missing_wan
+    old_unifi = bool(unifi_api.enabled)
+    # Each step runs on its own: a transient DB error in one must not leave
+    # the others (or the scheduler follow-ups below) stale.
+    steps = (
+        ('parsers', lambda: parsers.reload_config_from_db(db)),
+        ('unifi_api', unifi_api.reload_config),
+        ('pihole', pihole.reload_config),
+        ('enricher', enricher.reload_config),
+        ('disabled log types', receiver._load_disabled_types),
+    )
+    for name, step in steps:
+        try:
+            step()
+        except Exception as e:
+            logger.error("Config reload step '%s' failed: %s", name, e)
+    # scheduler thread will rebuild the retention job on its next tick
+    _retention_reload_requested.set()
+    missing = frozenset(parsers.WAN_INTERFACES - set(parsers.WAN_IP_BY_IFACE))
+    if bool(unifi_api.enabled) != old_unifi or missing != _last_missing_wan:
+        _identity_refresh_requested.set()
+    _last_missing_wan = missing
+
+
+def _handle_config_reload_signal(db: Database, unifi_api, pihole, enricher, receiver):
+    """SIGUSR2 handler body. Never raises: the handler runs on the main thread
+    inside the receiver's recvfrom loop, which an exception would unwind."""
+    try:
+        logger.info("Received SIGUSR2, reloading config from database...")
+        _reload_config(db, unifi_api, pihole, enricher, receiver)
+
+        # Write timestamp to confirm reload completed
+        try:
+            from pathlib import Path
+            Path('/tmp/config_reloaded').write_text(str(time.time()))
+        except Exception as e:
+            logger.debug("Failed to write reload timestamp: %s", e)
+
+        logger.info("Config reloaded: WAN=%s", parsers.WAN_INTERFACES)
+    except Exception:
+        logger.exception("Config reload failed")
+
+
+def run_scheduler(db: Database, enricher: Enricher, unifi_api: UniFiAPI,
+                  blacklist_fetcher: BlacklistFetcher = None):
     """Background thread for scheduled tasks (retention cleanup, stats, blacklist)."""
 
     def log_stats():
+        # Output is DEBUG-only; skip the DB work when nobody can see it (#103).
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
         try:
             db_stats = db.get_stats()
             enrich_stats = enricher.get_stats()
@@ -368,24 +508,25 @@ def run_scheduler(db: Database, enricher: Enricher, blacklist_fetcher: Blacklist
                 logger.error("Blacklist pull failed: %s", e)
 
     def refresh_wan_ip():
-        _refresh_network_identity_from_logs(db)
+        _refresh_network_identity_from_logs(db, unifi_api, enricher)
 
     schedule.every(STATS_INTERVAL_MINUTES).minutes.do(log_stats)
-    schedule.every(STATS_INTERVAL_MINUTES).minutes.do(refresh_wan_ip)
+    schedule.every(WAN_REFRESH_INTERVAL_MINUTES).minutes.do(refresh_wan_ip)
     _register_retention_job(db)
     schedule.every().day.at("04:00").do(pull_blacklist)
     # auth_cleanup has its own internal try/except — no wrapper needed here.
     schedule.every().day.at("03:30").do(auth_cleanup)
 
-    logger.info("Scheduler started — stats every %dm, blacklist daily at 04:00, auth cleanup daily at 03:30",
-                 STATS_INTERVAL_MINUTES)
+    logger.info("Scheduler started — stats every %dm (DEBUG only), WAN refresh every %dm, "
+                "blacklist daily at 04:00, auth cleanup daily at 03:30",
+                STATS_INTERVAL_MINUTES, WAN_REFRESH_INTERVAL_MINUTES)
 
     # Initial blacklist pull after 30s startup delay
     time.sleep(30)
     pull_blacklist()
 
     while True:
-        _scheduler_tick(db)
+        _scheduler_tick(db, unifi_api, enricher)
         time.sleep(10)
 
 
@@ -412,13 +553,8 @@ def main():
     # Check for existing user migration
     setup_complete = get_config(db, "setup_complete", None)
     if setup_complete is None:
-        # Count firewall logs to detect existing installation
-        with db.get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM logs WHERE log_type = 'firewall'")
-                log_count = cur.fetchone()[0]
-
-        if log_count > 0:
+        # Any firewall log means an existing installation
+        if has_logs(db, 'firewall'):
             # Auto-migrate existing installation with safe defaults
             logger.info("Migrating existing installation to dynamic config...")
             set_config(db, "wan_interfaces", ["ppp0"])
@@ -434,18 +570,20 @@ def main():
     parsers.reload_config_from_db(db)
     logger.info("Loaded config: WAN interfaces = %s", parsers.WAN_INTERFACES)
 
+    # Initialize UniFi API client (self-disables when not configured). Built
+    # before the identity refresh, which gates on its effective enabled flag;
+    # construction only resolves config, polling starts further down.
+    unifi_api = UniFiAPI(db=db)
+
     # Detect and persist WAN IP + gateway IPs from existing log data
     # (skipped when UniFi API is authoritative — identity comes from poll)
-    _refresh_network_identity_from_logs(db)
+    _refresh_network_identity_from_logs(db, unifi_api)
 
     # Check config version for future migrations
     current_version = get_config(db, 'config_version', 0)
     if current_version < 1:
         # Future: handle config schema migrations
         pass
-
-    # Initialize UniFi API client (self-disables when not configured)
-    unifi_api = UniFiAPI(db=db)
 
     # Initialize Pi-hole poller
     pihole = PiHolePoller(db=db, enricher=None)  # enricher set after creation
@@ -477,23 +615,7 @@ def main():
     # Handle config reload
     def reload_config(signum, frame):
         """Reload config from database when signaled by API process."""
-        logger.info("Received SIGUSR2, reloading config from database...")
-        parsers.reload_config_from_db(db)
-        unifi_api.reload_config()
-        pihole.reload_config()
-        enricher.reload_config()
-        receiver._load_disabled_types()
-        # scheduler thread will rebuild the retention job on its next tick
-        _retention_reload_requested.set()
-
-        # Write timestamp to confirm reload completed
-        try:
-            from pathlib import Path
-            Path('/tmp/config_reloaded').write_text(str(time.time()))
-        except Exception as e:
-            logger.debug("Failed to write reload timestamp: %s", e)
-
-        logger.info("Config reloaded: WAN=%s", parsers.WAN_INTERFACES)
+        _handle_config_reload_signal(db, unifi_api, pihole, enricher, receiver)
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
@@ -502,7 +624,8 @@ def main():
 
     # Start scheduler in background thread
     blacklist_fetcher = BlacklistFetcher(db)
-    scheduler_thread = threading.Thread(target=run_scheduler, args=(db, enricher, blacklist_fetcher), daemon=True)
+    scheduler_thread = threading.Thread(target=run_scheduler,
+                                        args=(db, enricher, unifi_api, blacklist_fetcher), daemon=True)
     scheduler_thread.start()
 
     # Start backfill daemon (queue-driven threat enrichment every 5 min)

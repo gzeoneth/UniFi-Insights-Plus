@@ -3,13 +3,17 @@
 Covers:
 - extract_network_identity_from_net_config()
 - Database.persist_network_identity()
+- recent_firewall_cutoff() and the windowed detection/candidate queries
+- Database.detect_wan_ip() / detect_gateway_ips() merge persistence (#103)
 """
 
+import logging
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
 
-from db import Database
+from db import Database, _ordered_wan_ips, get_wan_ips_from_config, recent_firewall_cutoff
 from unifi_api import UniFiAPI
 
 
@@ -156,6 +160,15 @@ class TestPersistNetworkIdentity:
         for c in mock_db.set_config.call_args_list:
             assert c[0][0] not in ('gateway_ip_vlans', 'gateway_ips')
 
+    def test_empty_wan_ip_dropped_from_wan_ips(self, mock_db):
+        """Empty IP strings never reach wan_ips/wan_ip (shared _ordered_wan_ips)."""
+        Database.persist_network_identity(
+            mock_db,
+            wan_ip_by_iface={'eth0': '', 'eth1': '5.6.7.8'},
+        )
+        mock_db.set_config.assert_any_call('wan_ips', ['5.6.7.8'])
+        mock_db.set_config.assert_any_call('wan_ip', '5.6.7.8')
+
     def test_both_wan_and_gateway(self, mock_db):
         Database.persist_network_identity(
             mock_db,
@@ -165,3 +178,308 @@ class TestPersistNetworkIdentity:
         keys_written = [c[0][0] for c in mock_db.set_config.call_args_list]
         assert 'wan_ip_by_iface' in keys_written
         assert 'gateway_ip_vlans' in keys_written
+
+
+# ── Ordered WAN IP derivation ───────────────────────────────────────────────
+
+class TestOrderedWanIps:
+    """_ordered_wan_ips(): wan_interfaces order, missing and empty values dropped."""
+
+    def test_follows_wan_interfaces_order(self):
+        assert _ordered_wan_ips({'eth0': '1.1.1.1', 'eth1': '2.2.2.2'},
+                                ['eth1', 'eth0']) == ['2.2.2.2', '1.1.1.1']
+
+    def test_drops_missing_and_empty(self):
+        assert _ordered_wan_ips({'eth0': '', 'eth1': None, 'eth2': '3.3.3.3', 'eth9': '9.9.9.9'},
+                                ['eth0', 'eth1', 'eth2', 'eth3']) == ['3.3.3.3']
+
+    def test_get_wan_ips_from_config_uses_map_order(self):
+        config = {'wan_ip_by_iface': {'eth0': '1.1.1.1', 'eth1': ''},
+                  'wan_interfaces': ['eth1', 'eth0'], 'wan_ips': ['9.9.9.9']}
+        db = MagicMock()
+        db.get_config.side_effect = lambda key, default=None: config.get(key, default)
+        assert get_wan_ips_from_config(db) == ['1.1.1.1']
+
+    def test_get_wan_ips_from_config_legacy_fallback(self):
+        config = {'wan_ips': ['9.9.9.9']}
+        db = MagicMock()
+        db.get_config.side_effect = lambda key, default=None: config.get(key, default)
+        assert get_wan_ips_from_config(db) == ['9.9.9.9']
+
+
+# ── Log-based detection (issue #103) ────────────────────────────────────────
+
+CUTOFF = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)
+
+
+def _sql(text):
+    return ' '.join(text.split())
+
+
+def _config_db(config, rows=(), cutoff=CUTOFF):
+    """MagicMock Database backed by a config dict; set_config writes through.
+
+    The cursor's fetchone() answers the cutoff query (no row when `cutoff`
+    is None, like the HAVING clause on an empty table); fetchall() returns
+    `rows` for the detection query.
+    """
+    db = MagicMock()
+    # SQL fragment is a class attribute read through `self`
+    db._PRIVATE_IP_FILTER = Database._PRIVATE_IP_FILTER
+    db.get_config.side_effect = lambda key, default=None: config.get(key, default)
+    db.set_config.side_effect = config.__setitem__
+    cur = MagicMock()
+    cur.fetchone.return_value = (cutoff,) if cutoff is not None else None
+    cur.fetchall.return_value = list(rows)
+    conn = db.get_conn.return_value.__enter__.return_value
+    conn.cursor.return_value.__enter__.return_value = cur
+    return db, cur
+
+
+def _keys_written(db):
+    return [c.args[0] for c in db.set_config.call_args_list]
+
+
+class TestRecentFirewallCutoff:
+    """recent_firewall_cutoff(): 7 days before the newest firewall row, capped at NOW()."""
+
+    def test_cutoff_query_caps_newest_row_at_now(self):
+        cur = MagicMock()
+        cur.fetchone.return_value = (CUTOFF,)
+        assert recent_firewall_cutoff(cur) == CUTOFF
+        sql = _sql(cur.execute.call_args.args[0])
+        assert 'LEAST(MAX(timestamp), NOW())' in sql
+        assert "INTERVAL '7 days'" in sql
+        assert "log_type = 'firewall'" in sql
+        # LEAST() ignores a NULL MAX; HAVING turns "no firewall rows" into no row
+        assert 'HAVING MAX(timestamp) IS NOT NULL' in sql
+
+    def test_none_without_firewall_rows(self):
+        cur = MagicMock()
+        cur.fetchone.return_value = None
+        assert recent_firewall_cutoff(cur) is None
+
+
+class TestDetectionQueryWindow:
+    """Detection queries bind the cutoff as a parameter so the planner can use
+    idx_logs_type_time, and observe nothing when there is no cutoff."""
+
+    def test_wan_query_binds_cutoff(self):
+        db, cur = _config_db({}, rows=[('eth8', '1.1.1.1')])
+        assert Database.get_wan_ips_by_interface(db, ['eth8', 'eth9']) == {'eth8': '1.1.1.1'}
+        assert 'LEAST(MAX(timestamp), NOW())' in _sql(cur.execute.call_args_list[0].args[0])
+        sql, params = cur.execute.call_args_list[1].args
+        assert 'timestamp >= %s' in _sql(sql)
+        assert 'host(dst_ip)' in sql
+        assert params == [CUTOFF, 'eth8', 'eth9']
+
+    def test_wan_query_skipped_without_cutoff(self):
+        db, cur = _config_db({}, cutoff=None)
+        assert Database.get_wan_ips_by_interface(db, ['eth8']) == {}
+        assert cur.execute.call_count == 1  # cutoff lookup only
+
+    def test_detect_wan_ip_persists_nothing_without_cutoff(self):
+        config = {
+            'wan_interfaces': ['eth8'],
+            'wan_ip_by_iface': {'eth8': '1.1.1.1'},
+            'wan_ips': ['1.1.1.1'],
+            'wan_ip': '1.1.1.1',
+        }
+        db, _ = _config_db(config, cutoff=None)
+        db.get_wan_ips_by_interface.side_effect = (
+            lambda ifaces: Database.get_wan_ips_by_interface(db, ifaces))
+        assert Database.detect_wan_ip(db) == '1.1.1.1'
+        db.set_config.assert_not_called()
+
+    def test_gateway_query_binds_cutoff(self):
+        db, cur = _config_db({'gateway_ips': []}, rows=[('192.168.1.1',)])
+        assert Database.detect_gateway_ips(db) == ['192.168.1.1']
+        assert 'LEAST(MAX(timestamp), NOW())' in _sql(cur.execute.call_args_list[0].args[0])
+        sql, params = cur.execute.call_args_list[1].args
+        assert 'timestamp >= %s' in _sql(sql)
+        assert params == [CUTOFF]
+
+    def test_gateway_persists_nothing_without_cutoff(self):
+        config = {'gateway_ips': ['10.0.0.1']}
+        db, cur = _config_db(config, cutoff=None)
+        assert Database.detect_gateway_ips(db) == ['10.0.0.1']
+        assert cur.execute.call_count == 1
+        db.set_config.assert_not_called()
+
+    def test_candidates_query_binds_cutoff(self):
+        db, cur = _config_db({}, rows=[('eth8', 12, '1.1.1.1'), ('eth9', 3, None)])
+        assert Database.get_wan_ip_candidates(db) == [
+            {'interface': 'eth8', 'event_count': 12, 'wan_ip': '1.1.1.1'},
+            {'interface': 'eth9', 'event_count': 3, 'wan_ip': ''},
+        ]
+        assert 'LEAST(MAX(timestamp), NOW())' in _sql(cur.execute.call_args_list[0].args[0])
+        sql, params = cur.execute.call_args_list[1].args
+        assert 'timestamp >= %s' in _sql(sql)
+        assert params == [CUTOFF]
+
+    def test_candidates_empty_without_cutoff(self):
+        db, cur = _config_db({}, cutoff=None)
+        assert Database.get_wan_ip_candidates(db) == []
+        assert cur.execute.call_count == 1
+
+
+class TestDetectWanIpMerge:
+    """detect_wan_ip() merges observations into persisted identity."""
+
+    def test_keeps_wan2_when_only_wan1_observed(self):
+        config = {
+            'wan_interfaces': ['eth8', 'eth9'],
+            'wan_ip_by_iface': {'eth8': '1.1.1.1', 'eth9': '2.2.2.2'},
+            'wan_ips': ['1.1.1.1', '2.2.2.2'],
+            'wan_ip': '1.1.1.1',
+        }
+        db, _ = _config_db(config)
+        db.get_wan_ips_by_interface.return_value = {'eth8': '3.3.3.3'}
+
+        assert Database.detect_wan_ip(db) == '3.3.3.3'
+        assert config['wan_ip_by_iface'] == {'eth8': '3.3.3.3', 'eth9': '2.2.2.2'}
+        assert config['wan_ips'] == ['3.3.3.3', '2.2.2.2']
+        assert config['wan_ip'] == '3.3.3.3'
+
+    def test_empty_observation_persists_nothing(self):
+        config = {
+            'wan_interfaces': ['eth8', 'eth9'],
+            'wan_ip_by_iface': {'eth8': '1.1.1.1', 'eth9': '2.2.2.2'},
+            'wan_ips': ['1.1.1.1', '2.2.2.2'],
+            'wan_ip': '1.1.1.1',
+        }
+        db, _ = _config_db(config)
+        db.get_wan_ips_by_interface.return_value = {}
+
+        assert Database.detect_wan_ip(db) == '1.1.1.1'
+        db.set_config.assert_not_called()
+
+    def test_removed_interface_pruned_even_without_observations(self):
+        """Pruning applies without observations while the merged map stays non-empty."""
+        config = {
+            'wan_interfaces': ['eth9'],
+            'wan_ip_by_iface': {'eth8': '1.1.1.1', 'eth9': '2.2.2.2'},
+            'wan_ips': ['1.1.1.1', '2.2.2.2'],
+            'wan_ip': '1.1.1.1',
+        }
+        db, _ = _config_db(config)
+        db.get_wan_ips_by_interface.return_value = {}
+
+        assert Database.detect_wan_ip(db) == '2.2.2.2'
+        assert config['wan_ip_by_iface'] == {'eth9': '2.2.2.2'}
+        assert config['wan_ips'] == ['2.2.2.2']
+        assert config['wan_ip'] == '2.2.2.2'
+
+    def test_prune_and_merge_log_lines(self, caplog):
+        """Prune-only runs must not claim anything was merged from logs."""
+        caplog.set_level(logging.INFO, logger='db')
+        config = {
+            'wan_interfaces': ['eth9'],
+            'wan_ip_by_iface': {'eth8': '1.1.1.1', 'eth9': '2.2.2.2'},
+        }
+        db, _ = _config_db(config)
+        db.get_wan_ips_by_interface.return_value = {}
+        Database.detect_wan_ip(db)
+        messages = [r.getMessage() for r in caplog.records]
+        assert "wan_ip_by_iface pruned (no observations in window): {'eth9': '2.2.2.2'}" in messages
+        assert not [m for m in messages if 'merged from logs' in m]
+
+        caplog.clear()
+        db.get_wan_ips_by_interface.return_value = {'eth9': '3.3.3.3'}
+        Database.detect_wan_ip(db)
+        assert "wan_ip_by_iface merged from logs: {'eth9': '3.3.3.3'}" in [
+            r.getMessage() for r in caplog.records]
+
+    def test_prune_to_empty_is_deferred(self):
+        """Every persisted interface removed and nothing observed: write nothing.
+
+        An empty wan_ip_by_iface would make get_wan_ips_from_config() fall
+        back to the stale legacy wan_ips, so pruning waits for an observation.
+        """
+        config = {
+            'wan_interfaces': ['eth7'],
+            'wan_ip_by_iface': {'eth8': '1.1.1.1', 'eth9': '2.2.2.2'},
+            'wan_ips': ['1.1.1.1', '2.2.2.2'],
+            'wan_ip': '1.1.1.1',
+        }
+        db, _ = _config_db(config)
+        db.get_wan_ips_by_interface.return_value = {}
+
+        assert Database.detect_wan_ip(db) is None
+        db.set_config.assert_not_called()
+
+    def test_prune_applies_once_new_interface_observed(self):
+        config = {
+            'wan_interfaces': ['eth7'],
+            'wan_ip_by_iface': {'eth8': '1.1.1.1'},
+            'wan_ips': ['1.1.1.1'],
+            'wan_ip': '1.1.1.1',
+        }
+        db, _ = _config_db(config)
+        db.get_wan_ips_by_interface.return_value = {'eth7': '7.7.7.7'}
+
+        assert Database.detect_wan_ip(db) == '7.7.7.7'
+        assert config['wan_ip_by_iface'] == {'eth7': '7.7.7.7'}
+        assert config['wan_ips'] == ['7.7.7.7']
+        assert config['wan_ip'] == '7.7.7.7'
+
+    def test_legacy_wan_ips_kept_when_nothing_observed(self):
+        """Pre-multi-WAN install: only wan_ips/wan_ip, no wan_ip_by_iface."""
+        config = {
+            'wan_interfaces': ['ppp0'],
+            'wan_ips': ['1.2.3.4'],
+            'wan_ip': '1.2.3.4',
+        }
+        db, _ = _config_db(config)
+        db.get_wan_ips_by_interface.return_value = {}
+
+        assert Database.detect_wan_ip(db) is None
+        db.set_config.assert_not_called()
+
+    def test_first_detection_populates_identity(self):
+        config = {'wan_interfaces': ['ppp0']}
+        db, _ = _config_db(config)
+        db.get_wan_ips_by_interface.return_value = {'ppp0': '5.5.5.5'}
+
+        assert Database.detect_wan_ip(db) == '5.5.5.5'
+        assert config['wan_ip_by_iface'] == {'ppp0': '5.5.5.5'}
+        assert config['wan_ips'] == ['5.5.5.5']
+        assert config['wan_ip'] == '5.5.5.5'
+
+    def test_unchanged_observation_writes_nothing(self):
+        config = {
+            'wan_interfaces': ['eth8'],
+            'wan_ip_by_iface': {'eth8': '1.1.1.1'},
+            'wan_ips': ['1.1.1.1'],
+            'wan_ip': '1.1.1.1',
+        }
+        db, _ = _config_db(config)
+        db.get_wan_ips_by_interface.return_value = {'eth8': '1.1.1.1'}
+
+        Database.detect_wan_ip(db)
+        db.set_config.assert_not_called()
+
+
+class TestDetectGatewayIpsMerge:
+    """detect_gateway_ips() unions observations and never drops an address."""
+
+    def test_unions_with_persisted(self):
+        config = {'gateway_ips': ['10.0.0.1']}
+        db, _ = _config_db(config, rows=[('192.168.1.1',)])
+
+        assert Database.detect_gateway_ips(db) == ['10.0.0.1', '192.168.1.1']
+        assert config['gateway_ips'] == ['10.0.0.1', '192.168.1.1']
+
+    def test_empty_observation_keeps_persisted(self):
+        config = {'gateway_ips': ['10.0.0.1', '192.168.1.1']}
+        db, _ = _config_db(config, rows=[])
+
+        assert Database.detect_gateway_ips(db) == ['10.0.0.1', '192.168.1.1']
+        db.set_config.assert_not_called()
+
+    def test_partial_observation_never_drops(self):
+        config = {'gateway_ips': ['10.0.0.1', '192.168.1.1']}
+        db, _ = _config_db(config, rows=[('192.168.1.1',)])
+
+        assert Database.detect_gateway_ips(db) == ['10.0.0.1', '192.168.1.1']
+        db.set_config.assert_not_called()

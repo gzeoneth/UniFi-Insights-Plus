@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException
 
-from db import Database, get_config, is_external_db
+from db import Database, estimate_log_count, get_config, is_external_db
 from enrichment import get_abuseipdb_stats
 from deps import get_conn, put_conn, enricher_db, APP_VERSION
 
@@ -22,19 +22,9 @@ def health():
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            # Use pg_class catalog estimate instead of COUNT(*) full scan.
-            # On large tables (100M+ rows) the exact COUNT takes 5-7s per call and
-            # causes persistent /api/health 503 errors via statement_timeout.
-            # reltuples is updated by autovacuum and accurate to ~1% on active tables.
-            cur.execute("""
-                SELECT COALESCE(GREATEST(c.reltuples::bigint, 0), 0)
-                FROM pg_class c
-                JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relname = 'logs'
-                  AND n.nspname = 'public'
-            """)
-            row = cur.fetchone()
-            total = row[0] if row else 0
+            # Catalog estimate, not COUNT(*): on 100M+ rows the exact count takes
+            # 5-7s per call and causes /api/health 503s via statement_timeout.
+            total = estimate_log_count(cur)
 
             # MIN/MAX on idx_logs_timestamp btree: two index edge lookups (~1ms)
             cur.execute("SELECT MIN(timestamp), MAX(timestamp) FROM logs")

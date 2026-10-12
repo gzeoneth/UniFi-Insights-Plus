@@ -38,7 +38,7 @@ def client(monkeypatch):
 
     mock_db.get_config = MagicMock(side_effect=_get_config)
     mock_db.set_config = MagicMock(side_effect=_set_config)
-    mock_db.count_logs = MagicMock(return_value=0)
+    mock_db.has_logs = MagicMock(return_value=False)
     mock_db.encrypt_api_key = MagicMock(return_value='encrypted')
     mock_db.decrypt_api_key = MagicMock(return_value='decrypted')
     mock_db.is_external_db = MagicMock(return_value=False)

@@ -1,13 +1,18 @@
-"""Tests for db.py utility functions — encryption, connection params, external DB detection."""
+"""Tests for db.py utility functions — encryption, connection params, external DB detection,
+positive-int parsing, log presence."""
 
 import pytest
+
+from unittest.mock import MagicMock
 
 from db import (
     _normalize_db_host,
     build_conn_params,
     decrypt_api_key,
     encrypt_api_key,
+    has_logs,
     is_external_db,
+    parse_positive_int,
 )
 
 
@@ -121,3 +126,44 @@ class TestIsExternalDb:
     def test_whitespace_stripped(self, monkeypatch):
         monkeypatch.setenv('DB_HOST', '  localhost  ')
         assert is_external_db() is False
+
+
+# ── parse_positive_int ───────────────────────────────────────────────────────
+
+class TestParsePositiveInt:
+    @pytest.mark.parametrize('raw, expected', [(60, 60), ('90', 90), (' 7 ', 7), (1, 1)])
+    def test_accepts_positive_coercible(self, raw, expected):
+        assert parse_positive_int(raw) == expected
+
+    @pytest.mark.parametrize('raw', [0, '0', -5, '-5', '', 'abc', None, '1.5', [1]])
+    def test_rejects_non_positive_or_non_coercible(self, raw):
+        assert parse_positive_int(raw) is None
+
+
+# ── has_logs ─────────────────────────────────────────────────────────────────
+
+class TestHasLogs:
+    """has_logs(): EXISTS probe instead of an unbounded COUNT(*) (#103)."""
+
+    @staticmethod
+    def _db(exists):
+        db = MagicMock()
+        cur = MagicMock()
+        cur.fetchone.return_value = (exists,)
+        conn = db.get_conn.return_value.__enter__.return_value
+        conn.cursor.return_value.__enter__.return_value = cur
+        return db, cur
+
+    @pytest.mark.parametrize('exists', [True, False])
+    def test_returns_bool(self, exists):
+        db, _ = self._db(exists)
+        assert has_logs(db, 'firewall') is exists
+
+    def test_uses_exists_not_count(self):
+        db, cur = self._db(True)
+        has_logs(db, 'dns')
+        sql, params = cur.execute.call_args.args
+        sql = ' '.join(sql.split())
+        assert 'EXISTS (SELECT 1 FROM logs WHERE log_type = %s)' in sql
+        assert 'COUNT(' not in sql
+        assert params == ['dns']

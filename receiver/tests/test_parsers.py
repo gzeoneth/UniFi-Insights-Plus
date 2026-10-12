@@ -1,7 +1,7 @@
 """Tests for parsers.py — syslog parsing, direction/action derivation, VPN matching."""
 
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -636,3 +636,66 @@ class TestInvalidFieldWarnings:
         warnings = self._warnings(caplog, 'Invalid mac_address')
         assert len(warnings) == 1
         assert '\n' not in warnings[0].getMessage()
+
+
+# ── WAN_IP_BY_IFACE (issue #103) ─────────────────────────────────────────────
+
+class TestWanIpByIfaceState:
+    """reload_config_from_db() keeps the loaded wan_ip_by_iface map, which
+    gates WAN_LOCAL auto-learn and the receiver's identity-refresh trigger."""
+
+    @staticmethod
+    def _db(config):
+        db = MagicMock()
+        db.get_config.side_effect = lambda key, default=None: config.get(key, default)
+        return db
+
+    def test_reload_stores_map(self):
+        parsers.reload_config_from_db(self._db({
+            'wan_interfaces': ['eth8'], 'wan_ip_by_iface': {'eth8': '1.1.1.1'}}))
+        assert parsers.WAN_IP_BY_IFACE == {'eth8': '1.1.1.1'}
+
+    def test_reload_without_map_stores_empty_dict(self):
+        parsers.reload_config_from_db(self._db({'wan_interfaces': ['eth8']}))
+        assert parsers.WAN_IP_BY_IFACE == {}
+
+    def test_reload_adds_saved_wan_ip(self):
+        parsers.reload_config_from_db(self._db({'wan_interfaces': ['ppp0'], 'wan_ip': '5.6.7.8'}))
+        assert parsers.WAN_IPS == {'5.6.7.8'}
+        assert parsers.get_wan_ip() == '5.6.7.8'
+
+    def test_reload_publishes_after_all_reads(self, monkeypatch):
+        """The scheduler thread may reload while derive_direction() reads on the
+        main thread: no global may change before every DB read is done, and the
+        previously published WAN_IPS set is never mutated in place."""
+        old_wan_ips = {'9.9.9.9'}
+        monkeypatch.setattr(parsers, 'WAN_IPS', old_wan_ips)
+        before = (parsers.WAN_INTERFACES, parsers.INTERFACE_LABELS, parsers.WAN_IPS,
+                  parsers.WAN_IP_BY_IFACE, parsers.get_wan_ip())
+        config = {'wan_interfaces': ['eth8'], 'interface_labels': {'br0': 'LAN'},
+                  'wan_ip_by_iface': {'eth8': '1.1.1.1'}, 'wan_ip': '1.1.1.1'}
+        seen = []
+
+        def get_config(key, default=None):
+            seen.append((parsers.WAN_INTERFACES, parsers.INTERFACE_LABELS, parsers.WAN_IPS,
+                         parsers.WAN_IP_BY_IFACE, parsers.get_wan_ip()))
+            return config.get(key, default)
+
+        db = MagicMock()
+        db.get_config.side_effect = get_config
+        parsers.reload_config_from_db(db)
+
+        assert seen and all(state == before for state in seen)
+        assert old_wan_ips == {'9.9.9.9'}
+        assert parsers.WAN_INTERFACES == {'eth8'}
+        assert parsers.WAN_IPS == {'1.1.1.1'}
+        assert parsers.WAN_IP_BY_IFACE == {'eth8': '1.1.1.1'}
+
+    def test_auto_learn_only_without_map(self, monkeypatch):
+        monkeypatch.setattr(parsers, 'WAN_INTERFACES', {'ppp0'})
+        derive_direction('ppp0', '', 'WAN_LOCAL-D-1', '8.8.8.8', '1.2.3.4')
+        assert parsers.get_wan_ip() == '1.2.3.4'
+
+        monkeypatch.setattr(parsers, 'WAN_IP_BY_IFACE', {'ppp0': '5.6.7.8'})
+        derive_direction('ppp0', '', 'WAN_LOCAL-D-1', '8.8.8.8', '4.3.2.1')
+        assert parsers.get_wan_ip() == '1.2.3.4'

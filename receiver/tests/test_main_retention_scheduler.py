@@ -110,6 +110,24 @@ def test_scheduler_tick_rebuilds_job_when_event_set(main_module):
         'tick must clear the Event so the job is not rebuilt every tick'
 
 
+def test_scheduler_tick_survives_failing_retention_resolver(main_module):
+    """A DB error while rebuilding the retention job must not end the scheduler
+    thread; the Event stays set so the next tick retries."""
+    db = MagicMock()
+    main_module.Database.resolve_retention_time = MagicMock(
+        side_effect=[Exception('db down'), _time_cfg('18:45', 'ui')])
+
+    main_module._retention_reload_requested.set()
+    main_module._scheduler_tick(db)  # must not raise
+    assert main_module._retention_reload_requested.is_set()
+
+    main_module._scheduler_tick(db)
+    assert not main_module._retention_reload_requested.is_set()
+    tagged = list(schedule.get_jobs('retention'))
+    assert len(tagged) == 1
+    assert tagged[0].at_time.hour == 18
+
+
 def test_scheduler_tick_is_noop_when_event_unset(main_module):
     """Without the Event set, _scheduler_tick must not re-query retention_time
     or touch the retention job — only run pending scheduled tasks.

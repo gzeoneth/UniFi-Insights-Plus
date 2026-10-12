@@ -36,8 +36,13 @@ def client(monkeypatch):
     # Patch deps in sys.modules before any route imports
     monkeypatch.setitem(sys.modules, 'deps', mock_deps)
 
+    # Keep the real catalog-estimate helper (it only drives the cursor) so
+    # the health test exercises its fetchone() handling.
+    from db import estimate_log_count
+
     # Also need to patch db module to avoid psycopg2 import issues
     mock_db_module = MagicMock()
+    mock_db_module.estimate_log_count = estimate_log_count
     mock_db_module.get_config = MagicMock(return_value=None)
     mock_db_module.is_external_db = MagicMock(return_value=False)
     # SimpleNamespace — see testing rule in test_routes_retention.py fixture.
