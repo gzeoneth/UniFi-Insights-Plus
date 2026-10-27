@@ -2,7 +2,7 @@
 FROM node:20-slim AS ui-builder
 WORKDIR /ui
 COPY ui/package.json ui/package-lock.json* ./
-RUN npm install
+RUN npm ci
 COPY ui/ ./
 RUN npm run build
 
@@ -11,8 +11,8 @@ FROM ubuntu:24.04
 
 LABEL org.opencontainers.image.title="UniFi Log Insight"
 LABEL org.opencontainers.image.description="Real-time log analysis for UniFi routers — syslog, GeoIP, threat intelligence, and a live dashboard in a single container"
-LABEL org.opencontainers.image.source="https://github.com/jmasarweh/unifi-log-insight"
-LABEL org.opencontainers.image.url="https://github.com/jmasarweh/unifi-log-insight"
+LABEL org.opencontainers.image.source="https://github.com/gzeoneth/UniFi-Insights-Plus"
+LABEL org.opencontainers.image.url="https://github.com/gzeoneth/UniFi-Insights-Plus"
 LABEL org.opencontainers.image.licenses="BSL-1.1"
 LABEL org.opencontainers.image.vendor="jmasarweh"
 
@@ -56,13 +56,16 @@ RUN pip install --no-cache-dir -r /app/requirements.txt \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy version file and application code
+COPY LICENSE /app/LICENSE
 COPY VERSION /app/VERSION
 COPY receiver/ /app/
 COPY init.sql /app/init.sql
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY entrypoint.sh /app/entrypoint.sh
 COPY geoip-update.sh /app/geoip-update.sh
-RUN chmod +x /app/entrypoint.sh /app/geoip-update.sh
+RUN chmod +x /app/entrypoint.sh /app/geoip-update.sh \
+    && mkdir -p /var/lib/unifi-log-insight/ingest /run/unifi-log-insight /data/archives /var/lib/unifi-log-insight/tls \
+    && chmod 700 /var/lib/unifi-log-insight/ingest /data/archives /var/lib/unifi-log-insight/tls
 
 # Copy built UI
 COPY --from=ui-builder /ui/dist /app/static

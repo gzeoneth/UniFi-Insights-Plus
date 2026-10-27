@@ -5,6 +5,7 @@ import { formatNumber, FlagIcon, countryName, decodeThreatCategories, LOG_TYPE_S
 import { getThreatLevel } from '../lib/threatPresentation'
 import { readCache, writeCache, CACHE_TTL_MS } from '../lib/sessionCache'
 import NetworkBadge from './NetworkBadge'
+import SecuritySummary from './SecuritySummary'
 import useTimeRange from '../hooks/useTimeRange'
 
 function SkeletonRows({ count = 5, withBar = false }) {
@@ -406,7 +407,7 @@ export default function Dashboard({ maxFilterDays }) {
                 Blocked {formatNumber(stats.blocked || 0)}
               </span>
               <span className="inline-flex items-center gap-1 px-2 py-1 rounded text-xs font-semibold uppercase border bg-orange-500/15 text-orange-400 border-orange-500/30">
-                Threats {formatNumber(stats.threats || 0)}
+                IP reputation {formatNumber(stats.threats || 0)}
               </span>
             </div>
             {stats.by_direction && Object.keys(stats.by_direction).length > 0 && (
@@ -468,6 +469,8 @@ export default function Dashboard({ maxFilterDays }) {
         </div>
       )}
 
+      <SecuritySummary timeRange={timeRange} />
+
       {/* Logs over time chart */}
       {stats.logs_over_time || stats.logs_per_hour ? (
         <div className="border border-gray-800 rounded-lg p-4 min-h-[10rem] animate-[fadeIn_0.3s_ease-out]">
@@ -510,7 +513,7 @@ export default function Dashboard({ maxFilterDays }) {
       {/* Top lists grid */}
       {tierStatus.tables === 'loading' && !stats.top_threat_ips ? (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <CardSkeleton title="Top Threat IPs"><SkeletonRows count={5} /></CardSkeleton>
+          <CardSkeleton title="Top IP Reputation Alerts"><SkeletonRows count={5} /></CardSkeleton>
           <CardSkeleton title="Top Blocked External IPs"><SkeletonRows count={5} withBar /></CardSkeleton>
           <CardSkeleton title="Top Blocked Internal IPs"><SkeletonRows count={5} withBar /></CardSkeleton>
           <CardSkeleton title="Top Active Internal IPs"><SkeletonRows count={5} withBar /></CardSkeleton>
@@ -536,7 +539,7 @@ export default function Dashboard({ maxFilterDays }) {
       ) : (
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3 animate-[fadeIn_0.3s_ease-out]">
         <TopList
-          title="Top Threat IPs"
+          title="Top IP Reputation Alerts"
           items={stats.top_threat_ips || []}
           renderItem={(item, i) => (
             <div key={i} className="space-y-1">

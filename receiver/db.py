@@ -12,6 +12,7 @@ import json
 import logging
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import NamedTuple, Optional
 
 import psycopg2
@@ -128,6 +129,15 @@ def wait_for_postgres(conn_params: dict, max_retries: int = 30, delay: float = 2
     sys.exit(1)
 
 
+@dataclass
+class InsertResult:
+    """Only committed rows are counted; retryable rows retain their ingest IDs."""
+    inserted: int = 0
+    dropped: int = 0
+    retryable: list = field(default_factory=list)
+    duplicates: int = 0
+
+
 # Column names matching the logs table
 INSERT_COLUMNS = [
     'timestamp', 'log_type', 'direction',
@@ -145,12 +155,14 @@ INSERT_COLUMNS = [
     'abuse_is_whitelisted', 'abuse_is_tor',
     'src_device_name', 'dst_device_name',
     'remote_ip',
-    'raw_log',
+    'raw_log', 'ingest_id', 'source', 'event_source', 'event_id', 'event_name',
+    'ips_signature', 'ips_signature_id', 'ips_severity', 'ips_risk',
 ]
 
 INSERT_SQL = f"""
     INSERT INTO logs ({', '.join(INSERT_COLUMNS)})
     VALUES ({', '.join(['%s'] * len(INSERT_COLUMNS))})
+    ON CONFLICT (ingest_id) WHERE ingest_id IS NOT NULL DO NOTHING
 """
 
 # to_regclass() resolves logs through search_path, so an external DB that
@@ -729,6 +741,21 @@ END $$;""",
             """CREATE INDEX IF NOT EXISTS idx_rdns_cache_looked_up_at
                 ON rdns_cache (looked_up_at)""",
         ]
+        migrations.extend([
+            "ALTER TABLE logs ADD COLUMN IF NOT EXISTS ingest_id UUID",
+            "ALTER TABLE logs ADD COLUMN IF NOT EXISTS source TEXT",
+            "ALTER TABLE logs ADD COLUMN IF NOT EXISTS event_source TEXT",
+            "ALTER TABLE logs ADD COLUMN IF NOT EXISTS event_id TEXT",
+            "ALTER TABLE logs ADD COLUMN IF NOT EXISTS event_name TEXT",
+            "ALTER TABLE logs ADD COLUMN IF NOT EXISTS ips_signature TEXT",
+            "ALTER TABLE logs ADD COLUMN IF NOT EXISTS ips_signature_id TEXT",
+            "ALTER TABLE logs ADD COLUMN IF NOT EXISTS ips_severity SMALLINT",
+            "ALTER TABLE logs ADD COLUMN IF NOT EXISTS ips_risk TEXT",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_logs_ingest_id ON logs (ingest_id) WHERE ingest_id IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_logs_ips_time ON logs (timestamp DESC) WHERE event_source = 'unifi_ips'",
+        ])
+        from retention import RETENTION_SCHEMA_SQL
+        migrations.extend(RETENTION_SCHEMA_SQL)
         try:
             with self.get_conn() as conn:
                 with conn.cursor() as cur:
@@ -1028,49 +1055,72 @@ END $$;""",
                 cur.execute(INSERT_SQL, values)
 
     def _execute_log_insert(self, cur, logs: list[dict]):
-        """Shared insert helper: build rows and execute_batch on a caller-owned cursor.
+        """Insert on a caller-owned transaction and return actual new rows.
 
-        Does NOT commit, rollback, or manage connections — caller controls the
-        transaction boundary.  Used by both syslog (with fallback) and Pi-hole
-        (strict, no fallback) insert paths.
-        """
-        rows = [tuple(log.get(col) for col in INSERT_COLUMNS) for log in logs]
-        cur.execute("SET LOCAL statement_timeout = '30s'")
-        extras.execute_batch(cur, INSERT_SQL, rows, page_size=100)
-        return len(rows)
-
-    def insert_logs_batch(self, logs: list[dict]):
-        """Insert multiple parsed log entries in a single transaction.
-
-        If batch insert fails, falls back to row-by-row to isolate bad data.
-        Sets a 30s statement timeout to prevent hung inserts from blocking the
-        UDP receive loop (which causes silent packet loss).
+        ingest_id deduplicates durable-spool retries, including an ambiguous
+        commit. Older callers without an ingest ID retain their prior semantics.
         """
         if not logs:
-            return
+            return 0
+        rows = [tuple(log.get(col) for col in INSERT_COLUMNS) for log in logs]
+        # PostgreSQL text cannot represent NUL. psycopg2 raises a plain
+        # ValueError before sending such a row, which would otherwise look
+        # retryable forever and repeatedly hold up valid rows in its batch.
+        def contains_nul(value):
+            if isinstance(value, str):
+                return '\x00' in value
+            if isinstance(value, (list, tuple)):
+                return any(contains_nul(item) for item in value)
+            return False
+        if any(contains_nul(value) for row in rows for value in row):
+            raise psycopg2.DataError('Log text contains an unsupported NUL character')
+        cur.execute("SET LOCAL statement_timeout = '30s'")
+        # The durable spool is removed after this transaction commits. Force
+        # WAL flush even on existing clusters initialized with asynchronous
+        # commit, so a host crash cannot lose both the DB row and spool copy.
+        cur.execute('SET LOCAL synchronous_commit = on')
+        inserted = extras.execute_values(
+            cur, f"INSERT INTO logs ({', '.join(INSERT_COLUMNS)}) VALUES %s "
+                 "ON CONFLICT (ingest_id) WHERE ingest_id IS NOT NULL DO NOTHING RETURNING id",
+            rows, page_size=100, fetch=True,
+        )
+        return len(inserted)
 
+    def insert_logs_batch(self, logs: list[dict]) -> InsertResult:
+        """Acknowledge committed rows, isolate malformed data, retain outages.
+
+        Connection failures never trigger dozens of per-row connection retries.
+        The caller durably retains retryable rows with their original ingest IDs.
+        """
+        if not logs:
+            return InsertResult()
         try:
             with self.get_conn() as conn:
                 with conn.cursor() as cur:
-                    self._execute_log_insert(cur, logs)
-            logger.debug("Batch inserted %d logs", len(logs))
-        except Exception as batch_err:
-            logger.warning("Batch insert failed (%s), falling back to row-by-row for %d logs",
-                          batch_err, len(logs))
-            inserted = 0
-            dropped = 0
-            rows = [tuple(log.get(col) for col in INSERT_COLUMNS) for log in logs]
-            for row in rows:
-                try:
-                    with self.get_conn() as conn:
-                        with conn.cursor() as cur:
-                            cur.execute("SET LOCAL statement_timeout = '10s'")
-                            cur.execute(INSERT_SQL, row)
-                    inserted += 1
-                except Exception as row_err:
-                    dropped += 1
-                    logger.warning("Dropped bad log row: %s — raw: %.200s", row_err, row[-1] if row else '?')
-            logger.info("Row-by-row fallback: %d inserted, %d dropped", inserted, dropped)
+                    count = self._execute_log_insert(cur, logs)
+            return InsertResult(inserted=count, duplicates=len(logs) - count)
+        except (psycopg2.DataError, psycopg2.IntegrityError):
+            logger.warning("Malformed batch; isolating invalid rows")
+        except Exception as exc:
+            logger.warning("Database batch pending retry (%s)", type(exc).__name__)
+            return InsertResult(retryable=list(logs))
+
+        result = InsertResult()
+        for index, log in enumerate(logs):
+            try:
+                with self.get_conn() as conn:
+                    with conn.cursor() as cur:
+                        count = self._execute_log_insert(cur, [log])
+                result.inserted += count
+                result.duplicates += 1 - count
+            except (psycopg2.DataError, psycopg2.IntegrityError) as exc:
+                result.dropped += 1
+                logger.warning("Invalid log row rejected (%s)", type(exc).__name__)
+            except Exception as exc:
+                result.retryable.extend(logs[index:])
+                logger.warning("Remaining batch pending retry (%s)", type(exc).__name__)
+                break
+        return result
 
     def insert_pihole_batch(self, logs: list[dict], new_cursor: int):
         """Atomic insert of Pi-hole logs + cursor update. No row-by-row fallback.
@@ -1225,8 +1275,21 @@ END $$;""",
             non_dns_deleted, deleted_so_far, batches_completed, error.
         """
         from datetime import datetime, timezone, timedelta
+        from retention import load_policy, run_retention_cleanup
 
         self.validate_retention_days(general_days, dns_days)
+        try:
+            policy = load_policy(self, general_days, dns_days)
+        except Exception as exc:
+            # The async worker needs a terminal result even when configuration
+            # is corrupt or unreadable. Never fall back to shorter retention.
+            logger.error("Retention policy could not be loaded: %s", exc)
+            return {
+                'status': 'failed', 'dns_deleted': 0, 'non_dns_deleted': 0,
+                'deleted_so_far': 0, 'batches_completed': 0, 'error': str(exc),
+            }
+        if policy.get('enabled'):
+            return run_retention_cleanup(self, general_days, dns_days, progress_cb=progress_cb)
 
         batch_size = self.RETENTION_BATCH_SIZE
         now = datetime.now(timezone.utc)

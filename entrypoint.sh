@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+# Validate or create TLS material before starting any services.
+/app/venv/bin/python /app/tls_config.py
+
 PGDATA="/var/lib/postgresql/data"
 
 # ── External database mode detection ─────────────────────────────────────────

@@ -16,6 +16,7 @@ import ipaddress
 import logging
 import time
 import threading
+import queue
 from collections import OrderedDict
 from typing import Optional
 
@@ -788,11 +789,21 @@ class Enricher:
         self._known_wan_ip = None
         self._excluded_ips = set()  # WAN IPs, gateway IPs — not enrichable
         self._pihole_enrichment = 'both'  # none|geoip|threat|both
-        # @coderabbit Accessed only from the single-threaded UDP receive/enrich
-        # loop today, so this coalescing map intentionally does not use a lock.
-        # If enrich() is ever called concurrently, revisit Enricher shared-state
-        # locking.
-        self._recently_touched = {}  # {ip: monotonic_time} — coalescing set for DB writes
+        self._recently_touched = {}
+        self._touch_lock = threading.Lock()
+        self._vpn_networks = []
+        # One bounded daemon warms network caches. A stalled libc DNS lookup
+        # consumes this worker only; it cannot stall UDP intake or DB delivery.
+        from ingest_queue import positive_env
+        self._network_queue = queue.Queue(maxsize=positive_env('ENRICHMENT_QUEUE_CAPACITY', 256, 4096))
+        self._network_pending = set()
+        self._network_lock = threading.Lock()
+        self._network_stop = threading.Event()
+        self._network_thread = None
+        self._network_dropped = 0
+        self._network_completed = 0
+        self._provider_last_success = {}
+        self._provider_last_error = {}
 
         # Pre-load WAN/gateway exclusions and pihole config from DB so
         # background threads (backfill) have exclusions before the first
@@ -808,6 +819,7 @@ class Enricher:
 
         # rDNS opt-out toggle: env > system_config > default(True)
         self._rdns_enabled = _resolve_rdns_enabled(db)
+        self._load_vpn_networks()
 
     def _load_identity_exclusions(self):
         """Add persisted WAN and gateway IPs to the exclusion sets (additive).
@@ -840,33 +852,139 @@ class Enricher:
             return False
         return True
 
-    def _is_recently_touched(self, ip: str) -> bool:
-        """Check if an IP was touched/enqueued within the coalescing TTL.
+    def _load_vpn_networks(self):
+        if self._db:
+            try:
+                from db import get_config, parse_vpn_config
+                self._vpn_networks = parse_vpn_config(get_config(self._db, 'vpn_networks'))
+            except Exception:
+                logger.debug("Failed to reload VPN networks", exc_info=True)
 
-        Also prunes expired entries to prevent unbounded growth.
-        """
+    def _is_recently_touched(self, ip: str) -> bool:
         now = time.monotonic()
-        ts = self._recently_touched.get(ip)
-        if ts is not None and (now - ts) < self._COALESCE_TTL:
-            return True
-        # Lazy prune: when map exceeds threshold, remove expired entries
-        if len(self._recently_touched) > self._COALESCE_MAP_MAX_SIZE:
-            cutoff = now - self._COALESCE_TTL
-            self._recently_touched = {
-                k: v for k, v in self._recently_touched.items() if v > cutoff
-            }
-        return False
+        with self._touch_lock:
+            ts = self._recently_touched.get(ip)
+            return ts is not None and now - ts < self._COALESCE_TTL
+
+    def _mark_touched(self, ip):
+        with self._touch_lock:
+            if len(self._recently_touched) >= self._COALESCE_MAP_MAX_SIZE:
+                self._recently_touched.pop(next(iter(self._recently_touched)))
+            self._recently_touched[ip] = time.monotonic()
 
     def _touch_threat_coalesced(self, ip: str):
-        """Touch threat last_seen_at, coalesced to avoid per-packet DB writes."""
         if self._db and not self._is_recently_touched(ip):
             try:
                 self._db.touch_threat_last_seen(ip)
             except Exception:
                 logger.debug("touch_threat_last_seen failed for %s", ip, exc_info=True)
-            self._recently_touched[ip] = time.monotonic()
+            self._mark_touched(ip)
 
-    def enrich(self, parsed: dict) -> dict:
+    def _defer_network(self, ip, rdns, threat, policy=False):
+        if not (rdns or threat or policy) or self._network_stop.is_set():
+            return
+        key = (ip, rdns, threat, policy)
+        with self._network_lock:
+            if key in self._network_pending:
+                return
+            try:
+                self._network_queue.put_nowait(key)
+            except queue.Full:
+                self._network_dropped += 1
+                return
+            self._network_pending.add(key)
+            if self._network_thread is None:
+                self._network_thread = threading.Thread(
+                    target=self._network_loop, name='network-enrichment', daemon=True)
+                self._network_thread.start()
+
+    def _network_loop(self):
+        while not self._network_stop.is_set():
+            try:
+                key = self._network_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            ip, rdns, threat, policy = key
+            try:
+                if policy:
+                    from firewall_policy_matcher import _get_snapshot
+                    _get_snapshot(self.unifi, vpn_networks=self._vpn_networks)
+                    continue
+                if not self._is_remote_ip(ip):
+                    continue
+                if rdns and self._rdns_enabled:
+                    self.rdns.lookup(ip)
+                    entry = self.rdns.cache.get(ip)
+                    if entry and entry.get('status') == 'transient':
+                        self._provider_last_error['rdns'] = time.time()
+                    else:
+                        self._provider_last_success['rdns'] = time.time()
+                if threat:
+                    data = self.abuseipdb.lookup(ip)
+                    if data:
+                        self._provider_last_success['abuseipdb'] = time.time()
+                        self._touch_threat_coalesced(ip)
+                    elif self.abuseipdb.enabled and self.abuseipdb.remaining_budget > 0:
+                        self._provider_last_error['abuseipdb'] = time.time()
+                    # Existing backfill patches cold first events from the
+                    # persistent threat cache, even when this lookup succeeded.
+                    if self.abuseipdb.enabled and self._db and not self._is_recently_touched('queue:' + ip):
+                        self._db.enqueue_threat_backfill(ip, source='live_miss')
+                        self._mark_touched('queue:' + ip)
+            except Exception:
+                provider = 'unifi' if policy else ('rdns' if rdns else 'abuseipdb')
+                self._provider_last_error[provider] = time.time()
+                logger.debug("Deferred network enrichment failed", exc_info=True)
+            finally:
+                with self._network_lock:
+                    self._network_pending.discard(key)
+                    self._network_completed += 1
+                self._network_queue.task_done()
+
+    def network_stats(self):
+        with self._network_lock:
+            return {'depth': self._network_queue.qsize(), 'capacity': self._network_queue.maxsize,
+                    'pending': len(self._network_pending), 'dropped': self._network_dropped,
+                    'completed': self._network_completed,
+                    'worker_alive': bool(self._network_thread and self._network_thread.is_alive())}
+
+    def provider_stats(self):
+        """Local process observations only; never probe a provider for health."""
+        with self._network_lock:
+            pending = {'rdns': any(key[1] for key in self._network_pending),
+                       'abuseipdb': any(key[2] for key in self._network_pending)}
+        def network(name, configured):
+            success = self._provider_last_success.get(name)
+            error = self._provider_last_error.get(name)
+            if not configured:
+                status = 'not_configured'
+            elif error and (not success or error > success):
+                status = 'error'
+            elif pending.get(name):
+                status = 'pending'
+            else:
+                status = 'ready'
+            return {'status': status, 'last_success_at': success, 'last_error_at': error}
+        result = {
+            'geoip': {'status': 'ready' if self.geoip.city_reader is not None else 'missing'},
+            'asn': {'status': 'ready' if self.geoip.asn_reader is not None else 'missing'},
+            'rdns': network('rdns', self._rdns_enabled),
+            'abuseipdb': network('abuseipdb', self.abuseipdb.enabled),
+        }
+        if self.abuseipdb.enabled and (self.abuseipdb._paused_until > time.time()
+                                     or self.abuseipdb._rate_limit_remaining == 0):
+            result['abuseipdb']['status'] = 'pending'
+        if not self.unifi or not self.unifi.enabled:
+            result['unifi'] = {'status': 'not_configured'}
+        elif getattr(self.unifi, '_last_poll_error', None):
+            result['unifi'] = {'status': 'error'}
+        elif getattr(self.unifi, '_last_poll', None) is None:
+            result['unifi'] = {'status': 'pending'}
+        else:
+            result['unifi'] = {'status': 'ready'}
+        return result
+
+    def enrich(self, parsed: dict, defer_network: bool = False) -> dict:
         """Enrich a parsed log entry with GeoIP, ASN, threat, and rDNS data.
 
         Strategy:
@@ -883,8 +1001,13 @@ class Enricher:
             self._known_wan_ip = wan_ip
             self._excluded_ips.add(wan_ip)
             self.abuseipdb.exclude_ip(wan_ip)
-            # Refresh full wan_ips + gateway_ips from DB
-            self._load_identity_exclusions()
+            # The ingestion worker only reads cached parser identity. Scheduled
+            # refresh/reload keeps persisted gateway and WAN exclusions current.
+            if not defer_network:
+                self._load_identity_exclusions()
+        if defer_network:
+            from parsers import WAN_IPS
+            self._excluded_ips.update(WAN_IPS)
 
         # Determine which IP to enrich — the remote party, not our infrastructure
         ip_to_enrich = None
@@ -915,6 +1038,7 @@ class Enricher:
         # (e.g. 'block' from "Block Unauthorized Traffic"). The policy metadata
         # is authoritative and should override the desc_hint when available.
         if (parsed.get('log_type') == 'firewall'
+                and parsed.get('event_source') != 'unifi_ips'
                 and self.unifi and self.unifi.enabled):
             try:
                 from firewall_policy_matcher import parse_firewall_rule, resolve_rule_action
@@ -923,14 +1047,16 @@ class Enricher:
                     rule_desc=parsed.get('rule_desc'),
                 )
                 if parsed_rule and parsed_rule['format'] == 'zone_index':
-                    from db import get_config, parse_vpn_config
-                    vpn_networks = parse_vpn_config(get_config(self._db, 'vpn_networks'))
                     action = resolve_rule_action(
                         parsed_rule, self.unifi,
                         interface_in=parsed.get('interface_in', ''),
                         interface_out=parsed.get('interface_out', ''),
-                        vpn_networks=vpn_networks,
+                        vpn_networks=self._vpn_networks,
+                        cached_only=defer_network,
                     )
+                    if defer_network and not self._is_recently_touched('policy'):
+                        self._defer_network(None, False, False, policy=True)
+                        self._mark_touched('policy')
                     if action:
                         parsed['rule_action'] = action
             except Exception:
@@ -959,6 +1085,21 @@ class Enricher:
             geo_data = self.geoip.lookup(ip_to_enrich)
             parsed.update(geo_data)
 
+        if defer_network:
+            wants_rdns = not is_pihole and self._rdns_enabled
+            wants_threat = ((is_pihole and self._pihole_enrichment in ('threat', 'both'))
+                            or (parsed.get('log_type') == 'firewall' and parsed.get('rule_action') == 'block'))
+            rdns_cached = self.rdns.cache.get(ip_to_enrich) if wants_rdns else None
+            rdns_fresh = rdns_cached is not None and time.time() < rdns_cached.get('expires_at', 0)
+            if rdns_fresh and rdns_cached.get('rdns'):
+                parsed['rdns'] = rdns_cached['rdns']
+            threat_cached = self.abuseipdb.cache.get(ip_to_enrich) if wants_threat else None
+            if threat_cached:
+                parsed.update(threat_cached)
+            self._defer_network(ip_to_enrich, wants_rdns and not rdns_fresh,
+                                wants_threat and self.abuseipdb.enabled and not threat_cached)
+            return parsed
+
         # rDNS (skip for pihole — domain already in dns_query, or operator opt-out)
         if not is_pihole and self._rdns_enabled:
             rdns_data = self.rdns.lookup(ip_to_enrich)
@@ -984,7 +1125,7 @@ class Enricher:
                         self._db.enqueue_threat_backfill(ip_to_enrich, source='live_miss')
                     except Exception:
                         logger.debug("enqueue_threat_backfill failed for %s", ip_to_enrich, exc_info=True)
-                    self._recently_touched[ip_to_enrich] = time.monotonic()
+                    self._mark_touched(ip_to_enrich)
 
         return parsed
 
@@ -1000,6 +1141,9 @@ class Enricher:
         }
 
     def close(self):
+        self._network_stop.set()
+        if self._network_thread:
+            self._network_thread.join(timeout=0.5)
         self.geoip.close()
 
     def reload_config(self):
@@ -1013,6 +1157,7 @@ class Enricher:
                 logger.debug("Failed to reload pihole_enrichment config", exc_info=True)
         # rDNS toggle reload — env stays authoritative on reload as well.
         self._rdns_enabled = _resolve_rdns_enabled(self._db)
+        self._load_vpn_networks()
         # Pick up WAN/gateway identity learned since start (detection or UniFi)
         self._load_identity_exclusions()
 

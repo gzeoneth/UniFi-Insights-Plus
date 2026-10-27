@@ -675,6 +675,7 @@ class FakeRetentionCursor:
 def test_run_retention_cleanup_structured_result(monkeypatch):
     """run_retention_cleanup returns structured result with correct counts."""
     database = Database(conn_params={'user': 'unifi'})
+    monkeypatch.setattr(database, 'get_config', lambda key, default=None: default)
 
     remaining = {'dns': 100, 'non_dns': 200}
 
@@ -702,6 +703,7 @@ def test_run_retention_cleanup_structured_result(monkeypatch):
 def test_run_retention_cleanup_no_data(monkeypatch):
     """run_retention_cleanup with no expired data returns zero counts."""
     database = Database(conn_params={'user': 'unifi'})
+    monkeypatch.setattr(database, 'get_config', lambda key, default=None: default)
 
     remaining = {'dns': 0, 'non_dns': 0}
 
@@ -733,6 +735,7 @@ def test_run_retention_cleanup_invalid_days():
 def test_run_retention_cleanup_progress_callback(monkeypatch):
     """progress_cb is called during cleanup."""
     database = Database(conn_params={'user': 'unifi'})
+    monkeypatch.setattr(database, 'get_config', lambda key, default=None: default)
 
     from contextlib import contextmanager as cm
 

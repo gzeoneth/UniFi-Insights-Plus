@@ -32,7 +32,8 @@ export function isNewerVersion(latest, current) {
     const [base, pre] = clean.split('-')
     const parts = base.split('.').map(Number)
     // stable (no pre-release) ranks higher than any beta
-    const preNum = pre ? parseInt(pre.split('.').pop(), 10) || 0 : Infinity
+    // Local fork revisions are based on the stable upstream version.
+    const preNum = pre && !pre.startsWith('gzeon.') ? parseInt(pre.split('.').pop(), 10) || 0 : Infinity
     return [...parts, preNum]
   }
   const [lMaj, lMin, lPatch, lPre] = parse(latest)

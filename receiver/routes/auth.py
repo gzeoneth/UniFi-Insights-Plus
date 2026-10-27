@@ -94,8 +94,8 @@ def get_forwarded_proto(request: Request) -> str:
 def _require_https(request: Request):
     if get_forwarded_proto(request) != 'https':
         if not _is_trusted_proxy(request):
-            raise HTTPException(403, "Unable to verify a secure connection. Your reverse proxy may not be sending the required X-ULI-Proxy-Auth header. See the authentication docs for proxy configuration.")
-        raise HTTPException(403, "Authentication requires HTTPS. Please access the app through a reverse proxy with TLS enabled.")
+            raise HTTPException(403, "Authentication requires HTTPS. Use the app's HTTPS listener or a TLS reverse proxy. If you already use a reverse proxy, configure its X-ULI-Proxy-Auth header.")
+        raise HTTPException(403, "Authentication requires HTTPS. Use the app's HTTPS listener or enable TLS on your reverse proxy.")
 
 
 def _auth_enabled() -> bool:
@@ -330,6 +330,7 @@ def validate_token_with_effective_scopes(token: str) -> dict | None:
 # Paths that never require auth
 PUBLIC_PATHS = {
     '/api/health',
+    '/api/health/ingest',
     '/api/auth/status',
     '/api/auth/login',
     '/api/auth/logout',
@@ -355,11 +356,11 @@ AUTH_SESSION_PATHS = {
 def require_auth(request: Request) -> dict | None:
     """Auth dependency. Returns user/token info or None if auth disabled.
     Raises 401 if auth enabled and no valid credentials."""
-    if not _auth_enabled():
-        return None
-
     path = request.url.path
     if path in PUBLIC_PATHS or any(path.startswith(p) for p in PUBLIC_PREFIXES):
+        return None
+
+    if not _auth_enabled():
         return None
 
     # Check Bearer token first

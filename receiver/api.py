@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from fastapi import FastAPI, HTTPException
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -20,6 +21,9 @@ from starlette.responses import Response as StarletteResponse
 
 from deps import APP_VERSION
 from routes.logs import router as logs_router
+from routes.security import router as security_router
+from routes.retention import router as retention_router
+from routes.rule_usage import router as rule_usage_router
 from routes.stats import router as stats_router
 from routes.setup import router as setup_router
 from routes.unifi import router as unifi_router
@@ -146,6 +150,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
         ('/api/protocols',       'logs.read', None),
         ('/api/stats',           'stats.read', None),
         ('/api/flows',           'flows.read', None),
+        ('/api/security/', 'threats.read', None),
+        ('/api/rules/', 'logs.read', None),
+        ('/api/retention/', 'logs.read', None),
         ('/api/threats',         'threats.read', None),
         ('/api/abuseipdb/',      'threats.read', None),
         ('/api/enrich/',         'threats.read', 'threats.read'),
@@ -191,7 +198,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         # Delegate to require_auth which knows about public paths, auth state, etc.
         try:
-            auth_info = require_auth(request)
+            auth_info = await run_in_threadpool(require_auth, request)
         except HTTPException as exc:
             return JSONResponse(
                 status_code=exc.status_code,
@@ -262,6 +269,9 @@ def _configure_access_logging():
 app.include_router(auth_router)
 app.include_router(tokens_router)
 app.include_router(logs_router)
+app.include_router(security_router)
+app.include_router(retention_router)
+app.include_router(rule_usage_router)
 app.include_router(stats_router)
 app.include_router(setup_router)
 app.include_router(unifi_router)

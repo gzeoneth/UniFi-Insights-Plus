@@ -76,11 +76,33 @@ vi.mock('../components/Login', () => ({ default: () => <div /> }))
 
 // Import after mocks are declared
 import App from '../App'
-import { dismissVpnToast, fetchConfig, fetchInterfaces } from '../api'
+import { dismissVpnToast, fetchAuthMe, fetchAuthStatus, fetchConfig, fetchInterfaces } from '../api'
 
 beforeEach(() => {
   vi.clearAllMocks()
   configOverride = {}
+  fetchAuthStatus.mockResolvedValue({ auth_enabled: false })
+  fetchAuthMe.mockResolvedValue(null)
+})
+
+describe('HTTPS connection warning', () => {
+  it.each([
+    { is_https: true, proxy_trusted: false },
+    { is_https: true, proxy_trusted: true },
+  ])('does not require a proxy header once HTTPS is verified: %o', async (connection) => {
+    fetchAuthStatus.mockResolvedValue({ ...connection, setup_complete: true, auth_enabled_effective: true })
+    fetchAuthMe.mockResolvedValue({ authenticated: true })
+    render(<App />)
+    await screen.findByTestId('logstream')
+    expect(screen.queryByText(/Reverse proxy trust is not configured/)).not.toBeInTheDocument()
+  })
+
+  it('warns when authenticated access has no verified HTTPS or proxy', async () => {
+    fetchAuthStatus.mockResolvedValue({ is_https: false, proxy_trusted: false, setup_complete: true, auth_enabled_effective: true })
+    fetchAuthMe.mockResolvedValue({ authenticated: true })
+    render(<App />)
+    expect(await screen.findByText(/Reverse proxy trust is not configured/)).toBeInTheDocument()
+  })
 })
 
 

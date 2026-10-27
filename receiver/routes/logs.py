@@ -26,6 +26,27 @@ logger = logging.getLogger('api.logs')
 router = APIRouter()
 
 
+def _source_device_name_select(row_alias, client_alias='c1', device_alias='d1'):
+    """Prefer the actual IP and suppress provably misattributed old MAC names.
+
+    All aliases are internal SQL fragments. Existing names remain available
+    when no controller row demonstrates that they came from a different IP.
+    """
+    stored = f'{row_alias}.src_device_name'
+    safe_stored = f"""CASE WHEN {row_alias}.src_ip IS NOT NULL AND (
+        EXISTS (SELECT 1 FROM unifi_clients bad_client
+                WHERE bad_client.mac = {row_alias}.mac_address
+                  AND bad_client.ip IS NOT NULL AND bad_client.ip != {row_alias}.src_ip
+                  AND {stored} IN (bad_client.device_name, bad_client.hostname, bad_client.oui))
+        OR EXISTS (SELECT 1 FROM unifi_devices bad_device
+                   WHERE bad_device.mac = {row_alias}.mac_address
+                     AND bad_device.ip IS NOT NULL AND bad_device.ip != {row_alias}.src_ip
+                     AND {stored} IN (bad_device.device_name, bad_device.model))
+        ) THEN NULL ELSE {stored} END"""
+    return (f'COALESCE({client_alias}.device_name, {client_alias}.hostname, {client_alias}.oui, '
+            f'{device_alias}.device_name, {device_alias}.model, {safe_stored}) AS src_device_name')
+
+
 @router.get("/api/logs")
 def get_logs(
     log_type: Optional[str] = Query(None, description="Comma-separated: firewall,dns,dhcp,wifi,system"),
@@ -48,6 +69,7 @@ def get_logs(
     dst_port: Optional[str] = Query(None, description="Destination port (prefix with ! to negate)"),
     src_port: Optional[str] = Query(None, description="Source port (prefix with ! to negate)"),
     protocol: Optional[str] = Query(None, description="Comma-separated: TCP,UDP,ICMP (prefix with ! to negate)"),
+    filter_rules: Optional[str] = None,
     sort: str = Query("timestamp", description="Sort field"),
     order: str = Query("desc", description="asc or desc"),
     page: int = Query(1, ge=1),
@@ -59,7 +81,7 @@ def get_logs(
         src_ip, dst_ip, ip, direction, rule_action,
         rule_name, country, threat_min, search, service,
         interface, vpn_only, asn=asn,
-        dst_port=dst_port, src_port=src_port, protocol=protocol,
+        dst_port=dst_port, src_port=src_port, protocol=protocol, filter_rules=filter_rules,
     )
 
     # Whitelist sort columns
@@ -86,12 +108,12 @@ def get_logs(
                         ORDER BY {sort_col} {sort_dir} LIMIT %s OFFSET %s
                     )
                     SELECT page.*,
-                        {device_name_coalesce('c1', 'd1', 'src_device_name', 'page.src_device_name')},
+                        {_source_device_name_select('page')},
                         {device_name_coalesce('c2', 'd2', 'dst_device_name', 'page.dst_device_name')}
                     FROM page
-                    LEFT JOIN unifi_clients c1 ON c1.mac = page.mac_address
+                    {device_name_client_lateral('page.src_ip', 'c1')}
                     {device_name_client_lateral('page.dst_ip', 'c2')}
-                    LEFT JOIN unifi_devices d1 ON d1.mac = page.mac_address
+                    {device_name_device_lateral('page.src_ip', 'd1')}
                     {device_name_device_lateral('page.dst_ip', 'd2')}
                     ORDER BY page.{sort_col} {sort_dir}""",
                 params + [per_page, offset]
@@ -163,6 +185,7 @@ def get_logs_aggregate(
     dst_port: Optional[str] = Query(None, description="Destination port (prefix with ! to negate)"),
     src_port: Optional[str] = Query(None, description="Source port (prefix with ! to negate)"),
     protocol: Optional[str] = Query(None, description="Comma-separated: TCP,UDP,ICMP (prefix with ! to negate)"),
+    filter_rules: Optional[str] = None,
 ):
     """Aggregate logs by a dimension, returning grouped counts and optional metrics."""
     if group_by not in _GROUP_BY_MAP:
@@ -191,7 +214,7 @@ def get_logs_aggregate(
         src_ip, dst_ip, ip, direction, rule_action,
         rule_name, country, threat_min, search, service,
         interface, vpn_only, asn=asn,
-        dst_port=dst_port, src_port=src_port, protocol=protocol,
+        dst_port=dst_port, src_port=src_port, protocol=protocol, filter_rules=filter_rules,
     )
 
     # Build GROUP BY expression and per-clause param lists
@@ -319,16 +342,16 @@ _LOG_DETAIL_SQL = """
                      CASE WHEN array_length(t2.threat_categories, 1) > 0 THEN t2.threat_categories END
             END
         ) as threat_categories,
-        """ + device_name_coalesce('c1', 'd1', 'src_device_name', 'l.src_device_name') + """,
+        """ + _source_device_name_select('l') + """,
         """ + device_name_coalesce('c2', 'd2', 'dst_device_name', 'l.dst_device_name') + """
     FROM logs l
     LEFT JOIN ip_threats t1 ON t1.ip = l.src_ip
         AND NOT (l.src_ip = ANY(%s::inet[]))
     LEFT JOIN ip_threats t2 ON t2.ip = l.dst_ip
         AND NOT (l.dst_ip = ANY(%s::inet[]))
-    LEFT JOIN unifi_clients c1 ON c1.mac = l.mac_address
+    """ + device_name_client_lateral('l.src_ip', 'c1') + """
     """ + device_name_client_lateral('l.dst_ip', 'c2') + """
-    LEFT JOIN unifi_devices d1 ON d1.mac = l.mac_address
+    """ + device_name_device_lateral('l.src_ip', 'd1') + """
     """ + device_name_device_lateral('l.dst_ip', 'd2') + """
 """
 
@@ -460,6 +483,7 @@ def export_csv_endpoint(
     dst_port: Optional[str] = Query(None),
     src_port: Optional[str] = Query(None),
     protocol: Optional[str] = Query(None),
+    filter_rules: Optional[str] = Query(None),
     limit: int = Query(10000, ge=1, le=100000),
 ):
     time_range, time_from, time_to = validate_time_params(time_range, time_from, time_to)
@@ -467,7 +491,7 @@ def export_csv_endpoint(
         log_type, time_range, time_from, time_to,
         src_ip, dst_ip, ip, direction, rule_action,
         rule_name, country, threat_min, search, service, interface, vpn_only, asn=asn,
-        dst_port=dst_port, src_port=src_port, protocol=protocol,
+        dst_port=dst_port, src_port=src_port, protocol=protocol, filter_rules=filter_rules,
     )
 
     export_columns = [
@@ -479,6 +503,8 @@ def export_csv_endpoint(
         'threat_categories', 'rdns',
         'abuse_usage_type', 'abuse_total_reports', 'abuse_last_reported',
         'abuse_is_tor', 'remote_ip',
+        'source', 'event_source', 'event_id', 'event_name',
+        'ips_signature', 'ips_signature_id', 'ips_severity', 'ips_risk',
     ]
 
     if get_config(enricher_db, 'ui_csv_export_unifi_raw_log', 'off') == 'on':
@@ -500,12 +526,12 @@ def export_csv_endpoint(
                         ORDER BY timestamp DESC LIMIT %s
                     )
                     SELECT {', '.join('f.' + c for c in export_columns)},
-                        {device_name_coalesce('c1', 'd1', 'src_device_name', 'f.src_device_name')},
+                        {_source_device_name_select('f')},
                         {device_name_coalesce('c2', 'd2', 'dst_device_name', 'f.dst_device_name')}
                     FROM filtered f
-                    LEFT JOIN unifi_clients c1 ON c1.mac = f.mac_address
+                    {device_name_client_lateral('f.src_ip', 'c1')}
                     {device_name_client_lateral('f.dst_ip', 'c2')}
-                    LEFT JOIN unifi_devices d1 ON d1.mac = f.mac_address
+                    {device_name_device_lateral('f.src_ip', 'd1')}
                     {device_name_device_lateral('f.dst_ip', 'd2')}
                     ORDER BY f.timestamp DESC""",
                 params + [limit]

@@ -109,7 +109,7 @@ export default function FlowView({ maxFilterDays }) {
 
   const refreshSavedViews = useCallback(() => {
     fetchSavedViews()
-      .then(d => setSavedViews(d.views || []))
+      .then(d => setSavedViews((d.views || []).filter(v => v.filters?.view_type !== 'logs')))
       .catch(err => console.error('Failed to fetch saved views:', err))
   }, [])
 

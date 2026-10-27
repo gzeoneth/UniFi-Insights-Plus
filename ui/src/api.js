@@ -14,7 +14,7 @@ function buildQS(params) {
 let onAuthExpired = null
 export function setAuthExpiredHandler(handler) { onAuthExpired = handler }
 
-async function apiFetch(url, options = {}) {
+export async function apiFetch(url, options = {}) {
   const resp = await fetch(url, { credentials: 'include', ...options })
   if (resp.status === 401 && onAuthExpired) {
     onAuthExpired()
@@ -66,6 +66,10 @@ export async function fetchStatsCharts(timeRange = '24h') {
 
 export async function fetchStatsTables(timeRange = '24h') {
   return apiFetch(`${BASE}/stats/tables?time_range=${timeRange}`)
+}
+
+export async function fetchSecuritySummary(params = {}, options = {}) {
+  return apiFetch(`${BASE}/security/summary?${buildQS(params)}`, options)
 }
 
 export async function fetchHealth() {

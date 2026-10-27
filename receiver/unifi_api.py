@@ -1264,19 +1264,18 @@ class UniFiAPI:
             return bool(self._ip_to_name)
 
     def resolve_name(self, ip: str | None = None, mac: str | None = None) -> str | None:
-        """Resolve device name by IP or MAC from in-memory cache.
+        """Resolve the logged IP; use a MAC only when no IP was supplied.
 
-        Returns None if client_names feature is disabled or no match found.
+        A routed packet's MAC can identify its next hop, not its IP endpoint.
+        An unknown IP therefore stays unnamed even when its MAC is cached.
         """
         if not self.features.get('client_names', True):
             return None
         with self._lock:
-            if mac:
-                name = self._mac_to_name.get(mac.lower())
-                if name:
-                    return name
             if ip:
                 return self._ip_to_name.get(ip)
+            if mac:
+                return self._mac_to_name.get(mac.lower())
         return None
 
 

@@ -1,0 +1,56 @@
+"""Read-only observations of rule usage; these are log hits, not flow totals."""
+
+from fastapi import APIRouter, Query
+from psycopg2.extras import RealDictCursor
+from deps import get_conn, put_conn
+from query_helpers import build_log_query, validate_time_params
+
+router = APIRouter()
+
+
+@router.get('/api/rules/usage')
+def rule_usage(rule_name: str | None = None, time_range: str | None = '24h',
+               time_from: str | None = None, time_to: str | None = None,
+               filter_rules: str | None = None, limit: int = Query(200, ge=1, le=500),
+               log_type: str | None = None, src_ip: str | None = None,
+               dst_ip: str | None = None, ip: str | None = None,
+               direction: str | None = None, rule_action: str | None = None,
+               country: str | None = None, threat_min: int | None = None,
+               search: str | None = None, service: str | None = None,
+               interface: str | None = None, vpn_only: bool = False,
+               asn: str | None = None, dst_port: str | None = None,
+               src_port: str | None = None, protocol: str | None = None):
+    time_range, time_from, time_to = validate_time_params(time_range, time_from, time_to)
+    where, params = build_log_query(
+        log_type=log_type, time_range=time_range, time_from=time_from, time_to=time_to,
+        src_ip=src_ip, dst_ip=dst_ip, ip=ip, direction=direction, rule_action=rule_action,
+        rule_name=rule_name, country=country, threat_min=threat_min, search=search,
+        service=service, interface=interface, vpn_only=vpn_only, asn=asn,
+        dst_port=dst_port, src_port=src_port, protocol=protocol, filter_rules=filter_rules,
+    )
+    # Preserve a saved view's constraints even if they select another type;
+    # the rule-usage surface itself always remains firewall-only.
+    where += " AND log_type = 'firewall'"
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(f"""
+                SELECT rule_name, rule_desc, rule_action, host(src_ip) AS src_ip,
+                       host(dst_ip) AS dst_ip, protocol, dst_port,
+                       COUNT(*) AS log_hits, MIN(timestamp) AS first_seen,
+                       MAX(timestamp) AS last_seen
+                FROM logs WHERE {where}
+                GROUP BY rule_name, rule_desc, rule_action, src_ip, dst_ip, protocol, dst_port
+                ORDER BY log_hits DESC, last_seen DESC, rule_name, src_ip, dst_ip, dst_port
+                LIMIT %s
+            """, params + [limit + 1])
+            rows = [dict(row) for row in cur.fetchall()]
+        conn.commit()
+        return {'data': rows[:limit], 'truncated': len(rows) > limit, 'limit': limit,
+                'measurement': 'observed_log_hits',
+                'notice': 'Only logged events are visible. Rate limits and unlogged rules can hide traffic; absence is not proof a rule is unnecessary.'}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        put_conn(conn)

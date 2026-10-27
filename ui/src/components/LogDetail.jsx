@@ -80,7 +80,8 @@ export default function LogDetail({ log, hiddenColumns = new Set() }) {
   }, [canPrefetchBudget])
 
   // Match firewall log to policy for syslog toggle
-  const canMatchPolicy = log?.log_type === 'firewall' && log?.rule_name && parseRuleName(log.rule_name)
+  const canMatchPolicy = log?.log_type === 'firewall' && log?.event_source !== 'unifi_ips'
+    && log?.rule_name && parseRuleName(log.rule_name)
   useEffect(() => {
     if (!canMatchPolicy) return
     setPolicyLoading(true)
@@ -142,6 +143,27 @@ export default function LogDetail({ log, hiddenColumns = new Set() }) {
   }
 
   const sections = []
+
+  if (displayLog.event_source === 'unifi_ips') {
+    const action = { block: 'Blocked', allow: 'Allowed' }[displayLog.rule_action] || 'Unknown'
+    sections.push(
+      <section key="ips" aria-label="UniFi IPS detection" className="col-span-full rounded border border-orange-800/40 bg-orange-950/10 p-3">
+        <h3 className="text-orange-300 text-[12px] uppercase tracking-wider mb-2">UniFi IPS detection</h3>
+        <div className="text-sm text-gray-200 break-words">{displayLog.ips_signature || 'Signature not supplied'}</div>
+        <dl className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3 text-xs">
+          {[
+            ['Signature ID', displayLog.ips_signature_id || 'Unknown'],
+            ['IPS severity', displayLog.ips_severity == null ? 'Unknown' : `${displayLog.ips_severity}/10`],
+            ['UniFi risk', displayLog.ips_risk || 'Unknown'],
+            ['IPS action', action],
+          ].map(([label, value]) => (
+            <div key={label}><dt className="text-gray-400">{label}</dt><dd className="text-gray-200 mt-1">{value}</dd></div>
+          ))}
+        </dl>
+        {displayLog.event_name && <div className="text-xs text-gray-400 mt-3">{displayLog.event_name}{displayLog.event_id ? ` (event ${displayLog.event_id})` : ''}</div>}
+      </section>
+    )
+  }
 
   // Source IP / Destination IP (always shown for copyability)
   if (displayLog.src_ip) {
@@ -265,7 +287,7 @@ export default function LogDetail({ log, hiddenColumns = new Set() }) {
   if (displayLog.log_type === 'firewall') {
     // Parsed rule breakdown (hidden when rule column is hidden)
     if (!hiddenColumns.has('rule')) {
-      const parsed = parseRuleName(displayLog.rule_name)
+      const parsed = displayLog.event_source !== 'unifi_ips' && parseRuleName(displayLog.rule_name)
       if (parsed) {
         const actionDisplay = parsed.action
           || (displayLog.rule_action && displayLog.rule_action.charAt(0).toUpperCase() + displayLog.rule_action.slice(1))

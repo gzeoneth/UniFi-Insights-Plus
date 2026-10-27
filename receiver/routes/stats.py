@@ -107,19 +107,19 @@ def _query_top_blocked_internal_ips(cur, cutoff):
 
 
 def _query_top_threat_ips(cur, cutoff, exclude_ips):
-    """Top threat IPs with categories from ip_threats and last_seen ISO format."""
+    """Top scored remote IPs; outbound scores belong to the destination."""
     cur.execute(
-        "SELECT host(l.src_ip) as ip, COUNT(*) as count, "
+        "SELECT host(l.remote_ip) as ip, COUNT(*) as count, "
         "MAX(l.geo_country) as country, MAX(l.asn_name) as asn, "
         "MAX(l.geo_city) as city, MAX(l.rdns) as rdns, "
         "MAX(l.threat_score) as threat_score, "
         "COALESCE(MAX(l.threat_categories), MAX(t.threat_categories)) as threat_categories, "
         "MAX(l.timestamp) as last_seen "
         "FROM logs l "
-        "LEFT JOIN ip_threats t ON l.src_ip = t.ip "
-        "WHERE l.timestamp >= %s AND l.threat_score > 50 AND l.src_ip IS NOT NULL "
-        "AND host(l.src_ip) != ALL(%s) "
-        "GROUP BY l.src_ip ORDER BY max(l.threat_score) DESC, count DESC LIMIT 10",
+        "LEFT JOIN ip_threats t ON l.remote_ip = t.ip "
+        "WHERE l.timestamp >= %s AND l.threat_score > 50 AND l.remote_ip IS NOT NULL "
+        "AND host(l.remote_ip) != ALL(%s) "
+        "GROUP BY l.remote_ip ORDER BY max(l.threat_score) DESC, count DESC LIMIT 10",
         [cutoff, exclude_ips]
     )
     results = []

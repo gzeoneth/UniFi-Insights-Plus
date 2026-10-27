@@ -7,3 +7,21 @@ __pycache__
 README.md
 ui/node_modules
 ui/dist
+
+.secrets
+**/.secrets
+.env.*
+*.dump
+*.tar
+*.tar.gz
+.local
+receiver/tests
+
+# Runtime TLS material is private and must never enter source or images.
+certs/
+tls/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx

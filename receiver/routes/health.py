@@ -1,6 +1,9 @@
 """Health check endpoint."""
 
 import logging
+import json
+import math
+import time
 import os
 import shutil
 from datetime import datetime, timedelta, timezone
@@ -16,11 +19,106 @@ logger = logging.getLogger('api.health')
 router = APIRouter()
 
 
+_COUNTERS = (
+    'received', 'parsed', 'filtered', 'failed', 'inserted', 'duplicates',
+    'flush_errors', 'dropped', 'parse_exceptions', 'enrich_exceptions',
+    'queue_dropped', 'spool_dropped', 'spool_errors', 'retry_attempts', 'shutdown_dropped',
+)
+_PROVIDER_NAMES = ('geoip', 'asn', 'rdns', 'abuseipdb', 'unifi')
+_PROVIDER_STATES = {'not_configured', 'ready', 'missing', 'error', 'pending'}
+
+
+def _number(value, default=None):
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+        return value
+    return default
+
+
+def read_ingest_health():
+    """Read a bounded, allowlisted process snapshot; never query DB or providers.
+
+    A fresh file proves only that the health publisher ran. Separate worker
+    liveness/progress fields reveal a stalled ingestion worker behind it.
+    """
+    unavailable = {'status': 'unavailable', 'state': 'unknown', 'updated_at': None,
+                   'age_seconds': None, 'providers': {}}
+    path = os.environ.get('INGEST_STATUS_PATH', '/run/unifi-log-insight/receiver-health.json')
+    try:
+        with open(path, 'r', encoding='utf-8') as stream:
+            payload = stream.read(65537)
+        if len(payload) > 65536:
+            return dict(unavailable, reason='invalid_snapshot')
+        raw = json.loads(payload)
+        if not isinstance(raw, dict) or raw.get('schema_version') != 1:
+            return dict(unavailable, reason='invalid_snapshot')
+        now = time.time()
+        updated = _number(raw.get('updated_at'))
+        if updated is None or updated > now + 5:
+            return dict(unavailable, reason='invalid_snapshot')
+        age = max(0, now - updated)
+        snapshot = {
+            'status': 'fresh' if age <= 10 else 'stale',
+            'state': 'ready', 'updated_at': updated, 'age_seconds': age,
+            'running': raw.get('running') is True,
+            'worker_alive': raw.get('worker_alive') is True,
+            'last_progress_at': _number(raw.get('last_progress_at')),
+            'last_receive_at': _number(raw.get('last_receive_at')) or None,
+        }
+        for group, fields in {
+            'stats': _COUNTERS,
+            'queue': ('depth', 'capacity', 'oldest_age_seconds'),
+            'spool': ('rows', 'bytes', 'max_rows', 'max_bytes'),
+            'retry': ('consecutive_failures', 'next_retry_at'),
+            'enrichment': ('depth', 'capacity', 'pending', 'dropped', 'completed'),
+        }.items():
+            data = raw.get(group)
+            data = data if isinstance(data, dict) else {}
+            snapshot[group] = {key: _number(data.get(key), 0) for key in fields}
+        spool = raw.get('spool')
+        snapshot['spool']['failed'] = isinstance(spool, dict) and spool.get('failed') is True
+        providers = raw.get('providers')
+        providers = providers if isinstance(providers, dict) else {}
+        snapshot['providers'] = {}
+        for name in _PROVIDER_NAMES:
+            value = providers.get(name)
+            value = value if isinstance(value, dict) else {}
+            state = value.get('status')
+            # Stale configuration cannot establish current provider readiness.
+            snapshot['providers'][name] = {
+                'status': state if state in _PROVIDER_STATES and age <= 10 else 'pending',
+                'last_success_at': _number(value.get('last_success_at')),
+                'last_error_at': _number(value.get('last_error_at')),
+            }
+        progress = snapshot['last_progress_at']
+        snapshot['progress_age_seconds'] = max(0, now - progress) if progress else None
+        snapshot['receive_age_seconds'] = max(0, now - snapshot['last_receive_at']) if snapshot['last_receive_at'] else None
+        if snapshot['status'] == 'stale':
+            snapshot['state'] = 'unknown'
+        elif not snapshot['running'] or not snapshot['worker_alive'] or snapshot['spool']['failed']:
+            snapshot['state'] = 'error'
+        elif (snapshot['queue']['depth'] or snapshot['spool']['rows']) and (not progress or now - progress > 30):
+            snapshot['state'] = 'stalled'
+        elif snapshot['retry']['consecutive_failures'] or snapshot['queue']['depth'] or snapshot['spool']['rows']:
+            snapshot['state'] = 'pending'
+        return snapshot
+    except FileNotFoundError:
+        return dict(unavailable, reason='not_started')
+    except (OSError, ValueError, TypeError):
+        return dict(unavailable, reason='unreadable_snapshot')
+
+
+@router.get("/api/health/ingest")
+def ingest_health():
+    """Ingestion remains observable even when PostgreSQL cannot answer."""
+    return read_ingest_health()
+
+
 @router.get("/api/health")
 def health():
     """Return service health, log count estimate, retention config, and storage stats."""
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         with conn.cursor() as cur:
             # Catalog estimate, not COUNT(*): on 100M+ rows the exact count takes
             # 5-7s per call and causes /api/health 503s via statement_timeout.
@@ -82,7 +180,11 @@ def health():
             except Exception as e:
                 logger.warning("Failed to read disk usage for /var/lib/postgresql/data: %s", e)
 
+        ingestion = read_ingest_health()
         return {
+            'ingestion': ingestion,
+            'providers': ingestion['providers'],
+            'total_logs_is_estimate': True,
             'status': 'ok',
             'version': APP_VERSION,
             'total_logs': total,
@@ -95,8 +197,10 @@ def health():
             'storage': storage,
         }
     except Exception as e:
-        conn.rollback()
+        if conn is not None:
+            conn.rollback()
         logger.exception("Health check failed")
         raise HTTPException(status_code=503, detail="Service unavailable") from None
     finally:
-        put_conn(conn)
+        if conn is not None:
+            put_conn(conn)

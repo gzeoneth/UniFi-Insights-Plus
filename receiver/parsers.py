@@ -43,6 +43,11 @@ def _is_broadcast_or_multicast(ip: str) -> bool:
 SYSLOG_HEADER = re.compile(
     r'^(?P<month>\w+)\s+(?P<day>\d+)\s+(?P<time>\d+:\d+:\d+)\s+(?P<host>\S+)\s+(?P<body>.+)$'
 )
+RFC5424_HEADER = re.compile(
+    r'^\d{1,3} (?P<timestamp>\S+) (?P<host>\S+) \S+ \S+ \S+ (?P<rest>.*)$'
+)
+CEF_EXTENSION_KEY = re.compile(r'(?:^|[ \t]+)([A-Za-z][A-Za-z0-9_]*)=')
+CEF_TAG = re.compile(r'^(?:\ufeff)?(?:[\w./-]+(?:\[\d+\])?:\s+)?(?P<cef>CEF:.*)$', re.DOTALL)
 
 # ── Firewall (iptables/netfilter) ──────────────────────────────────────────────
 FW_RULE     = re.compile(r'\[([^\]]+)\]')
@@ -219,6 +224,66 @@ def parse_syslog_timestamp(month: str, day: str, time_str: str) -> datetime | No
         return ts.astimezone(timezone.utc)
     except (ValueError, OverflowError):
         return None
+
+
+def _parse_iso_timestamp(value: str) -> datetime | None:
+    """Accept explicit, timezone-qualified event time; never guess its timezone."""
+    if not value or not re.fullmatch(
+            r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})', value):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _rfc5424_message(rest: str) -> str | None:
+    """Skip NILVALUE or structured data, honoring escaped closing brackets."""
+    if rest == '-':
+        return ''
+    if rest.startswith('- '):
+        return rest[2:]
+    pos = 0
+    while pos < len(rest) and rest[pos] == '[':
+        pos += 1
+        while pos < len(rest):
+            if rest[pos] == '\\':
+                pos += 2
+            elif rest[pos] == ']':
+                pos += 1
+                break
+            else:
+                pos += 1
+        else:
+            return None
+    if not pos:
+        return None
+    if pos == len(rest):
+        return ''
+    return rest[pos + 1:] if rest[pos] == ' ' else None
+
+
+def _syslog_envelope(raw_log: str) -> tuple | None:
+    """Return timestamp and body from RFC3164, RFC5424, or UniFi's dual date."""
+    stripped = re.sub(r'^<\d{1,3}>', '', raw_log)
+    modern = RFC5424_HEADER.match(stripped)
+    if modern:
+        body = _rfc5424_message(modern.group('rest'))
+        if body is None:
+            return None
+        return _parse_iso_timestamp(modern.group('timestamp')), body
+    legacy = SYSLOG_HEADER.match(stripped)
+    if not legacy:
+        return None
+    timestamp = parse_syslog_timestamp(
+        legacy.group('month'), legacy.group('day'), legacy.group('time'))
+    body = legacy.group('body')
+    # Some UniFi emitters insert an ISO timestamp before the actual hostname.
+    explicit_timestamp = _parse_iso_timestamp(legacy.group('host'))
+    if explicit_timestamp and ' ' in body:
+        timestamp = explicit_timestamp
+        body = body.split(' ', 1)[1]
+    return timestamp, body
 
 
 def derive_direction(iface_in: str, iface_out: str, rule_name: str, src_ip: str = None, dst_ip: str = None) -> str:
@@ -462,6 +527,137 @@ def parse_wifi(body: str) -> dict:
     return result
 
 
+def _cef_unescape(value: str, *, header: bool = False) -> str:
+    """Decode CEF escapes once; retain unknown escapes rather than losing data."""
+    escapes = {'\\': '\\', '|': '|'} if header else {
+        '\\': '\\', '=': '=', 'n': '\n', 'r': '\r', '|': '|',
+    }
+    return re.sub(r'\\(.)', lambda match: escapes.get(
+        match.group(1), match.group(0)), value, flags=re.DOTALL)
+
+
+def _cef_header(body: str) -> list[str] | None:
+    """Split the seven unescaped header pipes; extension pipes are literal."""
+    tagged = CEF_TAG.fullmatch(body)
+    if not tagged:
+        return None
+    body = tagged.group('cef')
+    fields, start, pos = [], 0, 0
+    while pos < len(body) and len(fields) < 7:
+        if body[pos] == '\\':
+            pos += 2
+            continue
+        if body[pos] == '|':
+            fields.append(_cef_unescape(body[start:pos], header=True))
+            start = pos + 1
+        pos += 1
+    if len(fields) != 7 or fields[0] not in ('CEF:0', 'CEF:1'):
+        return None
+    return fields + [body[start:]]
+
+
+def _parse_cef_extensions(extension: str) -> dict[str, str]:
+    """CEF values end at the next key=; literal equals must be escaped as \\=.
+
+    Parse boundaries before unescaping so a signature containing ``dst\\=``
+    cannot manufacture a destination field. Spaces and pipes in values are
+    allowed. First occurrence wins if a malformed sender repeats a key.
+    """
+    fields = {}
+    matches = list(CEF_EXTENSION_KEY.finditer(extension))
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(extension)
+        fields.setdefault(match.group(1), _cef_unescape(extension[match.end():end].strip()))
+    return fields
+
+
+def _cef_ip(value: str | None) -> str | None:
+    if not value or '%' in value:
+        return None
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        return None
+
+
+def _cef_port(value: str | None) -> int | None:
+    if value and re.fullmatch(r'[0-9]{1,5}', value):
+        port = int(value)
+        if 0 <= port <= 65535:
+            return port
+    return None
+
+
+def parse_cef_threat(body: str) -> dict | None:
+    """Parse UniFi IPS CEF events without mixing IPS risk with IP reputation.
+
+    Event IDs 200/201 describe detection/blocking, while other 2xx events can
+    be ordinary firewall events. Require the threat name or explicit IPS
+    metadata, and leave non-IPS CEF as system logs. The gateway's device MAC
+    and hostname never identify a client. All source data remains in raw_log.
+    """
+    header = _cef_header(body)
+    if not header:
+        return None
+    _, vendor, product, _, event_id, event_name, severity, extension = header
+    if vendor != 'Ubiquiti' or product != 'UniFi Network' or not re.fullmatch(r'2\d{2}', event_id):
+        return None
+    ext = _parse_cef_extensions(extension)
+    if not (event_name.startswith('Threat') or ext.get('UNIFIipsSignature')
+            or ext.get('UNIFIpolicyType', '').upper() == 'IDS/IPS'):
+        return None
+    protocol = ext.get('proto', '').lower()
+    protocol = {'1': 'icmp', '6': 'tcp', '17': 'udp', '41': 'ipv6',
+                '47': 'gre', '50': 'esp', '51': 'ah', '58': 'icmpv6',
+                '132': 'sctp'}.get(protocol, protocol)
+    if not re.fullmatch(r'[a-z][a-z0-9-]{0,9}|[0-9]{1,3}', protocol):
+        protocol = None
+    elif protocol.isdigit() and int(protocol) > 255:
+        protocol = None
+    action = ext.get('act', '').strip().lower()
+    result = {
+        'log_type': 'firewall',
+        'source': 'syslog',
+        'event_source': 'unifi_ips',
+        'event_id': event_id,
+        'event_name': event_name,
+        'ips_signature': ext.get('UNIFIipsSignature') or None,
+        'ips_signature_id': ext.get('UNIFIipsSignatureId') or None,
+        'ips_severity': int(severity) if re.fullmatch(r'(?:[0-9]|10)', severity) else None,
+        'ips_risk': ext.get('UNIFIrisk', '').lower() or None,
+        'src_ip': _cef_ip(ext.get('src')),
+        'dst_ip': _cef_ip(ext.get('dst')),
+        'src_port': _cef_port(ext.get('spt')),
+        'dst_port': _cef_port(ext.get('dpt')),
+        'protocol': protocol,
+        'rule_action': {'allow': 'allow', 'allowed': 'allow', 'accept': 'allow',
+                        'accepted': 'allow', 'block': 'block', 'blocked': 'block',
+                        'drop': 'block', 'dropped': 'block', 'deny': 'block',
+                        'denied': 'block', 'reject': 'block', 'rejected': 'block'}.get(action),
+        'rule_name': (ext.get('UNIFIpolicyName') or '')[:100] or None,
+        'rule_desc': (ext.get('UNIFIpolicyType') or 'IDS/IPS')[:255],
+        'direction': {'incoming': 'inbound', 'inbound': 'inbound',
+                      'outgoing': 'outbound', 'outbound': 'outbound'}.get(
+                          ext.get('UNIFIdirection', '').lower()),
+    }
+    result['service_name'] = get_service_name(result['dst_port'], result['protocol'])
+    timestamp = _parse_iso_timestamp(ext.get('UNIFIutcTime', ''))
+    if timestamp is not None:
+        result['timestamp'] = timestamp
+    return result
+
+
+def parse_cef_log(raw_log: str) -> dict | None:
+    """Read IPS fields from a syslog record, keeping only explicit CEF time.
+
+    Historical backfill uses this path so a yearless RFC3164 timestamp is
+    never reinterpreted as this year's date. Live parse_log adds envelope time
+    when the CEF extension contains no valid UNIFIutcTime.
+    """
+    envelope = _syslog_envelope(raw_log)
+    return parse_cef_threat(envelope[1]) if envelope else None
+
+
 def parse_system(body: str) -> dict:
     """Parse a system log line. Stores raw log only."""
     return {'log_type': 'system'}
@@ -469,6 +665,8 @@ def parse_system(body: str) -> dict:
 
 def detect_log_type(body: str) -> str:
     """Detect log type from the syslog message body."""
+    if CEF_TAG.fullmatch(body):
+        return 'firewall' if parse_cef_threat(body) else 'system'
     # Firewall: contains iptables-style fields
     if 'SRC=' in body and 'DST=' in body and 'PROTO=' in body:
         return 'firewall'
@@ -500,24 +698,15 @@ def parse_log(raw_log: str) -> dict | None:
     """
     original_raw = raw_log
 
-    m = SYSLOG_HEADER.match(raw_log)
-    if not m:
-        # Strip RFC3164 priority prefix (e.g. <13>, <14>) and retry
-        stripped = re.sub(r'^<\d+>', '', raw_log)
-        m = SYSLOG_HEADER.match(stripped)
-        if not m:
-            return None
-        raw_log = stripped
-
-    timestamp = parse_syslog_timestamp(m.group('month'), m.group('day'), m.group('time'))
-    if timestamp is None:
+    envelope = _syslog_envelope(raw_log)
+    if envelope is None:
         return None
-    body = m.group('body')
+    timestamp, body = envelope
 
     log_type = detect_log_type(body)
 
     if log_type == 'firewall':
-        parsed = parse_firewall(body)
+        parsed = parse_cef_threat(body) if CEF_TAG.fullmatch(body) else parse_firewall(body)
     elif log_type == 'dns':
         parsed = parse_dns(body)
     elif log_type == 'dhcp':
@@ -529,8 +718,11 @@ def parse_log(raw_log: str) -> dict | None:
     else:
         parsed = {'log_type': 'unknown'}
 
-    parsed['timestamp'] = timestamp
+    parsed.setdefault('timestamp', timestamp)
+    if parsed['timestamp'] is None:
+        return None
     parsed['raw_log'] = original_raw
+    parsed['source'] = 'syslog'
 
     # Validate IP fields — reject invalid inet values before DB insert
     for ip_field in ('src_ip', 'dst_ip'):

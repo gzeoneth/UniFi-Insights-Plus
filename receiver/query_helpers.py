@@ -133,6 +133,7 @@ def build_log_query(
     dst_port: Optional[str] = None,
     src_port: Optional[str] = None,
     protocol: Optional[str] = None,
+    filter_rules: Optional[str] = None,
 ) -> tuple[str, list]:
     """Build WHERE clause and params from filters."""
     conditions = []
@@ -322,6 +323,10 @@ def build_log_query(
             params.extend([f"{pfx}%", f"{pfx}%"])
         conditions.append(f"({' OR '.join(vpn_parts)})")
 
+    from field_filters import compile_filters
+    extra_conditions, extra_params = compile_filters(filter_rules)
+    conditions.extend(extra_conditions)
+    params.extend(extra_params)
     where = " AND ".join(conditions) if conditions else "1=1"
     return where, params
 
@@ -405,6 +410,38 @@ def validate_view_filters(filters: dict) -> str | None:
     """
     if not isinstance(filters, dict):
         return "filters must be a JSON object"
+
+    if filters.get('view_type') == 'logs':
+        from field_filters import compile_filters
+        from fastapi import HTTPException
+        try:
+            compile_filters(filters.get('filter_rules'))
+        except HTTPException as exc:
+            return str(exc.detail)
+        if filters.get('time_range') is not None and (not isinstance(filters['time_range'], str) or filters['time_range'] not in VALID_TIME_RANGES):
+            return 'Invalid log-view time range'
+        if set(filters) - {'view_type', 'filter_rules', 'time_range', 'time_from', 'time_to', 'log_type', 'rule_action', 'direction', 'ip', 'src_ip', 'dst_ip', 'rule_name', 'search', 'service', 'country', 'asn', 'dst_port', 'src_port', 'protocol', 'interface', 'vpn_only', 'threat_min'}:
+            return 'Unknown log-view option'
+        if filters.get('rule_name') is not None and (not isinstance(filters['rule_name'], str) or len(filters['rule_name']) > 255):
+            return 'Invalid rule name'
+        for key, value in filters.items():
+            if key in ('view_type', 'filter_rules') or value is None:
+                continue
+            if key == 'vpn_only':
+                if type(value) is not bool:
+                    return 'vpn_only must be a boolean'
+            elif key == 'threat_min':
+                if type(value) is not int or not 0 <= value <= 100:
+                    return 'threat_min must be an integer within 0..100'
+            elif not isinstance(value, str) or len(value) > 2048:
+                return f'{key} must be text up to 2048 characters'
+        for key in ('time_from', 'time_to'):
+            if filters.get(key):
+                try:
+                    datetime.fromisoformat(filters[key].replace('Z', '+00:00'))
+                except ValueError:
+                    return f'{key} must be an ISO timestamp'
+        return None
 
     dims = filters.get('dims')
     if not isinstance(dims, list) or len(dims) != 3:

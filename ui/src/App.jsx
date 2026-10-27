@@ -7,6 +7,7 @@ import { ThreatMapSkeleton } from './components/ThreatMap'
 import FlowViewSkeleton from './components/FlowViewSkeleton'
 
 const Dashboard = React.lazy(() => import('./components/Dashboard'))
+const Operations = React.lazy(() => import('./components/Operations'))
 const ThreatMap = React.lazy(() => import('./components/ThreatMap'))
 const FlowView = React.lazy(() => import('./components/FlowView'))
 import Login from './components/Login'
@@ -70,6 +71,7 @@ const TABS = [
   { id: 'flow-view', label: 'Flow View', shortLabel: 'Flow' },
   { id: 'threat-map', label: 'Threat Map', shortLabel: 'Map' },
   { id: 'dashboard', label: 'Dashboard', shortLabel: 'Dashboard' },
+  { id: 'operations', label: 'Operations', shortLabel: 'Operations' },
 ]
 
 function formatShortDate(isoStr) {
@@ -277,8 +279,8 @@ export default function App() {
           if (me.authenticated) {
             bootstrapDoneRef.current = true
             setAuthState('authenticated')
-            // Warn if reverse proxy isn't sending X-ULI-Proxy-Auth
-            if (!status.proxy_trusted && !sessionStorage.getItem('proxy_toast_dismissed')) {
+            // Direct HTTPS does not need the reverse proxy trust header.
+            if (!status.is_https && !status.proxy_trusted && !sessionStorage.getItem('proxy_toast_dismissed')) {
               setShowProxyToast(true)
             }
           } else {
@@ -342,14 +344,14 @@ export default function App() {
     return () => clearInterval(interval)
   }, [])
 
-  // Auto-dismiss proxy toast once reverse proxy starts sending X-ULI-Proxy-Auth
+  // Auto-dismiss once HTTPS is verified or the proxy trust header is configured.
   useEffect(() => {
     if (!showProxyToast) return
     const interval = setInterval(() => {
       fetchAuthStatus().then(status => {
-        if (status.proxy_trusted) {
+        if (status.is_https || status.proxy_trusted) {
           setShowProxyToast(false)
-          setAuthStatus(prev => ({ ...prev, proxy_trusted: true, is_https: status.is_https }))
+          setAuthStatus(prev => ({ ...prev, proxy_trusted: status.proxy_trusted, is_https: status.is_https }))
         }
       }).catch(() => {})
     }, 10000)
@@ -866,6 +868,7 @@ export default function App() {
         {activeTab === 'logs' && <LogStream version={health?.version} latestRelease={latestRelease} maxFilterDays={maxFilterDays} drillFilters={logsDrill} onDrillConsumed={clearLogsDrill} interfaces={allInterfaces} onPauseChange={onLogsPauseChange} uiSettings={uiSettings} />}
         <Suspense fallback={<DashboardSkeleton />}>
           {activeTab === 'dashboard' && <Dashboard maxFilterDays={maxFilterDays} />}
+          {activeTab === 'operations' && <Operations />}
         </Suspense>
         <Suspense fallback={<FlowViewSkeleton />}>
           {(activeTab === 'flow-view' || drillSource === 'flow-view') && (

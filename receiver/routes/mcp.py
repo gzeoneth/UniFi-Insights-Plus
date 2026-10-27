@@ -6,11 +6,14 @@ import logging
 from typing import Any
 from urllib.parse import urlencode
 
+from starlette.concurrency import run_in_threadpool
+
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from psycopg2.extras import RealDictCursor
 
 from db import get_config, set_config
+from field_filters import FIELDS, compile_filters, parse_rules
 from deps import APP_VERSION, get_conn, put_conn, enricher_db, unifi_api
 from routes import logs as logs_routes
 from routes import stats as stats_routes
@@ -199,7 +202,7 @@ def _tool_error(message: str) -> dict:
 
 
 def _tools_catalog() -> list[dict]:
-    return [
+    catalog = [
         {
             "name": "search_logs",
             "description": "Search logs with filters (log type, time range, IPs, ports, protocol, actions, services, ASN, etc.). Most text filters support ! prefix for negation.",
@@ -407,6 +410,19 @@ def _tools_catalog() -> list[dict]:
             "inputSchema": {"type": "object", "properties": {}},
         },
     ]
+    filter_schema = {
+        'type': 'array', 'maxItems': 24,
+        'description': 'Rules AND together; comma values OR. IPs match exact addresses or CIDRs; ports accept inclusive ranges. Exclude retains missing fields. Text matches literal substrings.',
+        'items': {'type': 'object', 'properties': {
+            'field': {'type': 'string', 'enum': sorted(FIELDS)},
+            'operator': {'enum': ['include', 'exclude', 'present', 'missing']},
+            'value': {'type': 'string', 'maxLength': 1024},
+        }, 'required': ['field', 'operator'], 'additionalProperties': False},
+    }
+    for tool in catalog:
+        if tool['name'] in ('search_logs', 'aggregate_logs', 'export_logs_csv_url'):
+            tool['inputSchema']['properties']['filter_rules'] = filter_schema
+    return catalog
 
 
 _TOOL_SCOPES = {
@@ -427,6 +443,14 @@ _TOOL_SCOPES = {
     'get_health': ['system.read'],
     'list_interfaces': ['system.read'],
 }
+
+
+def _encoded_filter_rules(value):
+    if value is None:
+        return None
+    rules = parse_rules(value)
+    compile_filters(rules)
+    return json.dumps(rules)
 
 
 def _tool_search_logs(args: dict) -> dict:
@@ -455,6 +479,7 @@ def _tool_search_logs(args: dict) -> dict:
         dst_port=args.get('dst_port'),
         src_port=args.get('src_port'),
         protocol=args.get('protocol'),
+        filter_rules=_encoded_filter_rules(args.get('filter_rules')),
         sort=args.get('sort', 'timestamp'),
         order=args.get('order', 'desc'),
         page=page,
@@ -518,6 +543,7 @@ def _tool_aggregate_logs(args: dict) -> dict:
         dst_port=args.get('dst_port'),
         src_port=args.get('src_port'),
         protocol=args.get('protocol'),
+        filter_rules=_encoded_filter_rules(args.get('filter_rules')),
     )
 
 
@@ -526,6 +552,8 @@ def _tool_export_logs_csv_url(args: dict) -> dict:
     if limit is not None and (limit < 1 or limit > 100000):
         raise ValueError("limit must be between 1 and 100000")
     params = {k: v for k, v in args.items() if v is not None}
+    if 'filter_rules' in params:
+        params['filter_rules'] = _encoded_filter_rules(params['filter_rules'])
     qs = urlencode(params)
     return {'download_url': f"/api/export?{qs}" if qs else "/api/export"}
 
@@ -708,7 +736,7 @@ async def _handle_jsonrpc(body: Any, token_info: dict | None) -> Response:
 
     if not isinstance(body, dict):
         return JSONResponse(_jsonrpc_error(-32600, "Invalid request", None))
-    resp = _handle_request(body, token_info)
+    resp = await run_in_threadpool(_handle_request, body, token_info)
     if resp is None:
         return Response(status_code=202)
     return JSONResponse(resp)
@@ -721,12 +749,12 @@ def _require_mcp_enabled():
 
 @router.get("/api/mcp")
 async def mcp_get(request: Request):
-    _require_mcp_enabled()
-    _validate_origin(request)
+    await run_in_threadpool(_require_mcp_enabled)
+    await run_in_threadpool(_validate_origin, request)
     _validate_protocol_version(request)
 
     token = _get_bearer_token(request)
-    token_info = _lookup_token(token)
+    token_info = await run_in_threadpool(_lookup_token, token)
     if not token_info:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -741,12 +769,12 @@ async def mcp_get(request: Request):
 
 @router.post("/api/mcp")
 async def mcp_post(request: Request):
-    _require_mcp_enabled()
-    _validate_origin(request)
+    await run_in_threadpool(_require_mcp_enabled)
+    await run_in_threadpool(_validate_origin, request)
     _validate_protocol_version(request)
 
     token = _get_bearer_token(request)
-    token_info = _lookup_token(token)
+    token_info = await run_in_threadpool(_lookup_token, token)
     if not token_info:
         raise HTTPException(status_code=401, detail="Unauthorized")
 

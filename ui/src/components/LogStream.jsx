@@ -2,11 +2,13 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { fetchLogs, fetchLog, getExportUrl, fetchLogCountsByType } from '../api'
 import { TR_KEY } from '../utils'
 import FilterBar from './FilterBar'
+import FieldFilters from './FieldFilters'
 import LogTable from './LogTable'
 import Pagination from './Pagination'
 
 const DEFAULT_FILTERS = {
   time_range: '24h',
+  filter_rules: null,
   log_type: null,
   rule_action: null,
   direction: null,
@@ -308,6 +310,7 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
       {/* Filters */}
       <div className="px-4 py-2.5 border-b border-gray-800 bg-gray-950 relative z-20">
         <FilterBar filters={filters} onChange={handleFilterChange} maxFilterDays={maxFilterDays} prefetchedInterfaces={prefetchedInterfaces} hiddenLogTypes={hiddenLogTypes} />
+        <FieldFilters filters={filters} onChange={handleFilterChange} />
       </div>
 
       {/* Toolbar */}
