@@ -1,3 +1,4 @@
+import ExclusionProfiles, { ExclusionProfileProvider } from './components/ExclusionProfiles'
 import React, { Suspense, useState, useEffect, useLayoutEffect, useMemo, useCallback, useRef } from 'react'
 import LogStream from './components/LogStream'
 import SetupWizard from './components/SetupWizard'
@@ -539,7 +540,7 @@ export default function App() {
 
   // Show settings overlay (also hosts reconfigure wizard)
   if (showSettings) {
-    return <SettingsOverlay
+    return <ExclusionProfileProvider><SettingsOverlay
       onClose={() => {
         reloadConfig().catch(() => {})
         setTheme(localStorage.getItem('ui_theme') || 'dark')
@@ -557,10 +558,11 @@ export default function App() {
       storage={health?.storage}
       onAuthEnabled={() => { bootstrapDoneRef.current = true; setAuthState('authenticated') }}
       onUiSettingsChanged={setUiSettings}
-    />
+    /></ExclusionProfileProvider>
   }
 
   return (
+    <ExclusionProfileProvider>
     <div className={`h-dvh flex flex-col bg-gray-950${logsPaused && activeTab === 'logs' ? ' paused-glow' : ''}`}>
       {/* Log-detection deprecation modal — Phase 1 transition, removal target: phase 2 */}
       {showUpgradeModal && (
@@ -795,21 +797,31 @@ export default function App() {
                   {health.total_logs?.toLocaleString()} logs
                 </span>
               </div>
+              {health.ingestion?.stats?.dropped > 0 && <button type="button"
+                onClick={() => setActiveTab('operations')}
+                className="text-xs text-amber-300 hover:text-amber-200"
+                title="The receiver snapshot reports cumulative collection loss in its session. Open Collection health for current status and details.">
+                Collection loss: {health.ingestion.stats.dropped.toLocaleString()}
+              </button>}
               <div className="relative" ref={statusRef}>
                 <button
                   type="button"
                   onClick={() => setShowStatusTooltip(v => !v)}
                   className="flex items-center justify-center w-6 h-6 -m-1"
                   aria-label="System status"
+                  title={health.status !== 'ok' ? 'API/database health is not OK.' : health.ingestion?.stats?.dropped > 0 ? 'API/database reachable. Known collection loss was reported during this receiver session; this does not establish a current outage.' : 'API/database reachable. This does not confirm complete log collection.'}
                 >
                   <span className={`w-1.5 h-1.5 rounded-full ${
-                    health.status === 'ok' ? 'bg-emerald-400' : 'bg-red-400'
+                    health.status !== 'ok' ? 'bg-red-400' : health.ingestion?.stats?.dropped > 0 ? 'bg-amber-400' : 'bg-emerald-400'
                   }`} />
                 </button>
                 {showStatusTooltip && (
                   <div className="md:hidden absolute right-0 top-full mt-1 w-52 bg-gray-950 border border-gray-700 rounded-lg shadow-lg z-30 p-3">
                     <div className="text-xs text-gray-300 font-medium mb-2">System Status</div>
                     <div className="text-xs text-gray-400 space-y-1">
+                      <div>{health.status === 'ok' ? 'API/database reachable' : 'API/database health not OK'}</div>
+                      <div>Collection completeness is separate from API/database availability.</div>
+                      {health.ingestion?.stats?.dropped > 0 && <div className="text-amber-300">{health.ingestion.stats.dropped.toLocaleString()} cumulative dropped rows/packets reported this receiver session.</div>}
                       <div>AbuseIPDB: {formatAbuseIPDB(health.abuseipdb)}</div>
                       <div>MaxMind: {formatShortDate(health.maxmind_last_update)}</div>
                       <div>Next pull: {formatShortDate(health.maxmind_next_update)}</div>
@@ -864,6 +876,7 @@ export default function App() {
       </header>
 
       {/* Content */}
+      <ExclusionProfiles activeTab={activeTab} />
       <main className="flex-1 overflow-hidden">
         {activeTab === 'logs' && <LogStream version={health?.version} latestRelease={latestRelease} maxFilterDays={maxFilterDays} drillFilters={logsDrill} onDrillConsumed={clearLogsDrill} interfaces={allInterfaces} onPauseChange={onLogsPauseChange} uiSettings={uiSettings} />}
         <Suspense fallback={<DashboardSkeleton />}>
@@ -882,5 +895,6 @@ export default function App() {
         </Suspense>
       </main>
     </div>
+    </ExclusionProfileProvider>
   )
 }

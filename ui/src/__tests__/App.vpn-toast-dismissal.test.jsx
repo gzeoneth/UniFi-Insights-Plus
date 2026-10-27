@@ -35,6 +35,7 @@ const mockInterfaces = [
 let configOverride = {}
 
 vi.mock('../api', () => ({
+  fetchSavedViews: vi.fn(() => Promise.resolve({ views: [] })),
   fetchConfig: vi.fn(() => Promise.resolve({ ...baseConfig, ...configOverride })),
   fetchHealth: vi.fn(() => Promise.resolve({ status: 'ok', version: '3.3.0' })),
   fetchLatestRelease: vi.fn(() => Promise.resolve(null)),
@@ -76,13 +77,33 @@ vi.mock('../components/Login', () => ({ default: () => <div /> }))
 
 // Import after mocks are declared
 import App from '../App'
-import { dismissVpnToast, fetchAuthMe, fetchAuthStatus, fetchConfig, fetchInterfaces } from '../api'
+import { dismissVpnToast, fetchAuthMe, fetchAuthStatus, fetchConfig, fetchHealth, fetchInterfaces } from '../api'
 
 beforeEach(() => {
   vi.clearAllMocks()
   configOverride = {}
   fetchAuthStatus.mockResolvedValue({ auth_enabled: false })
   fetchAuthMe.mockResolvedValue(null)
+  fetchHealth.mockResolvedValue({ status: 'ok', version: '3.3.0' })
+})
+
+describe('collection status indicator', () => {
+  it('shows an amber loss indicator even when the API and database are reachable', async () => {
+    fetchHealth.mockResolvedValue({ status: 'ok', version: '3.3.0', ingestion: { stats: { dropped: 4 } } })
+    render(<App />)
+    await screen.findByRole('button', { name: 'Collection loss: 4' })
+    const status = screen.getByRole('button', { name: 'System status' })
+    expect(status).toHaveAttribute('title', expect.stringContaining('does not establish a current outage'))
+    expect(status.querySelector('span')).toHaveClass('bg-amber-400')
+  })
+
+  it('does not turn enrichment-only skips into a collection-loss warning', async () => {
+    fetchHealth.mockResolvedValue({ status: 'ok', version: '3.3.0', ingestion: { stats: { dropped: 0 }, enrichment: { dropped: 4 } } })
+    render(<App />)
+    await screen.findByRole('button', { name: 'System status' })
+    expect(screen.queryByRole('button', { name: /Collection loss:/ })).toBeNull()
+    expect(screen.getByRole('button', { name: 'System status' })).toHaveAttribute('title', expect.stringContaining('does not confirm complete log collection'))
+  })
 })
 
 describe('HTTPS connection warning', () => {

@@ -64,6 +64,23 @@ def test_stale_snapshot_does_not_claim_provider_readiness(route):
     assert result['providers']['rdns']['status'] == 'pending'
 
 
+def test_legacy_retry_total_is_exposed_as_deliveries_not_actual_retries(route):
+    module, path, _ = route
+    path.write_text(json.dumps(snapshot(stats={'retry_attempts': 7, 'flush_errors': 0})))
+    result = module.read_ingest_health()
+    assert result['stats']['delivery_attempts'] == 7
+    assert result['stats']['retry_attempts'] is None
+    assert result['state'] == 'ready'
+
+
+def test_new_delivery_and_retry_counters_keep_their_distinct_meanings(route):
+    module, path, _ = route
+    path.write_text(json.dumps(snapshot(stats={'delivery_attempts': 9, 'retry_attempts': 2})))
+    result = module.read_ingest_health()
+    assert result['stats']['delivery_attempts'] == 9
+    assert result['stats']['retry_attempts'] == 2
+
+
 def test_fresh_publisher_does_not_hide_stalled_ingestion_worker(route):
     module, path, _ = route
     path.write_text(json.dumps(snapshot(last_progress_at=time.time() - 60,

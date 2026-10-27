@@ -264,26 +264,27 @@ def _rfc5424_message(rest: str) -> str | None:
 
 
 def _syslog_envelope(raw_log: str) -> tuple | None:
-    """Return timestamp and body from RFC3164, RFC5424, or UniFi's dual date."""
+    """Return timestamp, body and emitter from supported syslog envelopes."""
     stripped = re.sub(r'^<\d{1,3}>', '', raw_log)
     modern = RFC5424_HEADER.match(stripped)
     if modern:
         body = _rfc5424_message(modern.group('rest'))
         if body is None:
             return None
-        return _parse_iso_timestamp(modern.group('timestamp')), body
+        return _parse_iso_timestamp(modern.group('timestamp')), body, modern.group('host')
     legacy = SYSLOG_HEADER.match(stripped)
     if not legacy:
         return None
     timestamp = parse_syslog_timestamp(
         legacy.group('month'), legacy.group('day'), legacy.group('time'))
     body = legacy.group('body')
+    emitter = legacy.group('host')
     # Some UniFi emitters insert an ISO timestamp before the actual hostname.
     explicit_timestamp = _parse_iso_timestamp(legacy.group('host'))
     if explicit_timestamp and ' ' in body:
         timestamp = explicit_timestamp
-        body = body.split(' ', 1)[1]
-    return timestamp, body
+        emitter, body = body.split(' ', 1)
+    return timestamp, body, emitter
 
 
 def derive_direction(iface_in: str, iface_out: str, rule_name: str, src_ip: str = None, dst_ip: str = None) -> str:
@@ -701,7 +702,7 @@ def parse_log(raw_log: str) -> dict | None:
     envelope = _syslog_envelope(raw_log)
     if envelope is None:
         return None
-    timestamp, body = envelope
+    timestamp, body, emitter = envelope
 
     log_type = detect_log_type(body)
 
@@ -718,6 +719,11 @@ def parse_log(raw_log: str) -> dict | None:
     else:
         parsed = {'log_type': 'unknown'}
 
+    # For firewall rows, hostname scopes the recorded rule to its emitter.
+    # DHCP's hostname remains the lease client; never use the emitter as a client name.
+    if (log_type == 'firewall' and emitter and emitter != '-'
+            and len(emitter) <= 255 and emitter.isprintable()):
+        parsed['hostname'] = emitter
     parsed.setdefault('timestamp', timestamp)
     if parsed['timestamp'] is None:
         return None

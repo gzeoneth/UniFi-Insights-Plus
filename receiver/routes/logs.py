@@ -18,6 +18,7 @@ from query_helpers import (build_log_query, validate_time_params,
                           device_name_client_lateral, device_name_device_lateral,
                           device_name_coalesce, sanitize_csv_cell)
 from services import get_service_description
+from field_filters import append_exclusions, compile_exclusions, query_view_counts
 
 
 
@@ -70,6 +71,7 @@ def get_logs(
     src_port: Optional[str] = Query(None, description="Source port (prefix with ! to negate)"),
     protocol: Optional[str] = Query(None, description="Comma-separated: TCP,UDP,ICMP (prefix with ! to negate)"),
     filter_rules: Optional[str] = None,
+    exclude_groups: Optional[str] = None,
     sort: str = Query("timestamp", description="Sort field"),
     order: str = Query("desc", description="asc or desc"),
     page: int = Query(1, ge=1),
@@ -84,6 +86,9 @@ def get_logs(
         dst_port=dst_port, src_port=src_port, protocol=protocol, filter_rules=filter_rules,
     )
 
+    base_where, base_params = where, params
+    where, params = append_exclusions(base_where, base_params, exclude_groups)
+
     # Whitelist sort columns
     allowed_sorts = {
         'timestamp', 'log_type', 'src_ip', 'dst_ip', 'src_port', 'dst_port',
@@ -97,9 +102,8 @@ def get_logs(
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Count total
-            cur.execute(f"SELECT COUNT(*) as total FROM logs WHERE {where}", params)
-            total = cur.fetchone()['total']
+            view_counts = query_view_counts(cur, base_where, base_params, exclude_groups)
+            total = view_counts['visible']
 
             # Fetch page, enriching with live device names from unifi_clients + unifi_devices
             cur.execute(
@@ -127,6 +131,7 @@ def get_logs(
         return {
             'data': logs,
             'total': total,
+            'view_counts': view_counts,
             'page': page,
             'per_page': per_page,
             'pages': (total + per_page - 1) // per_page if per_page else 0,
@@ -186,6 +191,7 @@ def get_logs_aggregate(
     src_port: Optional[str] = Query(None, description="Source port (prefix with ! to negate)"),
     protocol: Optional[str] = Query(None, description="Comma-separated: TCP,UDP,ICMP (prefix with ! to negate)"),
     filter_rules: Optional[str] = None,
+    exclude_groups: Optional[str] = None,
 ):
     """Aggregate logs by a dimension, returning grouped counts and optional metrics."""
     if group_by not in _GROUP_BY_MAP:
@@ -216,6 +222,9 @@ def get_logs_aggregate(
         interface, vpn_only, asn=asn,
         dst_port=dst_port, src_port=src_port, protocol=protocol, filter_rules=filter_rules,
     )
+
+    base_where, base_params = where, params
+    where, params = append_exclusions(where, params, exclude_groups)
 
     # Build GROUP BY expression and per-clause param lists
     sql_expr, alias = _GROUP_BY_MAP[group_by]
@@ -277,11 +286,13 @@ def get_logs_aggregate(
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            view_counts = query_view_counts(cur, base_where, base_params, exclude_groups) if exclude_groups else None
             cur.execute(sql, final_params)
             rows = [dict(r) for r in cur.fetchall()]
         conn.commit()
         return {
             'group_by': group_by,
+            'view_counts': view_counts,
             'prefix_length': prefix_length,
             'count': len(rows),
             'data': rows,
@@ -385,13 +396,14 @@ def _annotate_logs(logs):
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
 @router.get("/api/logs/counts-by-type")
-def get_log_counts_by_type():
-    """Return record counts for wifi and system log types."""
+def get_log_counts_by_type(exclude_groups: Optional[str] = None):
+    """Return all-time wifi/system counts within the requested view."""
+    where, params = append_exclusions("log_type IN ('wifi', 'system')", [], exclude_groups)
     conn = get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT log_type, COUNT(*) FROM logs WHERE log_type IN ('wifi', 'system') GROUP BY log_type"
+                f"SELECT log_type, COUNT(*) FROM logs WHERE {where} GROUP BY log_type", params
             )
             rows = cur.fetchall()
         conn.commit()
@@ -403,6 +415,66 @@ def get_log_counts_by_type():
         put_conn(conn)
     counts = {r[0]: r[1] for r in rows}
     return {"wifi": counts.get("wifi", 0), "system": counts.get("system", 0)}
+
+
+@router.get("/api/logs/exclusion-preview")
+def preview_exclusions(
+    log_type: Optional[str] = Query(None, description="Comma-separated: firewall,dns,dhcp,wifi,system"),
+    time_range: Optional[str] = Query(None, description="1h,6h,24h,7d,30d,60d"),
+    time_from: Optional[str] = Query(None, description="ISO datetime"),
+    time_to: Optional[str] = Query(None, description="ISO datetime"),
+    src_ip: Optional[str] = Query(None, description="Source IP search (prefix with ! to negate)"),
+    dst_ip: Optional[str] = Query(None, description="Dest IP search (prefix with ! to negate)"),
+    ip: Optional[str] = Query(None, description="Search both src and dst (prefix with ! to negate)"),
+    direction: Optional[str] = Query(None, description="Comma-separated: inbound,outbound,inter_vlan,nat"),
+    rule_action: Optional[str] = Query(None, description="Comma-separated: allow,block,redirect (prefix with ! to negate)"),
+    rule_name: Optional[str] = Query(None, description="Rule name search (prefix with ! to negate)"),
+    country: Optional[str] = Query(None, description="Comma-separated country codes (prefix with ! to negate)"),
+    threat_min: Optional[int] = Query(None, description="Minimum threat score"),
+    search: Optional[str] = Query(None, description="Full-text search in raw_log (prefix with ! to negate)"),
+    service: Optional[str] = Query(None, description="Comma-separated service names (prefix with ! to negate)"),
+    interface: Optional[str] = Query(None, description="Comma-separated interface names"),
+    vpn_only: bool = Query(False, description="Show only VPN traffic"),
+    asn: Optional[str] = Query(None, description="ASN name search"),
+    dst_port: Optional[str] = Query(None, description="Destination port (prefix with ! to negate)"),
+    src_port: Optional[str] = Query(None, description="Source port (prefix with ! to negate)"),
+    protocol: Optional[str] = Query(None, description="Comma-separated: TCP,UDP,ICMP (prefix with ! to negate)"),
+    filter_rules: Optional[str] = None,
+    exclude_groups: Optional[str] = None,
+):
+    """Preview how many current-scope events would be hidden, without writing."""
+    time_range, time_from, time_to = validate_time_params(time_range, time_from, time_to)
+    base_where, base_params = build_log_query(
+        log_type, time_range, time_from, time_to,
+        src_ip, dst_ip, ip, direction, rule_action,
+        rule_name, country, threat_min, search, service,
+        interface, vpn_only, asn=asn, dst_port=dst_port, src_port=src_port,
+        protocol=protocol, filter_rules=filter_rules,
+    )
+    conditions, params = compile_exclusions(exclude_groups)
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            view_counts = query_view_counts(cur, base_where, base_params, exclude_groups)
+            examples = []
+            if conditions and view_counts['hidden']:
+                cur.execute(
+                    f"SELECT id, timestamp, hostname, rule_name, rule_desc, rule_action, "
+                    f"host(src_ip) AS src_ip, host(dst_ip) AS dst_ip, protocol, src_port, dst_port "
+                    f"FROM logs WHERE ({base_where}) AND NOT ({' AND '.join(conditions)}) "
+                    "ORDER BY timestamp DESC, id DESC LIMIT 5",
+                    list(base_params) + params,
+                )
+                examples = [_serialize_log(row) for row in cur.fetchall()]
+        conn.commit()
+        return {'view_counts': view_counts, 'examples': examples,
+                'notice': 'Preview only. Raw records are retained; IPS and unparsed CEF threat events stay visible.'}
+    except Exception as e:
+        conn.rollback()
+        logger.exception('Error previewing exclusions')
+        raise HTTPException(status_code=500, detail='Internal server error') from e
+    finally:
+        put_conn(conn)
 
 
 @router.get("/api/logs/{log_id}")
@@ -484,6 +556,7 @@ def export_csv_endpoint(
     src_port: Optional[str] = Query(None),
     protocol: Optional[str] = Query(None),
     filter_rules: Optional[str] = Query(None),
+    exclude_groups: Optional[str] = None,
     limit: int = Query(10000, ge=1, le=100000),
 ):
     time_range, time_from, time_to = validate_time_params(time_range, time_from, time_to)
@@ -493,6 +566,8 @@ def export_csv_endpoint(
         rule_name, country, threat_min, search, service, interface, vpn_only, asn=asn,
         dst_port=dst_port, src_port=src_port, protocol=protocol, filter_rules=filter_rules,
     )
+
+    where, params = append_exclusions(where, params, exclude_groups)
 
     export_columns = [
         'timestamp', 'log_type', 'direction', 'src_ip', 'src_port',

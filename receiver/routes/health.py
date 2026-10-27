@@ -22,7 +22,7 @@ router = APIRouter()
 _COUNTERS = (
     'received', 'parsed', 'filtered', 'failed', 'inserted', 'duplicates',
     'flush_errors', 'dropped', 'parse_exceptions', 'enrich_exceptions',
-    'queue_dropped', 'spool_dropped', 'spool_errors', 'retry_attempts', 'shutdown_dropped',
+    'queue_dropped', 'spool_dropped', 'spool_errors', 'delivery_attempts', 'retry_attempts', 'shutdown_dropped',
 )
 _PROVIDER_NAMES = ('geoip', 'asn', 'rdns', 'abuseipdb', 'unifi')
 _PROVIDER_STATES = {'not_configured', 'ready', 'missing', 'error', 'pending'}
@@ -74,6 +74,13 @@ def read_ingest_health():
             data = raw.get(group)
             data = data if isinstance(data, dict) else {}
             snapshot[group] = {key: _number(data.get(key), 0) for key in fields}
+        # Older receivers named every DB batch delivery a retry. Preserve the
+        # useful total while marking actual retries unknown, never as zero.
+        raw_stats = raw.get('stats')
+        raw_stats = raw_stats if isinstance(raw_stats, dict) else {}
+        if _number(raw_stats.get('delivery_attempts')) is None:
+            snapshot['stats']['delivery_attempts'] = _number(raw_stats.get('retry_attempts'))
+            snapshot['stats']['retry_attempts'] = None
         spool = raw.get('spool')
         snapshot['spool']['failed'] = isinstance(spool, dict) and spool.get('failed') is True
         providers = raw.get('providers')

@@ -99,11 +99,20 @@ class RetrySpool:
         return accepted, rejected
 
     def due(self, limit, now=None):
+        return self.due_batch(limit, now)[0]
+
+    def due_batch(self, limit, now=None):
+        """Return (rows, retrying) without putting spool metadata in log rows.
+
+        retrying means at least one due row had a prior acknowledged delivery
+        failure. A crash before acknowledgement can cause a replay without
+        that evidence; PostgreSQL deduplication counts those separately.
+        """
         now = time.time() if now is None else now
-        result = self.conn.execute('''SELECT payload FROM pending
+        result = self.conn.execute('''SELECT payload, attempts FROM pending
             WHERE next_retry_at <= ? ORDER BY next_retry_at, created_at LIMIT ?''',
             (now, limit)).fetchall()
-        return [json.loads(row[0]) for row in result]
+        return [json.loads(row[0]) for row in result], any(row[1] > 0 for row in result)
 
     def acknowledge(self, attempted, retryable, now=None):
         """Remove acknowledged rows; retain failures with capped backoff forever.

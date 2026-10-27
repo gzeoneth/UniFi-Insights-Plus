@@ -11,6 +11,8 @@ This fork publishes source code and synthetic test fixtures only. Keep deploymen
 - Persist pending batches in a bounded SQLite spool before database delivery. UUIDs make retries idempotent. Count committed rows, duplicates, failures and queue overflow separately.
 - Receive UDP independently of slow enrichment/database work. Bound enrichment workers and queues. MCP dispatch and authentication use worker threads.
 - Apply structured include/exclude filters consistently in log queries and CSV exports. Save log views separately from flow views.
+- Choose built-in views for security, blocked private traffic, discovery replies, NAT mapping attempts and other common investigations. They do not hide events by default.
+- Save previewed exclusion profiles for routine events. Apply them to traffic views, charts and exports while retaining raw logs and keeping Security independent. See [view exclusions](docs/view-exclusions.md).
 - Browse observed rule usage, collector health, per-type retention and older-event summaries in Operations.
 - Optionally archive records to gzip JSONL before retention deletion. Archive failure or capacity exhaustion prevents affected raw-data deletion.
 
@@ -40,7 +42,7 @@ Before merging, use a local build for staging or explicitly dispatch the workflo
 
 `compose.gzeon.yml` starts a separate instance with its own database and persistent ingestion/archive volumes. It defaults to loopback ports 8091 and 1514, so it does not replace or compete with the existing collector. A four-GiB container limit is a resource ceiling, not a throughput guarantee.
 
-1. After a merged-PR or manual image workflow succeeds, pull the versioned GHCR image used by `compose.gzeon.yml`. For local staging, build locally, copy its archive privately to the Docker host, and load it with `docker image load -i <archive>`. Set `INSIGHTS_IMAGE=unifi-insights-plus:3.7.2-gzeon.1` and `INSIGHTS_PULL_POLICY=never` in the private `.env` for that local image.
+1. After a merged-PR or manual image workflow succeeds, pull the versioned GHCR image used by `compose.gzeon.yml`. For local staging, build locally, copy its archive privately to the Docker host, and load it with `docker image load -i <archive>`. Set `INSIGHTS_IMAGE=unifi-insights-plus:3.7.2-gzeon.2` and `INSIGHTS_PULL_POLICY=never` in the private `.env` for that local image.
 2. Create a private `.env` from the upstream `.env.example`. Set a new database password for staging. When restoring production data, preserve the existing database password and encryption `SECRET_KEY`; changing the encryption key prevents saved credentials from decrypting.
 3. Take a PostgreSQL custom-format backup of the existing database using `pg_dump -Fc`. Keep its configuration, image version, secret file, and MaxMind mounts together in private storage. The app's JSON configuration export is not a database backup.
 4. Restore into the separate database volume, then start the custom image. Verify schema migration, counts, raw messages, credentials and CEF backfill there first. Never attach two running PostgreSQL processes to the same data directory.
@@ -63,7 +65,11 @@ Add conditions in Log Stream's Include / exclude panel. All conditions combine w
 
 IP fields use exact addresses or CIDRs. Ports and scores accept inclusive ranges. Text matches literal substrings, not SQL wildcard patterns. Categorical fields match complete values. Invalid filters are rejected instead of silently broadened.
 
+View exclusions are a separate, opt-in profile: conditions within each group combine with AND, and an event is hidden if any group matches. Exact recorded-rule and gateway fields use case-sensitive, whole-string matching, including literal commas. A preview is required before applying a profile in the UI. Counts and Show all make the effect visible; Security and the threat map remain independent. Historical CEF threat candidates stay visible and produce a Security warning until backfilled.
+
 Device-name conditions match names recorded with an event. A newer controller name displayed by a live lookup can differ; use the IP condition when targeting a renamed device or historical records.
+
+Collection health distinguishes API availability from cumulative packet loss. The header flags known drops; skipped enrichment is reported separately. Delivery attempts count all database batches, while retries count batches with recorded prior failures. Legacy snapshots report the actual retry count as unknown.
 
 Rule usage counts observed log entries, not network flows or exact packet totals. Gateway rate limits, disabled logging and receiver loss can hide activity. Use these observations to propose narrower A/V rules, then test those rules separately; the app does not change firewall policy.
 

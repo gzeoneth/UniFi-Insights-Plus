@@ -186,6 +186,8 @@ def get_flow_graph(
     direction: Optional[str] = Query(None),
     interface: Optional[str] = Query(None),
     ip: Optional[str] = Query(None),
+    filter_rules: Optional[str] = None,
+    exclude_groups: Optional[str] = None,
 ):
     # Validate dimensions
     dims = [d.strip() for d in dimensions.split(',')]
@@ -213,6 +215,7 @@ def get_flow_graph(
         src_ip=None, dst_ip=None, ip=None, direction=direction,
         rule_action=rule_action, rule_name=None, country=None, threat_min=None,
         search=None, service=None, interface=interface,
+        filter_rules=filter_rules, exclude_groups=exclude_groups,
     )
 
     dim_a_expr = DIMENSION_EXPRS[dims[0]]
@@ -297,6 +300,8 @@ def get_zone_matrix(
     log_type: Optional[str] = Query("firewall"),
     rule_action: Optional[str] = Query(None),
     direction: Optional[str] = Query(None),
+    filter_rules: Optional[str] = None,
+    exclude_groups: Optional[str] = None,
 ):
     time_range, time_from, time_to = validate_time_params(time_range, time_from, time_to)
 
@@ -305,6 +310,7 @@ def get_zone_matrix(
         src_ip=None, dst_ip=None, ip=None, direction=direction,
         rule_action=rule_action, rule_name=None, country=None, threat_min=None,
         search=None, service=None, interface=None,
+        filter_rules=filter_rules, exclude_groups=exclude_groups,
     )
 
     sql = f"""
@@ -367,6 +373,8 @@ def get_host_detail(
     log_type: Optional[str] = Query("firewall"),
     rule_action: Optional[str] = Query(None),
     direction: Optional[str] = Query(None),
+    filter_rules: Optional[str] = None,
+    exclude_groups: Optional[str] = None,
 ):
     # Validate IP
     try:
@@ -381,6 +389,7 @@ def get_host_detail(
         src_ip=None, dst_ip=None, ip=None, direction=direction,
         rule_action=rule_action, rule_name=None, country=None, threat_min=None,
         search=None, service=None, interface=None,
+        filter_rules=filter_rules, exclude_groups=exclude_groups,
     )
 
     # All host queries use parenthesized OR to prevent precedence bugs with base filters

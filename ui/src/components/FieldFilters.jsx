@@ -1,14 +1,16 @@
 import { useEffect, useState } from 'react'
 import { createSavedView, deleteSavedView, fetchSavedViews } from '../api'
+import { logFilterFingerprint } from '../lib/logPresets'
 
 export const FILTER_FIELDS = [
   ['ip', 'Either IP / subnet'], ['src_ip', 'Source IP / subnet'], ['dst_ip', 'Destination IP / subnet'],
-  ['remote_ip', 'Remote IP / subnet'], ['src_port', 'Source port / range'], ['dst_port', 'Destination port / range'],
+  ['remote_ip', 'Remote IP / subnet'], ['port', 'Either port / range'], ['src_port', 'Source port / range'], ['dst_port', 'Destination port / range'],
   ['protocol', 'Protocol'], ['log_type', 'Log type'], ['direction', 'Direction'], ['rule_action', 'Action'],
   ['rule_name', 'Rule name'], ['device', 'Either recorded device name'], ['src_device', 'Recorded source device name'],
   ['dst_device', 'Recorded destination device name'], ['country', 'Country code'], ['asn', 'ASN name'],
   ['service', 'Service'], ['interface', 'Interface'], ['hostname', 'Hostname'], ['search', 'Raw message'],
   ['event_source', 'Event source'], ['source', 'Collector source'], ['ips_signature', 'IPS signature'],
+  ['security_event', 'Security classification'],
   ['ips_signature_id', 'IPS signature ID'], ['ips_risk', 'IPS risk'], ['ips_severity', 'IPS severity (0–10)'],
   ['threat_score', 'IP reputation (0–100)'],
 ]
@@ -20,13 +22,16 @@ export function readFilterRules(value) {
 
 const style = 'bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-sm text-gray-200'
 
-export default function FieldFilters({ filters, onChange, savedViews = true }) {
+export default function FieldFilters({ filters, onChange, savedViews = true, presets = [], onPresetSelect, profileApplied = false }) {
   const [rules, setRules] = useState(() => readFilterRules(filters.filter_rules))
   const [views, setViews] = useState([])
   const [name, setName] = useState('')
   const [selected, setSelected] = useState('')
+  const [presetSnapshot, setPresetSnapshot] = useState(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const selectedPreset = presets.find(preset => selected === `builtin:${preset.id}`)
+  const presetCurrent = selectedPreset && presetSnapshot === logFilterFingerprint(filters) && (!selectedPreset.bypassProfile || !profileApplied)
   useEffect(() => setRules(readFilterRules(filters.filter_rules)), [filters.filter_rules])
   const reloadViews = async () => {
     const result = await fetchSavedViews()
@@ -58,7 +63,7 @@ export default function FieldFilters({ filters, onChange, savedViews = true }) {
         <option value="include">Include</option><option value="exclude">Exclude</option>
         <option value="present">Has value</option><option value="missing">Missing value</option>
       </select>
-      {!['present', 'missing'].includes(rule.operator) && <input className={`${style} flex-1 min-w-40`} aria-label={`Value ${index + 1}`} maxLength={1024} value={rule.value || ''} onChange={e => update(index, { value: e.target.value })} placeholder="IP/CIDR, port range, or literal text" />}
+      {!['present', 'missing'].includes(rule.operator) && <input className={`${style} flex-1 min-w-40`} aria-label={`Value ${index + 1}`} maxLength={1024} value={rule.value || ''} onChange={e => update(index, { value: e.target.value })} placeholder={rule.field === 'security_event' ? 'ips or unparsed_cef (comma OR)' : 'IP/CIDR, port range, or literal text'} />}
       <button type="button" className="text-sm text-red-400 px-2" aria-label={`Remove condition ${index + 1}`} onClick={() => setRules(current => current.filter((_, i) => i !== index))}>Remove</button>
     </div>)}
     <div className="flex flex-wrap gap-2 items-center">
@@ -68,17 +73,24 @@ export default function FieldFilters({ filters, onChange, savedViews = true }) {
     </div>
     <p className="text-xs text-gray-500">IP fields accept exact addresses or CIDRs. Ports accept values such as 443,8000-8100. Names match literal text; protocol, country and action match complete values.</p>
     {savedViews && <div className="flex flex-wrap gap-2 border-t border-gray-800 pt-3">
-      <select className={style} aria-label="Saved log view" value={selected} onChange={e => {
+      <select className={style} aria-label={presets.length ? 'Log view' : 'Saved log view'} value={selectedPreset && !presetCurrent ? '' : selected} onChange={e => {
         setSelected(e.target.value)
+        const preset = presets.find(item => e.target.value === `builtin:${item.id}`)
+        if (preset) { const next = onPresetSelect?.(preset); setPresetSnapshot(next ? logFilterFingerprint(next) : null); return }
+        setPresetSnapshot(null)
         const view = views.find(v => String(v.id) === e.target.value)
         if (view) { const { view_type, ...rest } = view.filters; onChange({ ...rest, filter_rules: JSON.stringify(readFilterRules(rest.filter_rules)), page: 1, per_page: filters.per_page || 50 }) }
-      }}><option value="">Saved log views</option>{views.map(view => <option key={view.id} value={view.id}>{view.name}</option>)}</select>
+      }}><option value="">{presets.length ? 'Choose log view' : 'Saved log views'}</option>
+        {presets.length > 0 && <optgroup label="Built-in">{presets.map(preset => <option key={preset.id} value={`builtin:${preset.id}`}>{preset.name}</option>)}</optgroup>}
+        <optgroup label="Saved">{views.map(view => <option key={view.id} value={view.id}>{view.name}</option>)}</optgroup>
+      </select>
       <input className={style} aria-label="New view name" value={name} maxLength={100} onChange={e => setName(e.target.value)} placeholder="Name this view" />
       <button className={style} type="button" disabled={busy || !valid || !name.trim()} onClick={save}>Save view</button>
-      {selected && <button className={style} type="button" disabled={busy} onClick={async () => {
+      {selected && !selectedPreset && <button className={style} type="button" disabled={busy} onClick={async () => {
         setBusy(true); setError(''); try { await deleteSavedView(selected); setSelected(''); await reloadViews() } catch (e) { setError(e.message) } finally { setBusy(false) }
       }}>Delete saved view</button>}
     </div>}
+    {presetCurrent && <p className="text-xs text-gray-400" aria-label="Selected log view scope">Last 24h. {selectedPreset.description} {profileApplied ? 'The active exclusion profile also applies.' : 'No profile exclusions applied.'}</p>}
     {error && <p className="text-sm text-red-400" role="alert">{error}</p>}
   </section>
 }

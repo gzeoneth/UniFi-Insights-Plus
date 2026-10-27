@@ -47,6 +47,36 @@ def test_log_aggregate_and_csv_all_forward_advanced_filters(logs_client, path):
             assert field in header
 
 
+@pytest.mark.parametrize('path', ['/api/logs', '/api/logs/aggregate', '/api/export'])
+def test_log_aggregate_and_csv_apply_same_profile_predicate(logs_client, path):
+    client, cursor = logs_client
+    cursor.fetchone.return_value = {'total': 3, 'visible': 2}
+    groups = [{'conditions': [
+        {'field': 'rule_name_exact', 'operator': 'include', 'value': 'literal, rule'},
+        {'field': 'hostname_exact', 'operator': 'include', 'value': 'example-gateway'},
+        {'field': 'rule_action', 'operator': 'include', 'value': 'allow'},
+    ]}]
+    response = client.get(path, params={
+        'exclude_groups': json.dumps(groups), 'group_by': 'src_ip', 'time_range': '24h'})
+    assert response.status_code == 200
+    query, params = cursor.execute.call_args.args
+    assert 'rule_name = %s' in query and 'hostname = %s' in query
+    assert "event_source IN ('unifi_ips', 'ips')" in query
+    assert params.count('literal, rule') == 1
+    assert params.count('example-gateway') == 1
+    if path != '/api/export':
+        assert response.json()['view_counts'] == {'total': 3, 'visible': 2, 'hidden': 1}
+
+
+@pytest.mark.parametrize('path', ['/api/logs', '/api/logs/aggregate', '/api/export',
+                                  '/api/logs/exclusion-preview', '/api/logs/counts-by-type'])
+def test_invalid_profiles_are_rejected_before_query(logs_client, path):
+    client, cursor = logs_client
+    response = client.get(path, params={'exclude_groups': 'not-json', 'group_by': 'src_ip'})
+    assert response.status_code == 400
+    cursor.execute.assert_not_called()
+
+
 @pytest.fixture
 def pg_client(monkeypatch):
     dsn = os.environ.get('TEST_POSTGRES_DSN')
@@ -63,7 +93,7 @@ def pg_client(monkeypatch):
         cursor.execute('''CREATE TEMP TABLE logs (
             id INTEGER, timestamp TIMESTAMPTZ DEFAULT NOW(), log_type TEXT,
             src_ip INET, dst_ip INET, protocol TEXT, dst_port INTEGER,
-            rule_name TEXT, rule_desc TEXT, rule_action TEXT)''')
+            rule_name TEXT, rule_desc TEXT, rule_action TEXT, hostname TEXT)''')
         cursor.executemany('''INSERT INTO logs
             (id,log_type,src_ip,dst_ip,protocol,dst_port,rule_name,rule_action)
             VALUES (%s,%s,%s,'203.0.113.1',%s,%s,'Example rule','allow')''', [

@@ -121,11 +121,12 @@ export default function SankeyChart({ filters, refreshKey, onNodeClick, activeFi
     if (!n || n < 1) return
 
     const params = { ...filters, dimensions: dims.join(','), top_n: n, ip: hostIp || undefined }
-    const disc = [filters.time_range, filters.time_from, filters.time_to, filters.rule_action, filters.direction, dims.join(','), n, hostIp || ''].join('|')
+    const disc = [filters.time_range, filters.time_from, filters.time_to, filters.rule_action, filters.direction, filters.exclude_groups, dims.join(','), n, hostIp || ''].join('|')
     const cached = readCache('sankey', disc)
     if (cached && refreshKey === refreshKeyRef.current) {
       refreshKeyRef.current = refreshKey
       setData(cached)
+      setError(null)
       setLoading(false)
       onDataLoaded?.(requestKey)
       return
@@ -140,7 +141,7 @@ export default function SankeyChart({ filters, refreshKey, onNodeClick, activeFi
       .catch(err => { if (!cancelled) setError(err.message) })
       .finally(() => { if (!cancelled) { setLoading(false); onDataLoaded?.(requestKey) } })
     return () => { cancelled = true }
-  }, [filters.time_range, filters.time_from, filters.time_to, filters.rule_action, filters.direction, dims, topN, hostIp, refreshKey, requestKey])
+  }, [filters.time_range, filters.time_from, filters.time_to, filters.rule_action, filters.direction, filters.exclude_groups, dims, topN, hostIp, refreshKey, requestKey])
 
   const setDim = (index, value) => {
     setDims(prev => {

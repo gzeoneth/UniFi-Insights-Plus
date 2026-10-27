@@ -18,7 +18,7 @@ def security_client(monkeypatch):
     connection.execute('''CREATE TABLE logs (
         id INTEGER PRIMARY KEY, timestamp TEXT, log_type TEXT, event_source TEXT,
         rule_action TEXT, threat_score INTEGER, ips_signature_id TEXT,
-        ips_signature TEXT, ips_risk TEXT, ips_severity INTEGER)''')
+        ips_signature TEXT, ips_risk TEXT, ips_severity INTEGER, raw_log TEXT)''')
     executed = []
 
     class Cursor:
@@ -32,7 +32,8 @@ def security_client(monkeypatch):
         def execute(self, query, params):
             executed.append((query, params))
             params = [value.isoformat() if hasattr(value, 'isoformat') else value for value in params]
-            self.inner.execute(query.replace('%s', '?'), params)
+            # SQLite LIKE is case-insensitive for the ASCII CEF fixtures.
+            self.inner.execute(query.replace('%s', '?').replace(' ILIKE ', ' LIKE '), params)
 
         def fetchone(self):
             return dict(self.inner.fetchone())
@@ -60,9 +61,9 @@ def security_client(monkeypatch):
 
 def add_row(connection, row_id, *, source=None, action=None, score=None,
             signature_id='1', signature='Synthetic signature', risk='high', severity=7,
-            stamp='2026-01-02T12:00:00+00:00', log_type='firewall'):
-    connection.execute('INSERT INTO logs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                       (row_id, stamp, log_type, source, action, score, signature_id, signature, risk, severity))
+            stamp='2026-01-02T12:00:00+00:00', log_type='firewall', raw_log=None):
+    connection.execute('INSERT INTO logs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                       (row_id, stamp, log_type, source, action, score, signature_id, signature, risk, severity, raw_log))
     connection.commit()
 
 
@@ -71,8 +72,8 @@ def test_ips_reputation_and_plain_firewall_counts_are_independent(security_clien
     add_row(connection, 1, source='unifi_ips', action='block', score=None)
     add_row(connection, 2, source='unifi_ips', action='allow', score=80)
     add_row(connection, 3, source='unifi_ips', action=None, score=50)
-    add_row(connection, 4, action='block', score=91)
-    add_row(connection, 5, action='block', log_type='dns')
+    add_row(connection, 4, action='block', score=91, signature_id=None)
+    add_row(connection, 5, action='block', log_type='dns', signature_id=None)
     add_row(connection, 6, source='unifi_ips', action='block', stamp='2025-12-01T00:00:00+00:00')
     response = client.get('/api/security/summary', params={
         'time_from': '2026-01-01T00:00:00+00:00', 'time_to': '2026-01-03T00:00:00+00:00'})
@@ -119,3 +120,24 @@ def test_database_failure_is_reported_without_leaking_details_and_connection_ret
     assert response.status_code == 500
     assert response.json() == {'detail': 'Failed to load security summary'}
     deps.put_conn.assert_called_once()
+
+
+@pytest.mark.parametrize('cef', [
+    'CEF:0|Ubiquiti|UniFi Network|10.0.0|200|Threat Detected|7|act=blocked',
+    'CEF:0|Ubiquiti|UniFi Network|10.0.0|200|Threat Detected and Blocked|7|act=blocked',
+    'CEF:0|Ubiquiti|UniFi Network|10.0.0|200|Example event|7|UNIFIpolicyType=IDS/IPS',
+])
+def test_unparsed_cef_warning_is_separate_from_verified_ips_and_ignores_view_exclusions(security_client, cef):
+    client, connection, _, _ = security_client
+    add_row(connection, 1, log_type='system', raw_log=cef, signature_id=None)
+    add_row(connection, 2, source='unifi_ips', action='block', raw_log=cef)
+    add_row(connection, 3, log_type='system', raw_log='Ordinary status event', signature_id=None)
+    add_row(connection, 4, log_type='system', raw_log=cef, signature_id=None, stamp='2025-12-01T00:00:00+00:00')
+    response = client.get('/api/security/summary', params={
+        'time_from': '2026-01-01T00:00:00Z', 'time_to': '2026-01-03T00:00:00Z',
+        'exclude_groups': '[{"conditions":[{"field":"raw_log","operator":"present"}]}]',
+    })
+    assert response.status_code == 200
+    assert response.json()['unparsed_cef_threats'] == 1
+    assert response.json()['ips_blocked'] == 1
+    assert response.json()['top_signatures'][0]['count'] == 1

@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Query
 from psycopg2.extras import RealDictCursor
 
 from deps import get_conn, put_conn
+from field_filters import PARSED_IPS_SQL, UNPARSED_CEF_THREAT_SQL
 from query_helpers import build_time_conditions, validate_time_params
 
 logger = logging.getLogger('api.security')
@@ -28,15 +29,16 @@ def security_summary(
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(f"""
                 SELECT
-                    COUNT(*) FILTER (WHERE event_source = 'unifi_ips'
+                    COUNT(*) FILTER (WHERE {PARSED_IPS_SQL}
                         AND rule_action = 'block') AS ips_blocked,
-                    COUNT(*) FILTER (WHERE event_source = 'unifi_ips'
+                    COUNT(*) FILTER (WHERE {PARSED_IPS_SQL}
                         AND rule_action = 'allow') AS ips_allowed,
-                    COUNT(*) FILTER (WHERE event_source = 'unifi_ips'
+                    COUNT(*) FILTER (WHERE {PARSED_IPS_SQL}
                         AND (rule_action IS NULL OR rule_action NOT IN ('block', 'allow'))) AS ips_unknown,
                     COUNT(*) FILTER (WHERE log_type = 'firewall' AND rule_action = 'block'
-                        AND event_source IS DISTINCT FROM 'unifi_ips') AS firewall_blocks,
-                    COUNT(*) FILTER (WHERE threat_score > 50) AS reputation_alerts
+                        AND NOT {PARSED_IPS_SQL}) AS firewall_blocks,
+                    COUNT(*) FILTER (WHERE threat_score > 50) AS reputation_alerts,
+                    COUNT(*) FILTER (WHERE {UNPARSED_CEF_THREAT_SQL}) AS unparsed_cef_threats
                 FROM logs WHERE {where}
             """, params)
             result = dict(cur.fetchone())
@@ -51,7 +53,7 @@ def security_summary(
                            COUNT(*) OVER (PARTITION BY ips_signature_id, ips_signature) AS count,
                            ROW_NUMBER() OVER (PARTITION BY ips_signature_id, ips_signature
                                ORDER BY timestamp DESC, id DESC) AS recency
-                    FROM logs WHERE {where} AND event_source = 'unifi_ips'
+                    FROM logs WHERE {where} AND {PARSED_IPS_SQL}
                 ) signatures
                 WHERE recency = 1
                 ORDER BY count DESC, last_seen DESC, ips_signature_id, ips_signature

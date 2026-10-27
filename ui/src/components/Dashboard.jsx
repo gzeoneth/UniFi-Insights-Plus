@@ -1,3 +1,4 @@
+import { useExclusionProfile, ExclusionCounts } from './ExclusionProfiles'
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 import { fetchStatsOverview, fetchStatsCharts, fetchStatsTables } from '../api'
@@ -264,6 +265,7 @@ function TopList({ title, items, renderItem }) {
 const CACHE_PREFIX = 'dashboard'
 
 export default function Dashboard({ maxFilterDays }) {
+  const { excludeGroups } = useExclusionProfile()
   const [timeRange, setTimeRange, visibleRanges] = useTimeRange(maxFilterDays)
   const [stats, setStats] = useState({})
   const [tierStatus, setTierStatus] = useState({ overview: 'loading', charts: 'loading', tables: 'loading' })
@@ -273,9 +275,9 @@ export default function Dashboard({ maxFilterDays }) {
     const epoch = ++requestEpochRef.current
 
     // Read cache first — render immediately if fresh
-    const cachedOverview = readCache(CACHE_PREFIX, `overview:${tr}`)
-    const cachedCharts = readCache(CACHE_PREFIX, `charts:${tr}`)
-    const cachedTables = readCache(CACHE_PREFIX, `tables:${tr}`)
+    const cachedOverview = readCache(CACHE_PREFIX, `overview:${tr}:${excludeGroups || ""}`)
+    const cachedCharts = readCache(CACHE_PREFIX, `charts:${tr}:${excludeGroups || ""}`)
+    const cachedTables = readCache(CACHE_PREFIX, `tables:${tr}:${excludeGroups || ""}`)
 
     if (!isRefresh) {
       // Build initial stats from cache — no null reset, so cached data renders instantly
@@ -291,7 +293,7 @@ export default function Dashboard({ maxFilterDays }) {
 
     const mergeTier = (tier, data) => {
       if (requestEpochRef.current !== epoch) return // stale response guard
-      writeCache(CACHE_PREFIX, `${tier}:${tr}`, data)
+      writeCache(CACHE_PREFIX, `${tier}:${tr}:${excludeGroups || ""}`, data)
       setStats(prev => ({ ...prev, ...data }))
       setTierStatus(prev => ({ ...prev, [tier]: 'loaded' }))
     }
@@ -309,15 +311,15 @@ export default function Dashboard({ maxFilterDays }) {
 
     // Fire all three tiers in parallel
     if (!cachedOverview || isRefresh) {
-      fetchStatsOverview(tr).then(d => mergeTier('overview', d)).catch(() => failTier('overview'))
+      fetchStatsOverview(tr, { exclude_groups: excludeGroups }).then(d => mergeTier('overview', d)).catch(() => failTier('overview'))
     }
     if (!cachedCharts || isRefresh) {
-      fetchStatsCharts(tr).then(d => mergeTier('charts', d)).catch(() => failTier('charts'))
+      fetchStatsCharts(tr, { exclude_groups: excludeGroups }).then(d => mergeTier('charts', d)).catch(() => failTier('charts'))
     }
     if (!cachedTables || isRefresh) {
-      fetchStatsTables(tr).then(d => mergeTier('tables', d)).catch(() => failTier('tables'))
+      fetchStatsTables(tr, { exclude_groups: excludeGroups }).then(d => mergeTier('tables', d)).catch(() => failTier('tables'))
     }
-  }, [])
+  }, [excludeGroups])
 
   // Primary load on mount / time-range change
   useEffect(() => {
@@ -359,6 +361,7 @@ export default function Dashboard({ maxFilterDays }) {
 
   return (
     <div className="pt-2.5 px-4 pb-4 space-y-4 overflow-auto max-h-full">
+      <ExclusionCounts counts={stats.view_counts} />
       {/* All tiers failed — show error instead of infinite skeleton */}
       {allFailed && !hasSomeData && (
         <div className="border border-red-800/50 rounded-lg p-6 text-center">
@@ -469,6 +472,7 @@ export default function Dashboard({ maxFilterDays }) {
         </div>
       )}
 
+      {excludeGroups && <p className="text-xs text-gray-400">Security below includes all detections, independent of the view exclusion profile.</p>}
       <SecuritySummary timeRange={timeRange} />
 
       {/* Logs over time chart */}

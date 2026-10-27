@@ -6,6 +6,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import {
   fetchLogs,
+  fetchExclusionPreview,
+  fetchIPPairs,
+  fetchFlowGraph,
+  fetchZoneMatrix,
+  fetchHostDetail,
+  fetchSecuritySummary,
   fetchHealth,
   fetchStats,
   fetchStatsOverview,
@@ -21,6 +27,29 @@ import {
 
 beforeEach(() => {
   vi.restoreAllMocks()
+})
+
+describe('explicit view exclusion propagation', () => {
+  it('preserves groups on view requests and exports without injecting them into Security or health', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) }))
+    const exclude_groups = JSON.stringify([{ conditions: [{ field: 'hostname_exact', operator: 'include', value: 'gateway.example.test' }] }])
+    const params = { exclude_groups }
+    await fetchLogs(params)
+    await fetchExclusionPreview(params)
+    await fetchStats('7d', params)
+    await fetchStatsOverview('7d', params)
+    await fetchStatsCharts('7d', params)
+    await fetchStatsTables('7d', params)
+    await fetchIPPairs(params)
+    await fetchFlowGraph(params)
+    await fetchZoneMatrix(params)
+    await fetchHostDetail({ ip: '192.0.2.10', ...params })
+    for (const [url] of fetch.mock.calls) expect(new URL(url, 'https://example.test').searchParams.get('exclude_groups')).toBe(exclude_groups)
+    expect(new URL(getExportUrl(params), 'https://example.test').searchParams.get('exclude_groups')).toBe(exclude_groups)
+    await fetchSecuritySummary({ time_range: '7d' })
+    await fetchHealth()
+    for (const [url] of fetch.mock.calls.slice(-2)) expect(new URL(url, 'https://example.test').searchParams.has('exclude_groups')).toBe(false)
+  })
 })
 
 

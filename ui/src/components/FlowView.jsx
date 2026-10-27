@@ -1,3 +1,4 @@
+import { useExclusionProfile } from './ExclusionProfiles'
 import { useState, useCallback, useEffect, useRef, lazy, Suspense } from 'react'
 import useTimeRange from '../hooks/useTimeRange'
 import { ACTION_STYLES, DIRECTION_ICONS, DIRECTION_COLORS } from '../utils'
@@ -19,6 +20,7 @@ const SUB_TABS = [
 const SESSION_KEY = 'flowview_filters'
 
 export default function FlowView({ maxFilterDays }) {
+  const { excludeGroups } = useExclusionProfile()
   const [timeRange, setTimeRange, visibleRanges] = useTimeRange(maxFilterDays)
   const [activeActions, setActiveActions] = useState(ACTIONS)
   const [activeDirections, setActiveDirections] = useState(DIRECTIONS)
@@ -105,11 +107,11 @@ export default function FlowView({ maxFilterDays }) {
   const sankeyRequestKey = [timeRange, timeFrom, timeTo,
     activeActions.length === ACTIONS.length ? null : activeActions.join(','),
     activeDirections.length === DIRECTIONS.length ? null : activeDirections.join(','),
-    dims.join(','), topN, expandedRow?.ip || '', refreshKey].join('|')
+    dims.join(','), topN, expandedRow?.ip || '', refreshKey, excludeGroups].join('|')
 
   const refreshSavedViews = useCallback(() => {
     fetchSavedViews()
-      .then(d => setSavedViews((d.views || []).filter(v => v.filters?.view_type !== 'logs')))
+      .then(d => setSavedViews((d.views || []).filter(v => !['logs', 'exclusions'].includes(v.filters?.view_type))))
       .catch(err => console.error('Failed to fetch saved views:', err))
   }, [])
 
@@ -183,6 +185,7 @@ export default function FlowView({ maxFilterDays }) {
 
   const isCustomTime = !!(timeFrom || timeTo)
   const filters = {
+    exclude_groups: excludeGroups,
     time_range: isCustomTime ? null : timeRange,
     time_from: timeFrom,
     time_to: timeTo,
@@ -244,6 +247,7 @@ export default function FlowView({ maxFilterDays }) {
 
   return (
     <div className="flex flex-col h-full overflow-hidden pt-2.5 px-4 pb-4 space-y-4">
+      {excludeGroups && <p className="text-xs text-gray-400">Charts, host details and CSV exports exclude profile matches. Security is independent.</p>}
       {/* Filters (toggle + content wrapper to avoid space-y margin on desktop) */}
       <div>
         {/* Mobile filter toggle */}

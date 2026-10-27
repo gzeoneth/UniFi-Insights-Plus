@@ -1,3 +1,4 @@
+import { useExclusionProfile, ExclusionCounts } from './ExclusionProfiles'
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { fetchLogs, fetchLog, getExportUrl, fetchLogCountsByType } from '../api'
 import { TR_KEY } from '../utils'
@@ -5,6 +6,7 @@ import FilterBar from './FilterBar'
 import FieldFilters from './FieldFilters'
 import LogTable from './LogTable'
 import Pagination from './Pagination'
+import { LOG_PRESETS, buildLogPresetFilters } from '../lib/logPresets'
 
 const DEFAULT_FILTERS = {
   time_range: '24h',
@@ -46,6 +48,8 @@ const TOGGLEABLE_COLUMNS = [
 ]
 
 export default function LogStream({ version, latestRelease, maxFilterDays, drillFilters, onDrillConsumed, interfaces: prefetchedInterfaces, onPauseChange, uiSettings }) {
+  const { excludeGroups, openDraft, setShowAll } = useExclusionProfile()
+  const requestEpoch = useRef(0)
   const [filters, setFilters] = useState(() => {
     const restored = { ...DEFAULT_FILTERS }
     try {
@@ -61,6 +65,8 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
       return {
         ...DEFAULT_FILTERS,
         time_range: drillFilters.time_range || restored.time_range,
+        time_from: drillFilters.time_from || null,
+        time_to: drillFilters.time_to || null,
         ip: null,
         src_ip: drillFilters.src_ip || null,
         dst_ip: drillFilters.dst_ip || null,
@@ -77,6 +83,7 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
   })
   const [data, setData] = useState({ data: [], total: 0, page: 1, pages: 0 })
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
   const [autoRefresh, setAutoRefresh] = useState(true)
   const [lastUpdate, setLastUpdate] = useState(null)
   const [expandedId, setExpandedId] = useState(null)
@@ -121,6 +128,8 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
     setFilters(prev => ({
       ...DEFAULT_FILTERS,
       time_range: drillFilters.time_range || prev.time_range,
+      time_from: drillFilters.time_from || null,
+      time_to: drillFilters.time_to || null,
       ip: null,
       src_ip: drillFilters.src_ip || null,
       dst_ip: drillFilters.dst_ip || null,
@@ -205,23 +214,24 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
 
   // When paused (manually or by expanding a row), silently check for new logs count
   useEffect(() => {
+    let active = true
     if (pendingRef.current) clearInterval(pendingRef.current)
     if (!isRefreshing && filters.page === 1) {
       pendingRef.current = setInterval(async () => {
         try {
           const qs = new URLSearchParams()
-          for (const [k, v] of Object.entries(filters)) {
+          for (const [k, v] of Object.entries({ ...filters, exclude_groups: excludeGroups })) {
             if (v !== null && v !== undefined && v !== '') qs.set(k, v)
           }
           qs.set('per_page', '1')
           const result = await fetchLogs(Object.fromEntries(qs))
           const diff = result.total - data.total
-          if (diff > 0) setPendingCount(diff)
+          if (active && diff > 0) setPendingCount(diff)
         } catch {}
       }, 5000)
     }
-    return () => { if (pendingRef.current) clearInterval(pendingRef.current) }
-  }, [isRefreshing, filters, data.total])
+    return () => { active = false; if (pendingRef.current) clearInterval(pendingRef.current) }
+  }, [isRefreshing, filters, data.total, excludeGroups])
 
   // Fetch detail data when a row is expanded
   useEffect(() => {
@@ -257,21 +267,33 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
 
   // Stable load function — reads filters from ref to avoid effect cascades
   const load = useCallback(async (f, { background } = {}) => {
+    const epoch = ++requestEpoch.current
     try {
       if (!background) setLoading(true)
-      const result = await fetchLogs(f || filtersRef.current)
+      const result = await fetchLogs({ ...(f || filtersRef.current), exclude_groups: excludeGroups })
+      if (epoch !== requestEpoch.current) return
       setData(result)
+      setLoadError('')
       setLastUpdate(new Date())
     } catch (err) {
-      console.error('Failed to fetch logs:', err)
+      if (epoch === requestEpoch.current) {
+        setLoadError('Could not load events for the current filters. Refresh to try again.')
+        if (!background) setData({ data: [], total: 0, page: 1, pages: 0 })
+      }
     } finally {
-      if (!background) setLoading(false)
+      if (epoch === requestEpoch.current) setLoading(false)
     }
-  }, [])
+  }, [excludeGroups])
+
+  useEffect(() => {
+    setFilters(current => ({ ...current, page: 1 }))
+    setExpandedId(null); setPendingCount(0)
+  }, [excludeGroups])
 
   // Load on filter change
   useEffect(() => {
     load(filters)
+    return () => { requestEpoch.current++ }
   }, [filters, load])
 
   // Auto-refresh every 5s when on page 1 and no row expanded
@@ -298,6 +320,14 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
     setFilters(f => ({ ...f, page }))
   }
 
+  const handlePresetSelect = preset => {
+    const next = buildLogPresetFilters(preset, filters, DEFAULT_FILTERS)
+    if (preset.bypassProfile) setShowAll?.(true)
+    setDrillContext(null)
+    handleFilterChange(next)
+    return next
+  }
+
   return (
     <div className="flex flex-col h-full">
       {/* Drill indicator banner (F8) */}
@@ -310,7 +340,9 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
       {/* Filters */}
       <div className="px-4 py-2.5 border-b border-gray-800 bg-gray-950 relative z-20">
         <FilterBar filters={filters} onChange={handleFilterChange} maxFilterDays={maxFilterDays} prefetchedInterfaces={prefetchedInterfaces} hiddenLogTypes={hiddenLogTypes} />
-        <FieldFilters filters={filters} onChange={handleFilterChange} />
+        <FieldFilters filters={filters} onChange={handleFilterChange} presets={LOG_PRESETS} onPresetSelect={handlePresetSelect} profileApplied={!!excludeGroups} />
+        {!loading && <ExclusionCounts counts={data.view_counts} />}
+        {loadError && <p role="alert" className="text-sm text-red-400">{loadError}</p>}
       </div>
 
       {/* Toolbar */}
@@ -389,7 +421,7 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
             ↻ Refresh
           </button>
           <a
-            href={getExportUrl(filters)}
+            href={getExportUrl({ ...filters, exclude_groups: excludeGroups })}
             className="text-[11px] text-gray-400 hover:text-gray-200 transition-colors"
           >
             ↓ Export CSV
@@ -400,7 +432,7 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
       {/* Log table */}
       <div className="flex-1 relative overflow-hidden">
         <div className="h-full overflow-auto" ref={scrollRef}>
-          <LogTable logs={data.data} loading={loading} expandedId={expandedId} detailedLog={detailedLog} onToggleExpand={handleToggleExpand} hiddenColumns={hiddenColumns} uiSettings={uiSettings} />
+          <LogTable onHideAllow={row => openDraft(row, filters)} logs={data.data} loading={loading} expandedId={expandedId} detailedLog={detailedLog} onToggleExpand={handleToggleExpand} hiddenColumns={hiddenColumns} uiSettings={uiSettings} />
         </div>
         {showScrollTop && (
           <button

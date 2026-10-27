@@ -79,10 +79,11 @@ export default function ZoneMatrix({ filters, refreshKey, onCellClick, activeCel
   const refreshKeyRef = useRef(refreshKey)
 
   useEffect(() => {
-    const disc = [filters.time_range, filters.time_from, filters.time_to, filters.rule_action, filters.direction].join('|')
+    const disc = [filters.time_range, filters.time_from, filters.time_to, filters.rule_action, filters.direction, filters.exclude_groups].join('|')
     const cached = readCache('zone-matrix', disc)
     if (cached && refreshKey === refreshKeyRef.current) {
       setData(cached)
+      setError(null)
       setLoading(false)
       return
     }
@@ -96,7 +97,7 @@ export default function ZoneMatrix({ filters, refreshKey, onCellClick, activeCel
       .catch(err => { if (!cancelled) setError(err.message) })
       .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
-  }, [filters.time_range, filters.time_from, filters.time_to, filters.rule_action, filters.direction, refreshKey])
+  }, [filters.time_range, filters.time_from, filters.time_to, filters.rule_action, filters.direction, filters.exclude_groups, refreshKey])
 
   useEffect(() => {
     const root = document.documentElement

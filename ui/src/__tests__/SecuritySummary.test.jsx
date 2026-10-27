@@ -15,6 +15,13 @@ const summary = {
 beforeEach(() => vi.clearAllMocks())
 
 describe('SecuritySummary', () => {
+  it('warns about retained unparsed CEF threats rather than claiming no IPS events', async () => {
+    fetchSecuritySummary.mockResolvedValue({ ...summary, unparsed_cef_threats: 3, top_signatures: [] })
+    render(<SecuritySummary />)
+    expect(await screen.findByRole('alert')).toHaveTextContent('3 retained CEF threat candidates')
+    expect(screen.queryByText('No IPS events in this time range.')).toBeNull()
+    expect(screen.getByText('No parsed IPS signatures in this time range.')).toBeTruthy()
+  })
   it('shows IPS counts and signatures independently of IP reputation', async () => {
     fetchSecuritySummary.mockResolvedValue(summary)
     render(<SecuritySummary timeRange="7d" />)

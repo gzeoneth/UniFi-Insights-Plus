@@ -52,20 +52,24 @@ export async function fetchLog(id) {
   return apiFetch(`${BASE}/logs/${id}`)
 }
 
-export async function fetchStats(timeRange = '24h') {
-  return apiFetch(`${BASE}/stats?time_range=${timeRange}`)
+export async function fetchExclusionPreview(params = {}, options = {}) {
+  return apiFetch(`${BASE}/logs/exclusion-preview?${buildQS(params)}`, options)
 }
 
-export async function fetchStatsOverview(timeRange = '24h') {
-  return apiFetch(`${BASE}/stats/overview?time_range=${timeRange}`)
+export async function fetchStats(timeRange = '24h', params = {}) {
+  return apiFetch(`${BASE}/stats?${buildQS({ time_range: timeRange, ...params })}`)
 }
 
-export async function fetchStatsCharts(timeRange = '24h') {
-  return apiFetch(`${BASE}/stats/charts?time_range=${timeRange}`)
+export async function fetchStatsOverview(timeRange = '24h', params = {}) {
+  return apiFetch(`${BASE}/stats/overview?${buildQS({ time_range: timeRange, ...params })}`)
 }
 
-export async function fetchStatsTables(timeRange = '24h') {
-  return apiFetch(`${BASE}/stats/tables?time_range=${timeRange}`)
+export async function fetchStatsCharts(timeRange = '24h', params = {}) {
+  return apiFetch(`${BASE}/stats/charts?${buildQS({ time_range: timeRange, ...params })}`)
+}
+
+export async function fetchStatsTables(timeRange = '24h', params = {}) {
+  return apiFetch(`${BASE}/stats/tables?${buildQS({ time_range: timeRange, ...params })}`)
 }
 
 export async function fetchSecuritySummary(params = {}, options = {}) {

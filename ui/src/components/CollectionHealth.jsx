@@ -78,6 +78,7 @@ export default function CollectionHealth() {
   const stats = ingestion?.stats || {}
   const queue = ingestion?.queue || {}
   const spool = ingestion?.spool || {}
+  const enrichment = ingestion?.enrichment || {}
   const state = snapshotError ? 'unavailable' : ingestion?.state || 'unknown'
   const fresh = ingestion?.status === 'fresh'
 
@@ -99,6 +100,9 @@ export default function CollectionHealth() {
               ? `Receiver snapshot is ${ingestion?.status || 'unavailable'}; current collection cannot be confirmed.` : ''}
           </p>
         )}
+        {stats.dropped > 0 && <p role="alert" className="text-sm text-amber-300">
+          Known collection loss this receiver session: {number(stats.dropped)} dropped rows/packets. This is a cumulative counter; it does not by itself indicate that collection is currently failing.
+        </p>}
         <dl className="grid grid-cols-2 lg:grid-cols-4 gap-3">
           <Metric label="Receiver" value={LABELS[state] || state} state={state}
             detail={ingestion?.updated_at ? `Snapshot ${age(ingestion.age_seconds)}` : 'No receiver snapshot'} />
@@ -124,6 +128,12 @@ export default function CollectionHealth() {
           Queue overflow: {number(stats.queue_dropped)} · Retry storage overflow/failure: {number(stats.spool_dropped)} ·
           {' '}Database write failures: {number(stats.flush_errors)} · Parser exceptions: {number(stats.parse_exceptions)}
         </p>
+        <dl className="grid grid-cols-2 gap-3">
+          <Metric label="Database batch sends" value={number(stats.delivery_attempts)}
+            detail="All delivery attempts, including retries. This counts batches, not rows." />
+          <Metric label="Retry batch sends" value={stats.retry_attempts == null ? 'Unknown' : number(stats.retry_attempts)}
+            detail={stats.retry_attempts == null ? 'This snapshot does not report a separate retry count.' : 'Sends containing rows from a previously failed delivery.'} />
+        </dl>
         <div className="border-t border-gray-800 pt-4">
           <h3 className="text-xs font-medium text-gray-300 mb-3">Enrichment providers</h3>
           <dl className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
@@ -137,6 +147,9 @@ export default function CollectionHealth() {
           <p className="text-xs text-gray-500 mt-3">
             Provider states come from local configuration, loaded files and background work. This page does not run live provider checks.
             First events can arrive before DNS or reputation data is available.
+          </p>
+          <p className={`text-xs mt-2 ${enrichment.dropped > 0 ? 'text-amber-300' : 'text-gray-500'}`}>
+            Skipped enrichment jobs: {number(enrichment.dropped)}. This counts skipped enrichment work, not dropped log rows. Missing enrichment can leave DNS or reputation fields unavailable.
           </p>
         </div>
         <p className="text-xs text-gray-500 border-t border-gray-800 pt-3">

@@ -52,11 +52,12 @@ function TopIPPairsMenuItems({ onSaveView, onLoadView, savedViews, onDeleteView,
   )
 }
 
-// onIpClick(ip, rowIndex) — rowIndex is used by FlowView's toggle logic:
+// onIpClick(ip, rowIndex): rowIndex is used by FlowView's toggle logic:
 // clicking the same IP in the same row closes the panel, different row keeps it open.
 export default function TopIPPairs({ filters, refreshKey, sankeyFilter, onClearSankeyFilter, zoneFilter, onClearZoneFilter, onIpClick, onSaveView, onLoadView, savedViews, onDeleteView, onRefreshViews, deferFetch }) {
   const [pairs, setPairs] = useState([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
   const [limit, setLimit] = useState(25)
   const refreshKeyRef = useRef(refreshKey)
 
@@ -65,9 +66,10 @@ export default function TopIPPairs({ filters, refreshKey, sankeyFilter, onClearS
   const zoneKey = zoneFilter ? `${zoneFilter.interface_in}:${zoneFilter.interface_out}` : ''
 
   useEffect(() => {
-    if (deferFetch) return
+    setError(null)
+    if (deferFetch) { setPairs([]); setLoading(true); return }
 
-    const disc = [filters.time_range, filters.time_from, filters.time_to, filters.rule_action, filters.direction, sankeyKey, zoneKey, limit].join('|')
+    const disc = [filters.time_range, filters.time_from, filters.time_to, filters.rule_action, filters.direction, filters.exclude_groups, sankeyKey, zoneKey, limit].join('|')
     const cached = readCache('ip-pairs', disc)
     if (cached && refreshKey === refreshKeyRef.current) {
       setPairs(cached)
@@ -78,6 +80,7 @@ export default function TopIPPairs({ filters, refreshKey, sankeyFilter, onClearS
 
     let cancelled = false
     setLoading(true)
+    setPairs([])
     const params = { ...filters, limit }
     if (sankeyFilter) {
       const paramKey = SANKEY_PARAM_MAP[sankeyFilter.type] || sankeyFilter.type
@@ -91,10 +94,10 @@ export default function TopIPPairs({ filters, refreshKey, sankeyFilter, onClearS
       .then(data => {
         if (!cancelled) { setPairs(data.pairs || []); writeCache('ip-pairs', disc, data.pairs || []) }
       })
-      .catch(err => console.error('IP pairs fetch failed:', err))
+      .catch(() => { if (!cancelled) setError('Could not load IP pairs for the current filters. Refresh to try again.') })
       .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
-  }, [deferFetch, filters.time_range, filters.time_from, filters.time_to, filters.rule_action, filters.direction, sankeyKey, zoneKey, limit, refreshKey])
+  }, [deferFetch, filters.time_range, filters.time_from, filters.time_to, filters.rule_action, filters.direction, filters.exclude_groups, sankeyKey, zoneKey, limit, refreshKey])
 
   const drillToLogs = (pair) => {
     window.dispatchEvent(new CustomEvent('drillToLogs', {
@@ -165,7 +168,7 @@ export default function TopIPPairs({ filters, refreshKey, sankeyFilter, onClearS
         </div>
       )}
 
-      {loading ? (
+      {error ? <p role="alert" className="p-4 text-sm text-red-400">{error}</p> : loading ? (
         <div className="overflow-y-auto overflow-x-hidden min-h-0 flex-1 animate-pulse">
           <table className="w-full table-fixed">
             <thead>

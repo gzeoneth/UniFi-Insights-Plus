@@ -43,7 +43,8 @@ def test_ips_fields_remain_distinct_from_reputation_and_gateway_identity():
     assert parsed['rule_name'] == 'Example policy'
     assert parsed['timestamp'] == datetime(2024, 10, 28, 4, 34, 56, 125000, tzinfo=timezone.utc)
     assert parsed['raw_log'] == raw
-    for forbidden in ('threat_score', 'threat_categories', 'mac_address', 'hostname'):
+    assert parsed['hostname'] == 'example-gateway'
+    for forbidden in ('threat_score', 'threat_categories', 'mac_address', 'src_device_name', 'dst_device_name'):
         assert forbidden not in parsed
 
 
@@ -149,3 +150,22 @@ def test_bad_cef_time_falls_back_to_envelope(value):
 
 def test_malformed_rfc5424_structured_data_returns_none():
     assert parse_log('<134>1 2023-10-28T04:34:56Z gateway app - - [unclosed ' + cef()) is None
+
+
+@pytest.mark.parametrize('prefix,expected', [
+    ('<13>Oct 28 12:34:56 example-gateway ', 'example-gateway'),
+    ('<13>1 2024-10-28T12:34:56Z example-rfc5424 app - - - ', 'example-rfc5424'),
+    ('<13>Oct 28 12:34:56 2024-10-28T12:34:56Z example-dual ', 'example-dual'),
+    ('<13>1 2024-10-28T12:34:56Z - app - - - ', None),
+])
+def test_firewall_emitter_is_recorded_for_scoped_rule_profiles(prefix, expected):
+    body = '[EXAMPLE-A-100] IN=br0 OUT=eth0 SRC=192.0.2.10 DST=203.0.113.20 PROTO=TCP SPT=50000 DPT=443'
+    parsed = parse_log(prefix + body)
+    assert parsed.get('hostname') == expected
+    assert parsed.get('src_device_name') is None
+    assert parsed['raw_log'] == prefix + body
+
+
+def test_emitter_does_not_replace_dhcp_client_hostname():
+    parsed = parse_log('<13>Oct 28 12:34:56 example-gateway dnsmasq-dhcp[1]: DHCPACK(br0) 192.0.2.10 02:00:00:00:00:10 example-client')
+    assert parsed['hostname'] == 'example-client'

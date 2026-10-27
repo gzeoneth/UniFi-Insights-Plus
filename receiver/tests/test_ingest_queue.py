@@ -48,6 +48,22 @@ def test_spool_capacity_drops_newest_and_retains_failed_rows(tmp_path):
     spool.close()
 
 
+def test_due_batch_reports_persisted_retry_evidence_without_altering_payload(tmp_path):
+    path = str(tmp_path / 'spool.sqlite3')
+    spool = RetrySpool(path)
+    spool.stage([{'raw_log': 'synthetic retry'}])
+    rows, retrying = spool.due_batch(50, now=100)
+    assert len(rows) == 1 and retrying is False
+    assert 'attempts' not in rows[0]
+    spool.acknowledge(rows, rows, now=100)
+    assert spool.due_batch(50, now=100) == ([], False)
+    spool.close()
+    spool = RetrySpool(path)
+    replay, retrying = spool.due_batch(50, now=101)
+    assert replay == rows and retrying is True
+    spool.close()
+
+
 def test_spool_payload_bytes_bound_and_duplicate_stage(tmp_path):
     spool = RetrySpool(str(tmp_path / 'spool.sqlite3'), max_rows=10, max_bytes=250)
     row = {'raw_log': 'a' * 100}
@@ -110,6 +126,34 @@ def test_failed_db_write_never_increments_inserted_or_drops_durable_rows(receive
     assert receiver.stats['dropped'] == 0
     assert receiver.stats['flush_errors'] == 1
     assert receiver._spool.snapshot()['rows'] == 1
+
+
+def test_delivery_counter_separates_first_attempts_from_known_retries(receiver):
+    successful = lambda rows: SimpleNamespace(inserted=len(rows), duplicates=0, dropped=0, retryable=[])
+    receiver.db.insert_logs_batch.side_effect = successful
+    receiver.batch = [{'raw_log': 'synthetic first send'}]
+    receiver._flush_batch()
+    assert receiver.stats['delivery_attempts'] == 1
+    assert receiver.stats['retry_attempts'] == 0
+
+    receiver.db.insert_logs_batch.side_effect = RuntimeError('synthetic outage')
+    receiver.batch = [{'raw_log': 'synthetic pending send'}]
+    receiver._flush_batch()
+    assert receiver.stats['delivery_attempts'] == 2
+    assert receiver.stats['retry_attempts'] == 0  # Failed first send is not a retry.
+    assert receiver.stats['flush_errors'] == 1
+    receiver._retry_spool()
+    assert receiver.stats['delivery_attempts'] == 2  # Backoff is not an attempt.
+
+    receiver._db_retry_at = 0
+    receiver._spool.conn.execute('UPDATE pending SET next_retry_at=0')
+    receiver._spool.conn.commit()
+    receiver.db.insert_logs_batch.side_effect = successful
+    receiver._retry_spool()
+    assert receiver.stats['delivery_attempts'] == 3
+    assert receiver.stats['retry_attempts'] == 1
+    assert receiver.stats['inserted'] == 2
+    assert receiver._spool.rows == 0
 
 
 def test_blocked_db_worker_does_not_block_intake_and_memory_is_bounded(receiver, monkeypatch):

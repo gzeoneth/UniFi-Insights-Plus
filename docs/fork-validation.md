@@ -2,7 +2,21 @@
 
 The changes were tested against the upstream v3.7.2 base using synthetic events and disposable local databases. No live collector, gateway or production database was modified for these checks.
 
-## Automated checks
+## View-exclusion release: 3.7.2-gzeon.2
+
+- 1,097 backend tests passed, including disposable PostgreSQL queries, upgrade/restore, replay, retention and TLS checks.
+- 204 UI tests passed. The production UI build and a local ARM64 Docker image build passed.
+- PostgreSQL tests verified AND-within/OR-between group matching, NULL behavior, literal comma/case matching, counts before pagination, and parity across logs, CSV, Rule Usage, stats, flows and MCP.
+- Parsed IPS records and raw CEF candidates remained visible under broad profiles. Fixtures include `Threat Detected and Blocked` and explicit IPS metadata, plus the separate unparsed-candidate warning.
+- Twelve built-in views reset conflicting filters and preserve page size/sort. Discovery includes replies, and private-traffic blocks include gateway-local paths. Security classifications use the same predicate across views and counters.
+- New firewall records retain their reported emitter without replacing DHCP client names. Delivery/retry counters distinguish ordinary batch sends from retries; old snapshots report unknown actual retries.
+- UI tests cover preview invalidation, delayed requests, profile loading/saving/deletion, browser defaults, delayed deletion, reversible Show all, scoped caches, collection-loss alerts and Security independence.
+- A local browser with synthetic API fixtures confirmed rule-scoped drafting, preview/save/apply, restoration through Show all, export parameters, default reload, built-in private/discovery filter selection and the unparsed-CEF warning. Backend behavior was tested separately against PostgreSQL; the browser fixture is not a live-gateway ingestion test.
+- Privacy review covered the outgoing source and new files. Exact private-value checks found only an unchanged upstream example URL. Gitleaks found the same two `retention_policy_v1` identifier false positives. Local test caches are excluded from Docker builds.
+
+No production workload, long-retention query benchmark or new image publication was performed for these checks. Active profiles inspect raw CEF text and add count-query work; measure latency and memory against a restored database before changing production retention.
+
+## Earlier release checks: 3.7.2-gzeon.1
 
 - 1,004 backend tests passed, including explicit PostgreSQL integration tests.
 - 167 UI tests passed.

@@ -46,6 +46,7 @@ def test_all_filtering_tools_advertise_whitelisted_fields(mcp):
         schema = catalog[name]['inputSchema']['properties']['filter_rules']
         assert schema['maxItems'] == 24
         assert 'ips_signature' in schema['items']['properties']['field']['enum']
+        assert 'security_event' in schema['items']['properties']['field']['enum']
         assert schema['items']['additionalProperties'] is False
 
 
@@ -53,6 +54,30 @@ def test_invalid_export_filter_is_rejected_before_issuing_a_broken_url(mcp):
     with pytest.raises(HTTPException) as error:
         mcp._tool_export_logs_csv_url({'filter_rules': [{'field': 'dst_port', 'operator': 'include', 'value': '99999'}]})
     assert error.value.status_code == 400
+
+
+def test_mcp_profile_parity_and_catalog(mcp):
+    groups = [{'name': 'Synthetic', 'conditions': [
+        {'field': 'rule_name_exact', 'operator': 'include', 'value': 'Rule, A'},
+        {'field': 'hostname_exact', 'operator': 'include', 'value': 'gateway-a'},
+    ]}]
+    mcp._tool_search_logs({'exclude_groups': groups})
+    mcp._tool_aggregate_logs({'group_by': 'rule_name', 'exclude_groups': groups})
+    assert json.loads(mcp.logs_routes.get_logs.call_args.kwargs['exclude_groups']) == groups
+    assert json.loads(mcp.logs_routes.get_logs_aggregate.call_args.kwargs['exclude_groups']) == groups
+    url = mcp._tool_export_logs_csv_url({'exclude_groups': groups})['download_url']
+    assert json.loads(parse_qs(urlsplit(url).query)['exclude_groups'][0]) == groups
+    mcp._handle_tool_call('get_log_stats', {'exclude_groups': groups})
+    assert json.loads(mcp.stats_routes.get_stats.call_args.kwargs['exclude_groups']) == groups
+    catalog = {tool['name']: tool for tool in mcp._tools_catalog()}
+    for name in ('search_logs', 'aggregate_logs', 'export_logs_csv_url', 'get_log_stats'):
+        schema = catalog[name]['inputSchema']['properties']['exclude_groups']
+        assert schema['maxItems'] == 12
+        rules = schema['items']['properties']['conditions']
+        assert rules['maxItems'] == 8 and rules['minItems'] == 1
+        assert 'hostname_exact' in rules['items']['properties']['field']['enum']
+    with pytest.raises(HTTPException):
+        mcp._tool_export_logs_csv_url({'exclude_groups': [{'conditions': []}]})
 
 
 def test_sync_tool_and_audit_do_not_block_event_loop_and_keep_context(mcp, monkeypatch):

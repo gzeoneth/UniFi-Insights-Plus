@@ -30,7 +30,7 @@ export default function HostSlidePanel({ ip, filters, onClose, onPeerClick, onBa
       .catch(err => { if (!cancelled) setError(err.message) })
       .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
-  }, [ip, filters.time_range, filters.rule_action, filters.direction])
+  }, [ip, filters.time_range, filters.time_from, filters.time_to, filters.rule_action, filters.direction, filters.exclude_groups])
 
   const handleClose = () => {
     setVisible(false)

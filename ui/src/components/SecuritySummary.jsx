@@ -48,6 +48,9 @@ export default function SecuritySummary({ timeRange = '24h', timeFrom, timeTo })
         <div role="status" className="text-sm text-gray-400">Loading security events…</div>
       ) : (
         <>
+          {data.unparsed_cef_threats > 0 && <p role="alert" className="text-sm text-amber-300 mb-3">
+            {formatNumber(data.unparsed_cef_threats)} retained CEF threat candidates have not been parsed into IPS fields and are not included in the IPS counters below. Search Log Stream for “CEF:” with all log types selected to inspect them. Historical records need a reparse or backfill before their threat details can be confirmed.
+          </p>}
           <dl className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-4">
             {COUNTERS.map(([key, label, color]) => (
               <div key={key}>
@@ -61,7 +64,7 @@ export default function SecuritySummary({ timeRange = '24h', timeFrom, timeTo })
           </p>
           <h3 className="text-xs text-gray-400 uppercase tracking-wider mt-5 mb-2">Top IPS signatures</h3>
           {!data.top_signatures?.length ? (
-            <p className="text-sm text-gray-500">No IPS events in this time range.</p>
+            <p className="text-sm text-gray-500">{data.unparsed_cef_threats > 0 ? 'No parsed IPS signatures in this time range.' : 'No IPS events in this time range.'}</p>
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-xs text-left">

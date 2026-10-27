@@ -1,3 +1,4 @@
+import { ruleExclusionGroup } from './ExclusionProfiles'
 import React from 'react'
 import {
   formatTime, formatDateShort, FlagIcon, countryName, getInterfaceName, formatServiceName, resolveIpSublines,
@@ -77,7 +78,7 @@ function NetworkPath({ ifaceIn, ifaceOut }) {
   )
 }
 
-function LogRow({ log, isExpanded, detailedLog, onToggle, hiddenColumns, colCount, uiSettings }) {
+function LogRow({ log, isExpanded, detailedLog, onToggle, hiddenColumns, colCount, uiSettings, onHideAllow }) {
   const actionStyle = ACTION_STYLES[log.rule_action || log.dhcp_event || log.wifi_event] || ''
   const typeStyle = LOG_TYPE_STYLES[log.log_type] || LOG_TYPE_STYLES.system
   const dirIcon = DIRECTION_ICONS[log.direction] || ''
@@ -243,6 +244,7 @@ function LogRow({ log, isExpanded, detailedLog, onToggle, hiddenColumns, colCoun
         {show('rule') && (
           <td className="px-2 py-1.5 text-[12px] text-gray-400 whitespace-nowrap sm:max-w-[180px] sm:truncate" title={infoTitle}>
             {infoText}
+            {onHideAllow && ruleExclusionGroup(log) && <button className="block text-xs text-blue-300" onClick={e => { e.stopPropagation(); onHideAllow(log) }}>Hide matching allow events</button>}
           </td>
         )}
 
@@ -272,7 +274,7 @@ function LogRow({ log, isExpanded, detailedLog, onToggle, hiddenColumns, colCoun
   )
 }
 
-export default function LogTable({ logs, loading, expandedId, detailedLog, onToggleExpand, hiddenColumns = new Set(), uiSettings }) {
+export default function LogTable({ logs, loading, expandedId, detailedLog, onToggleExpand, hiddenColumns = new Set(), uiSettings, onHideAllow }) {
 
   // Auto-hide ASN column when IP subline is enabled
   const effectiveHidden = uiSettings?.ui_ip_subline === 'asn_or_abuse'
@@ -336,6 +338,7 @@ export default function LogTable({ logs, loading, expandedId, detailedLog, onTog
               <LogRow
                 key={log.id}
                 log={log}
+                onHideAllow={onHideAllow}
                 isExpanded={expandedId === log.id}
                 detailedLog={expandedId === log.id ? detailedLog : null}
                 onToggle={() => onToggleExpand(log.id)}

@@ -130,7 +130,7 @@ class SyslogReceiver:
         self.stats = dict.fromkeys((
             'received', 'parsed', 'filtered', 'failed', 'inserted', 'duplicates',
             'flush_errors', 'dropped', 'parse_exceptions', 'enrich_exceptions',
-            'queue_dropped', 'spool_dropped', 'spool_errors', 'retry_attempts',
+            'queue_dropped', 'spool_dropped', 'spool_errors', 'delivery_attempts', 'retry_attempts',
             'shutdown_dropped',
         ), 0)
         self.queue = queue.Queue(maxsize=positive_env('INGEST_QUEUE_CAPACITY', 4096, 65536))
@@ -365,7 +365,7 @@ class SyslogReceiver:
         if self._spool is None or not self._spool.rows or time.time() < self._db_retry_at:
             return
         try:
-            rows = self._spool.due(BATCH_SIZE)
+            rows, retrying = self._spool.due_batch(BATCH_SIZE)
         except Exception:
             self._count('spool_errors')
             self._spool_failed = True
@@ -375,7 +375,9 @@ class SyslogReceiver:
             return
         if not rows:
             return
-        self._count('retry_attempts')
+        self._count('delivery_attempts')
+        if retrying:
+            self._count('retry_attempts')
         try:
             result = self.db.insert_logs_batch(rows)
             # A missing/old DB contract must never turn failure into success.
