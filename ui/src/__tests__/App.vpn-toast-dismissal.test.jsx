@@ -51,7 +51,8 @@ vi.mock('../api', () => ({
   setAuthExpiredHandler: vi.fn(),
 }))
 
-vi.mock('../utils', () => ({
+vi.mock('../utils', async importOriginal => ({
+  ...await importOriginal(),
   loadInterfaceLabels: vi.fn(() => ({})),
 }))
 
@@ -81,10 +82,26 @@ import { dismissVpnToast, fetchAuthMe, fetchAuthStatus, fetchConfig, fetchHealth
 
 beforeEach(() => {
   vi.clearAllMocks()
+  localStorage.clear(); sessionStorage.clear()
+  window.history.replaceState(null, '', '/')
   configOverride = {}
   fetchAuthStatus.mockResolvedValue({ auth_enabled: false })
   fetchAuthMe.mockResolvedValue(null)
   fetchHealth.mockResolvedValue({ status: 'ok', version: '3.3.0' })
+})
+
+describe('remembered navigation', () => {
+  it('restores the last tab and allows an explicit URL to override it', async () => {
+    localStorage.setItem('unifi-log-insight:active-tab', JSON.stringify('dashboard'))
+    const first = render(<App />)
+    await screen.findByRole('button', { name: 'System status' })
+    expect(screen.queryByTestId('logstream')).toBeNull()
+    first.unmount()
+    window.history.replaceState(null, '', '/#logs')
+    render(<App />)
+    await screen.findByTestId('logstream')
+    expect(JSON.parse(localStorage.getItem('unifi-log-insight:active-tab'))).toBe('logs')
+  })
 })
 
 describe('collection status indicator', () => {

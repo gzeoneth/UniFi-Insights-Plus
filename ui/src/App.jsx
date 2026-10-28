@@ -16,6 +16,7 @@ import { loadInterfaceLabels } from './utils'
 import { isVpnInterface } from './vpnUtils'
 import useSerializedPoll from './hooks/useSerializedPoll'
 import { collectionStatus } from './lib/collectionStatus'
+import { readPreference, writePreference, writeTextPreference } from './lib/preferences'
 
 const fetchStatusHealth = (_params, options) => fetchHealth(options)
 
@@ -120,8 +121,9 @@ export default function App() {
   const [activeTab, setActiveTab] = useState(() => {
     const hash = window.location.hash.replace('#', '').split('?')[0]
     const valid = TABS.map(t => t.id)
-    return valid.includes(hash) ? hash : 'logs'
+    return valid.includes(hash) ? hash : readPreference('unifi-log-insight:active-tab', 'logs', value => valid.includes(value))
   })
+  useEffect(() => { writePreference('unifi-log-insight:active-tab', activeTab) }, [activeTab])
   const healthPoll = useSerializedPoll({ params: {}, fetcher: fetchStatusHealth, intervalMs: 15000 })
   const health = healthPoll.data
   const collection = collectionStatus(health?.ingestion)
@@ -153,7 +155,7 @@ export default function App() {
   const [theme, setTheme] = useState(() => {
     const urlTheme = new URLSearchParams(window.location.search).get('theme')
     if (urlTheme === 'light' || urlTheme === 'dark') return urlTheme
-    return localStorage.getItem('ui_theme') || 'dark'
+    return readPreference('ui_theme', 'dark', value => ['light', 'dark'].includes(value))
   })
   const initialThemeRef = useRef(theme)
   const [showStatusTooltip, setShowStatusTooltip] = useState(false)
@@ -167,8 +169,8 @@ export default function App() {
   // Persist URL-derived theme to localStorage so Settings reads the correct value
   useEffect(() => {
     const urlTheme = new URLSearchParams(window.location.search).get('theme')
-    if ((urlTheme === 'light' || urlTheme === 'dark') && localStorage.getItem('ui_theme') !== urlTheme) {
-      localStorage.setItem('ui_theme', urlTheme)
+    if (urlTheme === 'light' || urlTheme === 'dark') {
+      writeTextPreference('ui_theme', urlTheme)
     }
   }, [])
 
@@ -177,9 +179,9 @@ export default function App() {
     if (authState === 'loading' || authState === 'login') return
     fetchUiSettings().then(data => {
       setUiSettings(data)
-      if (!localStorage.getItem('ui_theme') && data.ui_theme && data.ui_theme !== initialThemeRef.current) {
+      if (!readPreference('ui_theme', null, value => ['light', 'dark'].includes(value)) && ['light', 'dark'].includes(data.ui_theme) && data.ui_theme !== initialThemeRef.current) {
         setTheme(data.ui_theme)
-        localStorage.setItem('ui_theme', data.ui_theme)
+        writeTextPreference('ui_theme', data.ui_theme)
       }
     }).catch(() => {})
   }, [authState]) // eslint-disable-line react-hooks/exhaustive-deps
@@ -232,7 +234,7 @@ export default function App() {
   const toggleTheme = () => {
     const next = theme === 'dark' ? 'light' : 'dark'
     setTheme(next)
-    localStorage.setItem('ui_theme', next)
+    writeTextPreference('ui_theme', next)
     updateUiSettings({ ui_theme: next }).catch(() => {})
   }
 
@@ -541,7 +543,7 @@ export default function App() {
     return <ExclusionProfileProvider><SettingsOverlay
       onClose={() => {
         reloadConfig().catch(() => {})
-        setTheme(localStorage.getItem('ui_theme') || 'dark')
+        setTheme(readPreference('ui_theme', 'dark', value => ['light', 'dark'].includes(value)))
         setShowSettings(false)
         setSettingsReconfig(false)
         setSettingsInitialSection(null)

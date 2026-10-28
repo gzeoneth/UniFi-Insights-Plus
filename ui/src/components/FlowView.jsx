@@ -8,57 +8,53 @@ import TopIPPairs from './TopIPPairs'
 import HostSlidePanel from './HostSlidePanel'
 import DateRangePicker from './DateRangePicker'
 import FieldFilters, { readFilterRules } from './FieldFilters'
+import { readPreference, writePreference } from '../lib/preferences'
+import { FLOW_PREFERENCE_KEY, FLOW_ACTIONS, FLOW_DIRECTIONS, normalizeFlowPreferences, isFlowHostIp } from '../lib/flowPreferences'
 
 const ZoneMatrix = lazy(() => import('./ZoneMatrix'))
 
-const ACTIONS = ['allow', 'block']
-const DIRECTIONS = ['inbound', 'outbound', 'inter_vlan', 'nat', 'local', 'vpn']
+const ACTIONS = FLOW_ACTIONS
+const DIRECTIONS = FLOW_DIRECTIONS
 const SUB_TABS = [
   { key: 'sankey', label: 'Flow Graph' },
   { key: 'zone-matrix', label: 'Zone Matrix' },
 ]
 
-const SESSION_KEY = 'flowview_filters'
-
-function readSessionFilters() {
-  try {
-    const value = JSON.parse(sessionStorage.getItem(SESSION_KEY) || '{}')
-    return value && typeof value === 'object' && !Array.isArray(value) ? value : {}
-  } catch { return {} }
-}
-
 export default function FlowView({ maxFilterDays }) {
   const { excludeGroups } = useExclusionProfile()
-  const [initialFilters] = useState(readSessionFilters)
+  const [initialFilters] = useState(() => normalizeFlowPreferences(readPreference(FLOW_PREFERENCE_KEY, {})))
   const [timeRange, setTimeRange, visibleRanges] = useTimeRange(maxFilterDays)
   const [activeActions, setActiveActions] = useState(initialFilters.activeActions || ACTIONS)
   const [activeDirections, setActiveDirections] = useState(initialFilters.activeDirections || DIRECTIONS)
   const [refreshKey, setRefreshKey] = useState(0)
   const [dims, setDims] = useState(initialFilters.dims || ['src_ip', 'dst_port', 'dst_ip'])
   const [topN, setTopN] = useState(initialFilters.topN || 15)
-  const [activeViewName, setActiveViewName] = useState(initialFilters.activeViewName || null)
+  const [activeViewName, setActiveViewName] = useState(() => (
+    initialFilters.timeFrom || initialFilters.timeTo || initialFilters.timeRange === timeRange
+  ) ? initialFilters.activeViewName : null)
   const [filterRules, setFilterRules] = useState(() => readFilterRules(initialFilters.filter_rules))
 
   // Saved views list
   const [savedViews, setSavedViews] = useState([])
 
   // Sub-tab state
-  const [activePanel, setActivePanel] = useState('sankey')
+  const [activePanel, setActivePanel] = useState(initialFilters.activePanel)
 
   // Defer ip-pairs until Sankey resolves (avoid concurrent heavy queries).
   // Uses request-key matching instead of a boolean to avoid effect-order races on remount.
   const [sankeyFulfilledKey, setSankeyFulfilledKey] = useState(null)
 
   // Cross-filter state
-  const [sankeyFilter, setSankeyFilter] = useState(null)
-  const [zoneFilter, setZoneFilter] = useState(null)
+  const [sankeyFilter, setSankeyFilter] = useState(initialFilters.sankeyFilter)
+  const [zoneFilter, setZoneFilter] = useState(initialFilters.zoneFilter)
 
   // Host detail expansion state — { ip, rowIndex } or null
-  const [expandedRow, setExpandedRow] = useState(null)
+  const [expandedRow, setExpandedRow] = useState(() => initialFilters.hostIp ? { ip: initialFilters.hostIp, rowIndex: -1 } : null)
   // Navigation history stack for host detail drill-down
   const [hostHistory, setHostHistory] = useState([])
-  const [hostSearchInput, setHostSearchInput] = useState('')
-  const [filtersExpanded, setFiltersExpanded] = useState(false)
+  const [hostSearchInput, setHostSearchInput] = useState(initialFilters.hostSearchInput)
+  const [filtersExpanded, setFiltersExpanded] = useState(initialFilters.filtersExpanded)
+  const [advancedExpanded, setAdvancedExpanded] = useState(initialFilters.advancedExpanded)
   const [timeFrom, setTimeFrom] = useState(initialFilters.timeFrom || null)
   const [timeTo, setTimeTo] = useState(initialFilters.timeTo || null)
 
@@ -71,13 +67,14 @@ export default function FlowView({ maxFilterDays }) {
 
   // Initial filters are read before children can start a query.
   useEffect(() => {
-    try {
-      sessionStorage.setItem(SESSION_KEY, JSON.stringify({
-        dims, topN, activeActions, activeDirections,
-        timeFrom, timeTo, activeViewName, filter_rules: filterRules,
-      }))
-    } catch { /* ignore quota errors */ }
-  }, [dims, topN, activeActions, activeDirections, timeFrom, timeTo, activeViewName, filterRules])
+    writePreference(FLOW_PREFERENCE_KEY, normalizeFlowPreferences({
+      dims, topN, activeActions, activeDirections,
+      timeRange, timeFrom, timeTo, activeViewName, filter_rules: filterRules,
+      activePanel, filtersExpanded, advancedExpanded, sankeyFilter, zoneFilter,
+      hostIp: expandedRow?.ip, hostSearchInput,
+    }))
+  }, [dims, topN, activeActions, activeDirections, timeRange, timeFrom, timeTo, activeViewName, filterRules,
+    activePanel, filtersExpanded, advancedExpanded, sankeyFilter, zoneFilter, expandedRow?.ip, hostSearchInput])
 
   // Badge clear: any manual filter change clears the active view badge
   useEffect(() => {
@@ -123,13 +120,14 @@ export default function FlowView({ maxFilterDays }) {
   // Load view handler
   const handleLoadView = useCallback((view) => {
     if (!view?.filters) return
-    const f = view.filters
+    const f = normalizeFlowPreferences(view.filters)
     skipBadgeClear.current = true
     if (f.dims) setDims(f.dims)
     if (f.topN) setTopN(f.topN)
     if (f.activeActions) setActiveActions(f.activeActions)
     if (f.activeDirections) setActiveDirections(f.activeDirections)
     setFilterRules(readFilterRules(f.filter_rules))
+    if (f.filter_rules.length) setAdvancedExpanded(true)
     setSankeyFilter(null)
     setZoneFilter(null)
     setExpandedRow(null)
@@ -141,7 +139,7 @@ export default function FlowView({ maxFilterDays }) {
     } else {
       setTimeFrom(null)
       setTimeTo(null)
-      if (f.timeRange) setTimeRange(f.timeRange)
+      if (view.filters.timeRange) setTimeRange(view.filters.timeRange)
     }
     setActiveViewName(view.name)
     setTimeout(() => { skipBadgeClear.current = false }, 0)
@@ -223,7 +221,7 @@ export default function FlowView({ maxFilterDays }) {
   }, [handleSankeyNodeClick])
 
   const handleHostSearch = (e) => {
-    if (e.key === 'Enter' && hostSearchInput.trim()) {
+    if (e.key === 'Enter' && isFlowHostIp(hostSearchInput.trim())) {
       setExpandedRow({ ip: hostSearchInput.trim(), rowIndex: -1 })
     }
   }
@@ -233,8 +231,10 @@ export default function FlowView({ maxFilterDays }) {
     activeActions.length !== ACTIONS.length,
     activeDirections.length !== DIRECTIONS.length,
     isCustomTime || timeRange !== '24h',
-    hostSearchInput,
+    hostSearchInput || expandedRow?.ip,
     filterRules.length,
+    sankeyFilter,
+    zoneFilter,
   ].filter(Boolean).length
 
   return (
@@ -376,7 +376,8 @@ export default function FlowView({ maxFilterDays }) {
         </div>
       </div>
 
-      <details className="shrink-0 max-h-[45vh] overflow-y-auto" open={filterRules.length > 0 || undefined}>
+      <details className="shrink-0 max-h-[45vh] overflow-y-auto" open={advancedExpanded}
+        onToggle={event => setAdvancedExpanded(event.currentTarget.open)}>
         <summary className="cursor-pointer text-xs text-gray-300">Include / exclude hosts and traffic{filterRules.length ? ` (${filterRules.length})` : ''}</summary>
         <div className="mt-2">
           <FieldFilters filters={{ filter_rules: filters.filter_rules }} savedViews={false}

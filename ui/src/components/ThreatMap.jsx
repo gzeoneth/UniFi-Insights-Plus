@@ -6,6 +6,9 @@ import { fetchThreatGeo } from '../api'
 import { formatNumber } from '../utils'
 import { THREAT_LEVELS } from '../lib/threatPresentation'
 import useTimeRange from '../hooks/useTimeRange'
+import usePreference from '../hooks/usePreference'
+import { readPreference, writePreference } from '../lib/preferences'
+import { isBoolean, isDateWindow, isMapCamera } from '../lib/viewPreferences'
 import useSerializedPoll from '../hooks/useSerializedPoll'
 import ThreatSidebar from './ThreatSidebar'
 import DateRangePicker from './DateRangePicker'
@@ -206,13 +209,14 @@ export default function ThreatMap({ maxFilterDays, flyTo, onFlyToDone }) {
   const mapRef = useRef(null)
   const flyToMarkerRef = useRef(null)
   const [timeRange, setTimeRange, visibleRanges] = useTimeRange(maxFilterDays)
-  const [mode, setMode] = useState('threats')
-  const [view, setView] = useState('heatmap')
-  const [filtersExpanded, setFiltersExpanded] = useState(false)
+  const [mode, setMode] = usePreference('unifi-log-insight:map-mode', 'threats', value => MODES.some(mode => mode.id === value))
+  const [view, setView] = usePreference('unifi-log-insight:map-view', 'heatmap', value => VIEWS.some(view => view.id === value))
+  const [filtersExpanded, setFiltersExpanded] = usePreference('unifi-log-insight:map-filters-expanded', false, isBoolean)
   const [sidebarLocation, setSidebarLocation] = useState(null)
   const [hasFlyToMarker, setHasFlyToMarker] = useState(false)
-  const [timeFrom, setTimeFrom] = useState(null)
-  const [timeTo, setTimeTo] = useState(null)
+  const [dateWindow, setDateWindow] = usePreference('unifi-log-insight:map-date-window', { from: null, to: null }, isDateWindow)
+  const { from: timeFrom, to: timeTo } = dateWindow
+  const [initialCamera] = useState(() => readPreference('unifi-log-insight:map-camera', { center: [20, 20], zoom: 1.5, bearing: 0, pitch: 0 }, isMapCamera))
 
   const isCustomTime = !!(timeFrom || timeTo)
 
@@ -243,9 +247,17 @@ export default function ThreatMap({ maxFilterDays, flyTo, onFlyToDone }) {
     const map = new maplibregl.Map({
       container: mapContainer.current,
       style: getTheme() === 'dark' ? TILE_DARK : TILE_LIGHT,
-      center: [20, 20],
-      zoom: 1.5,
+      ...initialCamera,
       attributionControl: false,
+    })
+
+    map.on('moveend', () => {
+      const center = map.getCenter()
+      const camera = {
+        center: [((center.lng + 180) % 360 + 360) % 360 - 180, center.lat],
+        zoom: map.getZoom(), bearing: map.getBearing(), pitch: map.getPitch(),
+      }
+      if (isMapCamera(camera)) writePreference('unifi-log-insight:map-camera', camera)
     })
 
     map.addControl(new maplibregl.NavigationControl(), 'top-right')
@@ -524,7 +536,7 @@ export default function ThreatMap({ maxFilterDays, flyTo, onFlyToDone }) {
               <button
                 type="button"
                 key={tr}
-                onClick={() => { setTimeRange(tr); setTimeFrom(null); setTimeTo(null) }}
+                onClick={() => { setTimeRange(tr); setDateWindow({ from: null, to: null }) }}
                 aria-pressed={!isCustomTime && timeRange === tr}
                 className={`px-2.5 py-1 rounded text-xs font-medium transition-all ${
                   !isCustomTime && timeRange === tr ? 'bg-black text-white border border-gray-600' : 'text-gray-400 hover:text-gray-300 border border-transparent'
@@ -539,12 +551,10 @@ export default function ThreatMap({ maxFilterDays, flyTo, onFlyToDone }) {
               timeTo={timeTo}
               maxFilterDays={maxFilterDays}
               onApply={({ time_from, time_to }) => {
-                setTimeFrom(time_from)
-                setTimeTo(time_to)
+                setDateWindow({ from: time_from, to: time_to })
               }}
               onClear={() => {
-                setTimeFrom(null)
-                setTimeTo(null)
+                setDateWindow({ from: null, to: null })
                 setTimeRange('24h')
               }}
             />
@@ -555,8 +565,7 @@ export default function ThreatMap({ maxFilterDays, flyTo, onFlyToDone }) {
               type="button"
               onClick={() => {
                 setTimeRange('24h')
-                setTimeFrom(null)
-                setTimeTo(null)
+                setDateWindow({ from: null, to: null })
                 setMode('threats')
                 setView('heatmap')
               }}

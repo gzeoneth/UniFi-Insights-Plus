@@ -10,7 +10,7 @@ const rules = JSON.stringify([{ field: 'ip', operator: 'exclude', value: '198.51
 const filters = { time_range: '1h', filter_rules: rules, exclude_groups: '[]', rule_action: 'block', direction: 'inter_vlan' }
 const pair = { src_ip: '192.0.2.10', dst_ip: '203.0.113.20', dst_port: 443, protocol: 'TCP', service_name: 'HTTPS', block_count: 4 }
 beforeEach(() => {
-  vi.clearAllMocks(); sessionStorage.clear()
+  vi.clearAllMocks(); sessionStorage.clear(); localStorage.clear()
   Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
   fetchIPPairs.mockResolvedValue({ pairs: [pair] })
 })

@@ -2,6 +2,15 @@
 
 The changes were tested against the upstream v3.7.2 base using synthetic events and disposable local databases. No live collector, gateway or production database was modified for these checks.
 
+## Browser-preferences release: 3.7.2-gzeon.6
+
+- All 327 UI tests and the production UI build passed. This release changes browser state handling, documentation and version references; backend code and database schema are unchanged, so backend and container checks were not repeated.
+- Tests cover local persistence, migration from session storage, malformed and oversized values, unavailable storage, explicit drilldown precedence, custom dates, relative ranges, saved-view labels, view exclusions and per-view settings. Remembered filters are applied before the first query; result rows and pagination cursors are not restored.
+- A local browser using synthetic API fixtures retained Log Stream's IP exclusion, six-hour range, paused updates, 200-row page size and hidden country column after closing the tab and opening a new one. The export URL retained the same scope. Flow retained its selected tab, exclusion, expanded filter panel, matrix view and 50-pair limit across another tab closure.
+- Independent review found and fixed stale saved-view labels, legacy custom dates carrying a relative range, and invalid stored Rule Usage scopes. Shared filter validation enforces the backend's size and field limits.
+
+These browser checks verify persistence and request scope with fixtures, not live ingestion or production filtering. The release does not change gateway rules, collection, retention or server settings. See [browser preferences](browser-preferences.md) for the saved choices and their limits.
+
 ## Flow and query performance release: 3.7.2-gzeon.5
 
 - 1,264 backend tests passed with all disposable PostgreSQL checks enabled. All 275 UI tests, the production UI build and a local ARM64 image build passed. All 48 runtime receiver files matched the tested checkout by SHA-256.

@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import ExclusionProfiles, { EXCLUSION_DEFAULT_KEY, ExclusionCounts, ExclusionProfileProvider, ruleExclusionGroup, useExclusionProfile, validExclusionGroups } from '../components/ExclusionProfiles'
+import ExclusionProfiles, { EXCLUSION_DEFAULT_KEY, EXCLUSION_SELECTION_KEY, ExclusionCounts, ExclusionProfileProvider, ruleExclusionGroup, useExclusionProfile, validExclusionGroups } from '../components/ExclusionProfiles'
 import RuleUsage from '../components/RuleUsage'
 import SecuritySummary from '../components/SecuritySummary'
 import { apiFetch, createSavedView, deleteSavedView, fetchExclusionPreview, fetchSavedViews, fetchSecuritySummary } from '../api'
@@ -21,7 +21,7 @@ function Harness({ children }) {
 }
 
 beforeEach(() => {
-  vi.clearAllMocks(); localStorage.clear()
+  vi.clearAllMocks(); localStorage.clear(); sessionStorage.clear()
   fetchSavedViews.mockResolvedValue({ views: [profile, { id: 8, name: 'Other log view', filters: { view_type: 'logs' } }] })
   fetchExclusionPreview.mockResolvedValue(preview)
   apiFetch.mockResolvedValue({ data: [], notice: 'Observed events.', view_counts: preview.view_counts })
@@ -29,6 +29,49 @@ beforeEach(() => {
 })
 
 describe('exclusion profiles', () => {
+  it('remembers a previewed unsaved profile and Show all across browser sessions', async () => {
+    const first = render(<Harness />)
+    fireEvent.click(screen.getByText('Seed rule draft'))
+    fireEvent.click(screen.getByRole('button', { name: 'Preview matches' }))
+    await screen.findByLabelText('View event counts')
+    fireEvent.click(screen.getByRole('button', { name: 'Apply previewed profile' }))
+    expect(JSON.parse(localStorage.getItem(EXCLUSION_SELECTION_KEY)).groups).toEqual(groups)
+    fireEvent.click(screen.getByLabelText('Show all (ignore profile)'))
+    first.unmount(); sessionStorage.clear()
+    render(<Harness />)
+    await screen.findByRole('option', { name: 'Routine events' })
+    expect(screen.getByLabelText('Show all (ignore profile)')).toBeChecked()
+    expect(screen.getByTestId('applied-groups')).toHaveTextContent('none')
+    fireEvent.click(screen.getByLabelText('Show all (ignore profile)'))
+    expect(screen.getByTestId('applied-groups')).toHaveTextContent(JSON.stringify(groups))
+  })
+
+  it('reloads saved profiles by ID and leaves deleted definitions unapplied', async () => {
+    localStorage.setItem(EXCLUSION_SELECTION_KEY, JSON.stringify({ id: '7' }))
+    const first = render(<Harness />)
+    await waitFor(() => expect(screen.getByTestId('applied-groups')).toHaveTextContent(JSON.stringify(groups)))
+    first.unmount()
+    fetchSavedViews.mockResolvedValue({ views: [] })
+    render(<Harness />)
+    await screen.findByText(/profile is unavailable/)
+    expect(screen.getByTestId('applied-groups')).toHaveTextContent('none')
+  })
+
+  it('does not apply malformed stored exclusion conditions', async () => {
+    localStorage.setItem(EXCLUSION_SELECTION_KEY, JSON.stringify({ name: 'Bad profile', groups: [null] }))
+    render(<Harness />)
+    await screen.findByRole('option', { name: 'Routine events' })
+    expect(screen.getByTestId('applied-groups')).toHaveTextContent('none')
+  })
+
+  it('rejects a stored saved ID mixed with unvalidated local groups', async () => {
+    localStorage.setItem(EXCLUSION_SELECTION_KEY, JSON.stringify({ id: '7', groups: [null] }))
+    render(<Harness />)
+    expect(screen.getByTestId('applied-groups')).toHaveTextContent('none')
+    await screen.findByRole('option', { name: 'Routine events' })
+    expect(screen.getByTestId('applied-groups')).toHaveTextContent('none')
+  })
+
   it('does not display omitted profile counts as zero', () => {
     const { rerender } = render(<ExclusionCounts counts={null} unknown />)
     expect(screen.getByLabelText('View event counts')).toHaveTextContent('visible and hidden totals not counted')

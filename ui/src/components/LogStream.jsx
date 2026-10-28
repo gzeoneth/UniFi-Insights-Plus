@@ -1,9 +1,9 @@
 import { useExclusionProfile, ExclusionCounts } from './ExclusionProfiles'
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { fetchLogs, fetchLog, getExportUrl, fetchLogCountsByType } from '../api'
-import { TR_KEY } from '../utils'
+import { readPreference, writePreference, readTimeRange, writeTimeRange } from '../lib/preferences'
 import FilterBar from './FilterBar'
-import FieldFilters from './FieldFilters'
+import FieldFilters, { isValidFilterRules } from './FieldFilters'
 import LogTable from './LogTable'
 import Pagination from './Pagination'
 import { LOG_PRESETS, buildLogPresetFilters } from '../lib/logPresets'
@@ -28,6 +28,9 @@ const DEFAULT_FILTERS = {
   dst_port: null,
   src_port: null,
   protocol: null,
+  interface: null,
+  vpn_only: null,
+  threat_min: null,
   time_from: null,
   time_to: null,
   page: 1,
@@ -40,6 +43,8 @@ const STORAGE_KEY = 'unifi-log-insight:log-types'
 const ACTION_STORAGE_KEY = 'unifi-log-insight:rule-action'
 const DIRECTION_STORAGE_KEY = 'unifi-log-insight:direction'
 const COLUMNS_STORAGE_KEY = 'unifi-log-insight:hidden-columns'
+const FILTERS_STORAGE_KEY = 'unifi-log-insight:log-filters:v1'
+const REFRESH_STORAGE_KEY = 'unifi-log-insight:log-auto-refresh'
 const DNS_VIEW_CONTROLS = new Set(['log_type', 'time_range', 'time_from', 'time_to', 'page', 'per_page', 'sort', 'order'])
 
 const TOGGLEABLE_COLUMNS = [
@@ -51,25 +56,65 @@ const TOGGLEABLE_COLUMNS = [
   { key: 'categories', label: 'Categories' },
 ]
 
+const isRecord = value => value !== null && typeof value === 'object' && !Array.isArray(value)
+const isText = value => typeof value === 'string' && value.length <= 4096
+const SORT_FIELDS = new Set(['timestamp', 'log_type', 'src_ip', 'dst_ip', 'src_port', 'dst_port',
+  'protocol', 'service_name', 'direction', 'rule_action', 'rule_name', 'geo_country',
+  'threat_score', 'hostname', 'created_at'])
+const TEXT_FILTERS = ['log_type', 'rule_action', 'direction', 'ip', 'src_ip', 'dst_ip',
+  'rule_name', 'search', 'service', 'country', 'asn', 'dst_port', 'src_port', 'protocol', 'interface']
+
+// Only applied query preferences belong here. Response data and frozen cursors
+// must never survive a reload and masquerade as current results.
+function filterSnapshot(value) {
+  const result = {}
+  for (const key of TEXT_FILTERS) {
+    if (value[key] == null || isText(value[key])) result[key] = value[key] ?? null
+    else if (['dst_port', 'src_port'].includes(key) && Number.isInteger(value[key])) result[key] = String(value[key])
+  }
+  if (value.vpn_only == null || typeof value.vpn_only === 'boolean') result.vpn_only = value.vpn_only ?? null
+  if (value.threat_min == null || (Number.isInteger(value.threat_min) && value.threat_min >= 0 && value.threat_min <= 100)) result.threat_min = value.threat_min ?? null
+  if (SORT_FIELDS.has(value.sort)) result.sort = value.sort
+  if (['asc', 'desc'].includes(value.order)) result.order = value.order
+  result.per_page = logPageSize(value.per_page)
+  for (const key of ['time_from', 'time_to']) {
+    if (typeof value[key] === 'string' && value[key].length <= 64 && Number.isFinite(Date.parse(value[key]))) result[key] = value[key]
+  }
+  if (result.time_from && result.time_to && Date.parse(result.time_from) > Date.parse(result.time_to)) {
+    delete result.time_from; delete result.time_to
+  }
+  // The API gives explicit dates priority, including legacy saved views that
+  // also contain a relative range. Preserve that scope when restoring them.
+  if (result.time_from || result.time_to) result.time_range = null
+  try {
+    const rules = typeof value.filter_rules === 'string' ? JSON.parse(value.filter_rules) : value.filter_rules
+    if (isValidFilterRules(rules)) {
+      result.filter_rules = rules.length ? JSON.stringify(rules.map(({ field, operator, value }) => ({ field, operator, ...(value == null ? {} : { value }) }))) : null
+    }
+  } catch { /* Invalid stored filters do not prevent the page from opening. */ }
+  return result
+}
+
+function restoreFilters() {
+  const restored = { ...DEFAULT_FILTERS, time_range: readTimeRange() }
+  const saved = readPreference(FILTERS_STORAGE_KEY, null, isRecord)
+  if (saved) return { ...restored, ...filterSnapshot(saved) }
+  restored.per_page = logPageSize(readPreference(LOG_PAGE_SIZE_KEY, 50, value => typeof value === 'number' || typeof value === 'string'))
+  for (const [field, key] of [['log_type', STORAGE_KEY], ['rule_action', ACTION_STORAGE_KEY], ['direction', DIRECTION_STORAGE_KEY]]) {
+    restored[field] = readPreference(key, null, value => value === null || isText(value))
+  }
+  return restored
+}
+
 export default function LogStream({ version, latestRelease, maxFilterDays, drillFilters, onDrillConsumed, interfaces: prefetchedInterfaces, onPauseChange, uiSettings }) {
   const { excludeGroups, openDraft, setShowAll } = useExclusionProfile()
   const [filters, setFilters] = useState(() => {
-    const restored = { ...DEFAULT_FILTERS }
-    try {
-      restored.time_range = sessionStorage.getItem(TR_KEY) || '24h'
-      restored.per_page = logPageSize(localStorage.getItem(LOG_PAGE_SIZE_KEY))
-      const savedTypes = localStorage.getItem(STORAGE_KEY)
-      if (savedTypes) restored.log_type = savedTypes
-      const savedAction = localStorage.getItem(ACTION_STORAGE_KEY)
-      if (savedAction) restored.rule_action = savedAction
-      const savedDirection = localStorage.getItem(DIRECTION_STORAGE_KEY)
-      if (savedDirection) restored.direction = savedDirection
-    } catch (e) { /* private browsing */ }
+    const restored = restoreFilters()
     if (drillFilters) {
       return {
         ...DEFAULT_FILTERS,
         ...flowDrillScope(drillFilters),
-        time_range: drillFilters.time_range || restored.time_range,
+        time_range: (drillFilters.time_from || drillFilters.time_to) ? null : (drillFilters.time_range || restored.time_range || readTimeRange()),
         time_from: drillFilters.time_from || null,
         time_to: drillFilters.time_to || null,
         page: 1,
@@ -80,16 +125,11 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
     }
     return restored
   })
-  const [autoRefresh, setAutoRefresh] = useState(true)
+  const [autoRefresh, setAutoRefresh] = useState(() => readPreference(REFRESH_STORAGE_KEY, true, value => typeof value === 'boolean'))
   const [expandedId, setExpandedId] = useState(null)
   const [detailedLog, setDetailedLog] = useState(null)
-  const [hiddenColumns, setHiddenColumns] = useState(() => {
-    try {
-      const saved = localStorage.getItem(COLUMNS_STORAGE_KEY)
-      if (saved) return new Set(JSON.parse(saved))
-    } catch (e) { /* private browsing */ }
-    return new Set()
-  })
+  const [hiddenColumns, setHiddenColumns] = useState(() => new Set(readPreference(COLUMNS_STORAGE_KEY, [], value => Array.isArray(value)
+    && value.every(key => TOGGLEABLE_COLUMNS.some(column => column.key === key)))))
   const [showColumnsMenu, setShowColumnsMenu] = useState(false)
   const columnsMenuRef = useRef(null)
   const scrollRef = useRef(null)
@@ -119,7 +159,7 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
     setFilters(prev => ({
       ...DEFAULT_FILTERS,
       ...flowDrillScope(drillFilters),
-      time_range: drillFilters.time_range || prev.time_range,
+      time_range: (drillFilters.time_from || drillFilters.time_to) ? null : (drillFilters.time_range || prev.time_range || readTimeRange()),
       time_from: drillFilters.time_from || null,
       time_to: drillFilters.time_to || null,
       page: 1,
@@ -147,31 +187,12 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
   }, [])
 
 
-  // Persist filter toggles to localStorage
   useEffect(() => {
-    try { localStorage.setItem(LOG_PAGE_SIZE_KEY, String(filters.per_page)) } catch (e) { /* private browsing */ }
-  }, [filters.per_page])
-
-  useEffect(() => {
-    try {
-      if (filters.log_type) localStorage.setItem(STORAGE_KEY, filters.log_type)
-      else localStorage.removeItem(STORAGE_KEY)
-    } catch (e) { /* private browsing */ }
-  }, [filters.log_type])
-
-  useEffect(() => {
-    try {
-      if (filters.rule_action) localStorage.setItem(ACTION_STORAGE_KEY, filters.rule_action)
-      else localStorage.removeItem(ACTION_STORAGE_KEY)
-    } catch (e) { /* private browsing */ }
-  }, [filters.rule_action])
-
-  useEffect(() => {
-    try {
-      if (filters.direction) localStorage.setItem(DIRECTION_STORAGE_KEY, filters.direction)
-      else localStorage.removeItem(DIRECTION_STORAGE_KEY)
-    } catch (e) { /* private browsing */ }
-  }, [filters.direction])
+    writePreference(FILTERS_STORAGE_KEY, filterSnapshot(filters))
+    writePreference(LOG_PAGE_SIZE_KEY, filters.per_page)
+    if (filters.time_range) writeTimeRange(filters.time_range)
+  }, [filters])
+  useEffect(() => { writePreference(REFRESH_STORAGE_KEY, autoRefresh) }, [autoRefresh])
 
   // Persist hidden columns to localStorage
   const toggleColumn = (key) => {
@@ -179,7 +200,7 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
       const next = new Set(prev)
       if (next.has(key)) next.delete(key)
       else next.add(key)
-      try { localStorage.setItem(COLUMNS_STORAGE_KEY, JSON.stringify([...next])) } catch (e) { /* private browsing */ }
+      writePreference(COLUMNS_STORAGE_KEY, [...next])
       return next
     })
   }
@@ -265,11 +286,6 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
   const handleFilterChange = (newFilters) => {
     setExpandedId(null)
     setFilters({ ...newFilters, page: 1 })
-    // Persist time range within this session (shared across views via sessionStorage)
-    try {
-      if (newFilters.time_range) sessionStorage.setItem(TR_KEY, newFilters.time_range)
-      else sessionStorage.removeItem(TR_KEY)
-    } catch (e) { /* private browsing */ }
   }
 
   const handlePageChange = (page) => {

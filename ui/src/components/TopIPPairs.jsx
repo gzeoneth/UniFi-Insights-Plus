@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import usePreference from '../hooks/usePreference'
 import { fetchIPPairs } from '../api'
 import useFlowQuery from '../hooks/useFlowQuery'
 import { formatNumber, formatServiceName, resolveIpSublines } from '../utils'
@@ -6,6 +6,7 @@ import IPCell from './IPCell'
 import InfoTooltip from './InfoTooltip'
 import KebabMenu, { SaveLoadMenuItems } from './KebabMenu'
 import { exportCsv } from '../lib/exportCsv'
+import { FLOW_PAIR_LIMIT_KEY } from '../lib/flowPreferences'
 
 // Sankey node type → API param name mapping
 const SANKEY_PARAM_MAP = {
@@ -55,7 +56,7 @@ function TopIPPairsMenuItems({ onSaveView, onLoadView, savedViews, onDeleteView,
 // onIpClick(ip, rowIndex): rowIndex is used by FlowView's toggle logic:
 // clicking the same IP in the same row closes the panel, different row keeps it open.
 export default function TopIPPairs({ filters, refreshKey, sankeyFilter, onClearSankeyFilter, zoneFilter, onClearZoneFilter, onIpClick, onSaveView, onLoadView, savedViews, onDeleteView, onRefreshViews, deferFetch }) {
-  const [limit, setLimit] = useState(25)
+  const [limit, setLimit] = usePreference(FLOW_PAIR_LIMIT_KEY, 25, value => [10, 25, 50, 100].includes(value))
   const params = { ...filters }
   if (sankeyFilter) params[SANKEY_PARAM_MAP[sankeyFilter.type] || sankeyFilter.type] = sankeyFilter.value
   if (zoneFilter) {
@@ -94,6 +95,7 @@ export default function TopIPPairs({ filters, refreshKey, sankeyFilter, onClearS
         <div className="flex items-center gap-2">
           <label className="text-xs text-gray-500">Show</label>
           <select
+            aria-label="Number of IP pairs"
             value={limit}
             onChange={e => setLimit(Number(e.target.value))}
             className="bg-black text-gray-300 text-xs rounded px-1.5 py-0.5 border border-gray-700 focus:outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20"

@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { fetchUiSettings, updateUiSettings } from '../api'
+import { readPreference, writeTextPreference } from '../lib/preferences'
 
 const COUNTRY_OPTIONS = [
   { value: 'flag_name', label: 'Flag + Country Code' },
@@ -27,7 +28,7 @@ export default function SettingsUserInterface({ onSaved }) {
     fetchUiSettings().then(data => {
       // Seed theme from the active localStorage value so saving non-theme
       // settings doesn't accidentally overwrite the user's current theme
-      const activeTheme = localStorage.getItem('ui_theme')
+      const activeTheme = readPreference('ui_theme', null, value => ['light', 'dark'].includes(value))
       if (activeTheme && activeTheme !== data.ui_theme) {
         data.ui_theme = activeTheme
       }
@@ -50,7 +51,7 @@ export default function SettingsUserInterface({ onSaved }) {
     try {
       await updateUiSettings(settings)
       if (settings.ui_theme) {
-        localStorage.setItem('ui_theme', settings.ui_theme)
+        writeTextPreference('ui_theme', settings.ui_theme)
         document.documentElement.setAttribute('data-theme', settings.ui_theme)
       }
       setDirty(false)

@@ -1,53 +1,56 @@
 import { useEffect, useState } from 'react'
 import { createSavedView, deleteSavedView, fetchSavedViews } from '../api'
 import { logFilterFingerprint } from '../lib/logPresets'
+import { readPreference, writePreference } from '../lib/preferences'
 
-export const FILTER_FIELDS = [
-  ['ip', 'Either IP / subnet'], ['src_ip', 'Source IP / subnet'], ['dst_ip', 'Destination IP / subnet'],
-  ['remote_ip', 'Remote IP / subnet'], ['port', 'Either port / range'], ['src_port', 'Source port / range'], ['dst_port', 'Destination port / range'],
-  ['protocol', 'Protocol'], ['log_type', 'Log type'], ['direction', 'Direction'], ['rule_action', 'Action'],
-  ['rule_name', 'Rule name'], ['device', 'Either recorded device name'], ['src_device', 'Recorded source device name'],
-  ['dst_device', 'Recorded destination device name'], ['country', 'Country code'], ['asn', 'ASN name'],
-  ['service', 'Service'], ['interface', 'Either interface'], ['interface_in', 'Inbound interface'], ['interface_out', 'Outbound interface'], ['hostname', 'Hostname'], ['search', 'Raw message'],
-  ['event_source', 'Event source'], ['source', 'Collector source'], ['ips_signature', 'IPS signature'],
-  ['security_event', 'Security classification'],
-  ['ips_signature_id', 'IPS signature ID'], ['ips_risk', 'IPS risk'], ['ips_severity', 'IPS severity (0–10)'],
-  ['threat_score', 'IP reputation (0–100)'],
-]
-
-export function readFilterRules(value) {
-  try { const rules = typeof value === 'string' ? JSON.parse(value) : value; return Array.isArray(rules) ? rules : [] }
-  catch { return [] }
-}
+import { FILTER_FIELDS, readFilterRules, isValidFilterRules } from '../lib/fieldFilterRules'
+export { FILTER_FIELDS, readFilterRules, isValidFilterRules } from '../lib/fieldFilterRules'
 
 const style = 'bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-sm text-gray-200'
+const VIEW_SELECTION_KEY = 'unifi-log-insight:log-view-selection'
+const validSelection = value => value && typeof value === 'object' && !Array.isArray(value)
+  && typeof value.selected === 'string' && value.selected.length <= 128
+  && typeof value.fingerprint === 'string' && value.fingerprint.length <= 32768
 
-export default function FieldFilters({ filters, onChange, savedViews = true, presets = [], onPresetSelect, profileApplied = false }) {
+export default function FieldFilters({ filters, onChange, savedViews = true, presets = [], onPresetSelect, profileApplied = false, selectionStorageKey = VIEW_SELECTION_KEY }) {
   const [rules, setRules] = useState(() => readFilterRules(filters.filter_rules))
   const [views, setViews] = useState([])
   const [name, setName] = useState('')
-  const [selected, setSelected] = useState('')
-  const [presetSnapshot, setPresetSnapshot] = useState(null)
+  const [initialSelection] = useState(() => savedViews ? readPreference(selectionStorageKey, null, validSelection) : null)
+  const [selected, setSelected] = useState(initialSelection?.selected || '')
+  const [viewSnapshot, setViewSnapshot] = useState(initialSelection?.fingerprint || null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const selectedPreset = presets.find(preset => selected === `builtin:${preset.id}`)
-  const presetCurrent = selectedPreset && presetSnapshot === logFilterFingerprint(filters) && (!selectedPreset.bypassProfile || !profileApplied)
+  const fingerprint = logFilterFingerprint(filters)
+  const selectionCurrent = selected && viewSnapshot === fingerprint && (!selectedPreset?.bypassProfile || !profileApplied)
+  const presetCurrent = selectedPreset && selectionCurrent
+  useEffect(() => {
+    if (!savedViews) return
+    writePreference(selectionStorageKey, { selected: selectionCurrent ? selected : '', fingerprint: selectionCurrent ? fingerprint : '' })
+  }, [savedViews, selectionCurrent, selected, fingerprint, selectionStorageKey])
   useEffect(() => setRules(readFilterRules(filters.filter_rules)), [filters.filter_rules])
   const reloadViews = async () => {
     const result = await fetchSavedViews()
     setViews((result.views || []).filter(view => view.filters?.view_type === 'logs'))
   }
   useEffect(() => { if (savedViews) reloadViews().catch(e => setError(e.message)) }, [savedViews])
-  const valid = rules.length <= 24 && rules.every(rule => ['present', 'missing'].includes(rule.operator) || rule.value?.trim())
+  const valid = isValidFilterRules(rules)
   const update = (index, patch) => setRules(current => current.map((rule, i) => i === index ? { ...rule, ...patch } : rule))
   const apply = () => onChange({ ...filters, filter_rules: rules.length ? JSON.stringify(rules) : null, page: 1 })
   const save = async () => {
     if (!name.trim() || !valid) return
     setBusy(true); setError('')
     try {
-      const { page, per_page, sort, order, ...snapshot } = filters
-      await createSavedView(name.trim(), { ...snapshot, view_type: 'logs', filter_rules: rules, time_range: filters.time_range || '24h' })
-      apply(); setName(''); await reloadViews()
+      const next = { ...filters, filter_rules: rules.length ? JSON.stringify(rules) : null, page: 1,
+        time_range: (filters.time_from || filters.time_to) ? null : (filters.time_range || '24h') }
+      const { page, per_page, sort, order, ...snapshot } = next
+      const result = await createSavedView(name.trim(), { ...snapshot, view_type: 'logs', filter_rules: rules })
+      if (result.id != null) {
+        setSelected(String(result.id))
+        setViewSnapshot(logFilterFingerprint(next))
+      }
+      onChange(next); setName(''); await reloadViews()
     } catch (e) { setError(e.message) } finally { setBusy(false) }
   }
   return <section className="rounded-lg border border-gray-800 bg-gray-900/40 p-3 space-y-3" aria-label="Include and exclude filters">
@@ -73,20 +76,26 @@ export default function FieldFilters({ filters, onChange, savedViews = true, pre
     </div>
     <p className="text-xs text-gray-500">IP fields accept exact addresses or CIDRs. Ports accept values such as 443,8000-8100. Names match literal text; protocol, country and action match complete values.</p>
     {savedViews && <div className="flex flex-wrap gap-2 border-t border-gray-800 pt-3">
-      <select className={style} aria-label={presets.length ? 'Log view' : 'Saved log view'} value={selectedPreset && !presetCurrent ? '' : selected} onChange={e => {
+      <select className={style} aria-label={presets.length ? 'Log view' : 'Saved log view'} value={selectionCurrent ? selected : ''} onChange={e => {
         setSelected(e.target.value)
         const preset = presets.find(item => e.target.value === `builtin:${item.id}`)
-        if (preset) { const next = onPresetSelect?.(preset); setPresetSnapshot(next ? logFilterFingerprint(next) : null); return }
-        setPresetSnapshot(null)
+        if (preset) { const next = onPresetSelect?.(preset); setViewSnapshot(next ? logFilterFingerprint(next) : null); return }
+        setViewSnapshot(null)
         const view = views.find(v => String(v.id) === e.target.value)
-        if (view) { const { view_type, ...rest } = view.filters; onChange({ ...rest, filter_rules: JSON.stringify(readFilterRules(rest.filter_rules)), page: 1, per_page: filters.per_page || 50 }) }
+        if (view) {
+          const { view_type, ...rest } = view.filters
+          const next = { ...rest, filter_rules: JSON.stringify(readFilterRules(rest.filter_rules)), page: 1, per_page: filters.per_page || 50 }
+          if (next.time_from || next.time_to) next.time_range = null
+          setViewSnapshot(logFilterFingerprint(next))
+          onChange(next)
+        }
       }}><option value="">{presets.length ? 'Choose log view' : 'Saved log views'}</option>
         {presets.length > 0 && <optgroup label="Built-in">{presets.map(preset => <option key={preset.id} value={`builtin:${preset.id}`}>{preset.name}</option>)}</optgroup>}
         <optgroup label="Saved">{views.map(view => <option key={view.id} value={view.id}>{view.name}</option>)}</optgroup>
       </select>
       <input className={style} aria-label="New view name" value={name} maxLength={100} onChange={e => setName(e.target.value)} placeholder="Name this view" />
       <button className={style} type="button" disabled={busy || !valid || !name.trim()} onClick={save}>Save view</button>
-      {selected && !selectedPreset && <button className={style} type="button" disabled={busy} onClick={async () => {
+      {selectionCurrent && !selectedPreset && <button className={style} type="button" disabled={busy} onClick={async () => {
         setBusy(true); setError(''); try { await deleteSavedView(selected); setSelected(''); await reloadViews() } catch (e) { setError(e.message) } finally { setBusy(false) }
       }}>Delete saved view</button>}
     </div>}

@@ -10,6 +10,7 @@ import SettingsAPI from './SettingsAPI'
 import SettingsIntegrations from './SettingsIntegrations'
 import SetupWizard from './SetupWizard'
 import ReleaseNotesModal, { isNewerVersion } from './ReleaseNotesModal'
+import { readPreference, writePreference } from '../lib/preferences'
 
 function getVlanId(iface) {
   if (iface === 'br0') return 1
@@ -97,7 +98,9 @@ export default function SettingsOverlay({ onClose, startInReconfig, initialSecti
   const [config, setConfig] = useState(null)
   const [unifiSettings, setUnifiSettings] = useState(null)
   const [netConfig, setNetConfig] = useState(null)
-  const [activeSection, setActiveSection] = useState(initialSection || 'wan-networks')
+  const [activeSection, setActiveSection] = useState(() => initialSection || readPreference(
+    'unifi-log-insight:settings-section', 'wan-networks', value => BASE_SECTIONS.some(section => section.id === value)))
+  useEffect(() => { writePreference('unifi-log-insight:settings-section', activeSection) }, [activeSection])
   const [reconfigMode, setReconfigMode] = useState(!!startInReconfig)
   const [wizardPath, setWizardPath] = useState(null)
   const [showNotes, setShowNotes] = useState(false)

@@ -9,7 +9,7 @@ vi.mock('../api', () => ({
 vi.mock('../components/FilterBar', () => ({ default: ({ filters, onChange }) => <>
   <input aria-label="Source IP" value={filters.src_ip || ''} onChange={e => onChange({ ...filters, src_ip: e.target.value })} />
 </> }))
-vi.mock('../components/FieldFilters', () => ({ default: () => null, FILTER_FIELDS: [] }))
+vi.mock('../components/FieldFilters', async importOriginal => ({ ...await importOriginal(), default: () => null }))
 vi.mock('../components/LogTable', () => ({ default: ({ logs, loading, onToggleExpand }) => <div>
   <output data-testid="rows">{loading ? 'Loading' : logs.map(row => row.id).join(',')}</output>
   <button onClick={() => onToggleExpand('row-a')}>Toggle detail</button>

@@ -8,8 +8,8 @@ vi.mock('maplibre-gl', () => ({ default: {
   setWorkerUrl() {}, NavigationControl: class {}, AttributionControl: class {},
   Popup: class { remove() {} },
   Map: class {
-    constructor() { this.source = null; this.layers = new Set(); maps.push(this) }
-    on() {} once() {} off() {} addControl() {} remove() {} triggerRepaint() {}
+    constructor(options) { this.options = options; this.source = null; this.layers = new Set(); this.handlers = {}; maps.push(this) }
+    on(event, handler) { if (typeof handler === 'function') this.handlers[event] = handler } once() {} off() {} addControl() {} remove() {} triggerRepaint() {}
     isStyleLoaded() { return true }
     getSource() { return this.source }
     addSource(_id, value) { this.source = value }
@@ -18,6 +18,10 @@ vi.mock('maplibre-gl', () => ({ default: {
     addLayer(layer) { this.layers.add(layer.id) }
     removeLayer(id) { this.layers.delete(id) }
     setLayoutProperty() {}
+    getCenter() { return { lng: 25, lat: 35 } }
+    getZoom() { return 4 }
+    getBearing() { return 10 }
+    getPitch() { return 20 }
   },
 } }))
 vi.mock('../api', () => ({ fetchThreatGeo: vi.fn() }))
@@ -30,7 +34,7 @@ const visible = value => {
   Object.defineProperty(document, 'visibilityState', { configurable: true, value })
   fireEvent(document, new Event('visibilitychange'))
 }
-beforeEach(() => { vi.clearAllMocks(); vi.useFakeTimers(); localStorage.clear(); maps.length = 0; visible('visible') })
+beforeEach(() => { vi.clearAllMocks(); vi.useFakeTimers(); localStorage.clear(); sessionStorage.clear(); maps.length = 0; visible('visible') })
 afterEach(() => { cleanup(); vi.useRealTimers() })
 
 describe('Threat Map queries', () => {
@@ -62,3 +66,31 @@ describe('Threat Map queries', () => {
     expect(screen.queryByRole('alert')).toBeNull()
   })
 })
+
+  it('restores map filters, custom dates, display mode and camera after reopening', async () => {
+    fetchThreatGeo.mockResolvedValue(data)
+    localStorage.setItem('unifi-log-insight:map-date-window', JSON.stringify({ from: '2026-01-01T10:00:00Z', to: '2026-01-01T11:00:00Z' }))
+    const first = render(<ThreatMap />); await flush()
+    fireEvent.click(screen.getByRole('button', { name: 'Blocked Outbound' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Clusters' }))
+    fireEvent.click(screen.getByRole('button', { name: /Filters/ }))
+    maps[0].handlers.moveend()
+    await flush(); first.unmount(); sessionStorage.clear(); fetchThreatGeo.mockClear()
+    render(<ThreatMap />); await flush()
+    expect(fetchThreatGeo.mock.calls[0][0]).toEqual({ time_range: null, time_from: '2026-01-01T10:00:00Z', time_to: '2026-01-01T11:00:00Z', mode: 'blocked_outbound' })
+    expect(screen.getByRole('button', { name: 'Clusters' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name: /Filters/ })).toHaveAttribute('aria-expanded', 'true')
+    expect(maps[1].options).toMatchObject({ center: [25, 35], zoom: 4, bearing: 10, pitch: 20 })
+    fireEvent.click(screen.getByRole('button', { name: '24h' })); await flush()
+    expect(fetchThreatGeo.mock.lastCall[0]).toMatchObject({ time_range: '24h', time_from: null, time_to: null })
+  })
+
+  it('discards invalid map preferences before requesting data', async () => {
+    fetchThreatGeo.mockResolvedValue(data)
+    localStorage.setItem('unifi-log-insight:map-mode', JSON.stringify(['blocked_outbound']))
+    localStorage.setItem('unifi-log-insight:map-date-window', JSON.stringify({ from: 'not a date', to: null }))
+    localStorage.setItem('unifi-log-insight:map-camera', JSON.stringify({ center: [900, 900], zoom: 999 }))
+    render(<ThreatMap />); await flush()
+    expect(fetchThreatGeo.mock.calls[0][0]).toMatchObject({ time_range: '24h', time_from: null, time_to: null, mode: 'threats' })
+    expect(maps[0].options).toMatchObject({ center: [20, 20], zoom: 1.5 })
+  })

@@ -1,8 +1,11 @@
 import { createContext, useContext, useEffect, useRef, useState } from 'react'
 import { createSavedView, deleteSavedView, fetchSavedViews, fetchExclusionPreview } from '../api'
-import { FILTER_FIELDS } from './FieldFilters'
+import { FILTER_FIELDS, isValidFilterRules } from './FieldFilters'
+import { readPreference, writePreference } from '../lib/preferences'
+import usePreference from '../hooks/usePreference'
 
 export const EXCLUSION_DEFAULT_KEY = 'unifi-log-insight:exclusion-default'
+export const EXCLUSION_SELECTION_KEY = 'unifi-log-insight:exclusion-selection'
 const ExclusionContext = createContext({ excludeGroups: null, openDraft: () => {}, activeName: null })
 const style = 'bg-gray-950 border border-gray-700 rounded px-2 py-1.5 text-sm text-gray-200 disabled:opacity-40'
 const fields = [
@@ -16,12 +19,10 @@ export function validExclusionGroups(groups) {
   return Array.isArray(groups) && groups.length > 0 && groups.length <= 12
     && JSON.stringify(groups).length <= 16384
     && groups.reduce((n, g) => n + (g?.conditions?.length || 0), 0) <= 48
-    && groups.every(g => g && (g.name === undefined || (typeof g.name === 'string' && g.name.length <= 100))
+    && groups.every(g => g && Object.keys(g).every(key => ['name', 'conditions'].includes(key))
+      && (g.name === undefined || (typeof g.name === 'string' && g.name.length <= 100))
       && Array.isArray(g.conditions) && g.conditions.length > 0 && g.conditions.length <= 8
-      && g.conditions.every(c => c && fields.some(([f]) => f === c.field)
-        && ['include', 'exclude', 'present', 'missing'].includes(c.operator)
-        && (['present', 'missing'].includes(c.operator)
-          || (typeof c.value === 'string' && c.value.trim().length > 0 && c.value.length <= 1024))))
+      && isValidFilterRules(g.conditions))
 }
 
 export function ruleExclusionGroup(row) {
@@ -51,10 +52,25 @@ function storedDefault() {
   try { return localStorage.getItem(EXCLUSION_DEFAULT_KEY) || '' } catch { return '' }
 }
 
+function readSelection() {
+  return readPreference(EXCLUSION_SELECTION_KEY, undefined, value => value === null
+    || (value && typeof value === 'object' && !Array.isArray(value)
+      && ((Object.keys(value).length === 1 && typeof value.id === 'string' && /^\d{1,20}$/.test(value.id))
+        || (Object.keys(value).every(key => ['name', 'groups'].includes(key))
+          && typeof value.name === 'string' && value.name.length <= 100 && validExclusionGroups(value.groups)))))
+}
+
+function unsavedSelection(value) {
+  return value?.groups ? { name: value.name, filters: { view_type: 'exclusions', exclude_groups: value.groups } } : null
+}
+
 export function ExclusionProfileProvider({ children }) {
   const [profiles, setProfiles] = useState([])
-  const [active, setActive] = useState(null)
-  const [showAll, setShowAll] = useState(false)
+  const [initialSelection] = useState(readSelection)
+  const [active, setActive] = useState(() => unsavedSelection(initialSelection))
+  const activeRef = useRef(active)
+  activeRef.current = active
+  const [showAll, setShowAll] = usePreference('unifi-log-insight:exclusions-show-all', false, value => typeof value === 'boolean')
   const [defaultId, setDefaultId] = useState(storedDefault)
   const defaultIdRef = useRef(defaultId)
   const [editor, setEditor] = useState(null)
@@ -68,20 +84,33 @@ export function ExclusionProfileProvider({ children }) {
       if (cancelled) return
       const profiles = (result.views || []).filter(v => v.filters?.view_type === 'exclusions')
       if (listRevision.current === list) setProfiles(profiles)
-      const id = storedDefault()
+      const id = initialSelection === undefined ? storedDefault() : initialSelection?.id
       if (id && selectionRevision.current === selection) {
         const profile = profiles.find(v => String(v.id) === id)
-        if (profile && validExclusionGroups(profile.filters.exclude_groups)) setActive(profile)
+        if (profile && validExclusionGroups(profile.filters.exclude_groups)) { activeRef.current = profile; setActive(profile) }
         else setError('The browser default profile is unavailable. Showing all events.')
       }
     }).catch(e => {
       if (!cancelled && selectionRevision.current === selection && listRevision.current === list) {
-        setError(`Could not load exclusion profiles: ${e.message}. Showing all events.`)
+        setError(initialSelection?.groups
+          ? `Could not refresh saved profiles: ${e.message}. Your applied browser profile remains active.`
+          : `Could not load exclusion profiles: ${e.message}. Showing all events.`)
       }
     })
     return () => { cancelled = true }
   }, [])
-  const chooseProfile = value => { selectionRevision.current++; setActive(value) }
+  const chooseProfile = value => {
+    selectionRevision.current++
+    const next = typeof value === 'function' ? value(activeRef.current) : value
+    activeRef.current = next
+    setActive(next)
+    // Saved definitions are loaded fresh by ID. An applied unsaved profile is a
+    // user filter choice; retain its conditions without saving a server record.
+    const selection = next?.id ? { id: String(next.id) }
+      : next && validExclusionGroups(next.filters?.exclude_groups)
+        ? { name: next.name.slice(0, 100), groups: next.filters.exclude_groups } : null
+    writePreference(EXCLUSION_SELECTION_KEY, selection)
+  }
   const updateProfiles = value => { listRevision.current++; setProfiles(value) }
   const rememberDefault = id => {
     try {
@@ -105,7 +134,7 @@ export function ExclusionProfileProvider({ children }) {
 
 export default function ExclusionProfiles({ activeTab }) {
   const ctx = useExclusionProfile()
-  const [selected, setSelected] = useState('')
+  const [selected, setSelected] = usePreference('unifi-log-insight:exclusion-picker', '', value => typeof value === 'string' && /^\d*$/.test(value))
   const [busy, setBusy] = useState(false)
   const supported = ['logs', 'flow-view', 'dashboard', 'operations'].includes(activeTab)
   if (!supported) return null

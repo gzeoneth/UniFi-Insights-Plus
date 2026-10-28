@@ -12,7 +12,7 @@ vi.mock('../api', () => ({
   fetchLogs: vi.fn(), fetchLog: vi.fn(), fetchLogCountsByType: vi.fn(), getExportUrl: () => '/api/export',
 }))
 vi.mock('../components/FilterBar', () => ({ default: () => null }))
-vi.mock('../components/FieldFilters', () => ({ default: () => null, FILTER_FIELDS: [] }))
+vi.mock('../components/FieldFilters', async importOriginal => ({ ...await importOriginal(), default: () => null }))
 vi.mock('../components/LogTable', () => ({ default: () => null }))
 
 const rules = [{ field: 'ip', operator: 'exclude', value: '198.51.100.0/24' }]

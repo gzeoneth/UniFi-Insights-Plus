@@ -1,4 +1,6 @@
-import React, { useState, useEffect, useMemo } from 'react'
+import React, { useState, useEffect, useMemo, useRef } from 'react'
+import usePreference from '../hooks/usePreference'
+import { isRecord, isShortText, isBooleanRecord } from '../lib/viewPreferences'
 import { fetchFirewallPolicies, patchFirewallPolicy, bulkUpdateFirewallLoggingStream } from '../api'
 import { isControllablePolicy, isPostureCandidate, IDLESS_DOCS_URL, SYSLOG_DELAY_WARNING } from '../lib/firewallPolicyLogging'
 import SyslogToggle from './SyslogToggle'
@@ -649,21 +651,36 @@ export default function FirewallRules() {
   const [bulkAction, setBulkAction] = useState(null)
   const [pendingBulk, setPendingBulk] = useState(null) // { enableAll, eligible }
   const [bulkProgress, setBulkProgress] = useState(null) // { completed, total, success, failed, phase, eta }
-  const [selectedCell, setSelectedCell] = useState(null)
-  const [filters, setFilters] = useState({
+  const [selectedCell, setSelectedCell] = usePreference('unifi-log-insight:firewall-zone-pair', null,
+    value => value === null || (isRecord(value) && Object.keys(value).every(key => ['srcZoneId', 'dstZoneId'].includes(key)) && isShortText(value.srcZoneId) && isShortText(value.dstZoneId)))
+  const [filters, setFilters] = usePreference('unifi-log-insight:firewall-filters', {
     ipv4: true, ipv6: true, builtIn: true, custom: true, inUse: true, paused: true,
-  })
-  const [expandedGroups, setExpandedGroups] = useState(new Set())
+  }, value => isBooleanRecord(value, ['ipv4', 'ipv6', 'builtIn', 'custom', 'inUse', 'paused']))
+  const [expandedNames, setExpandedNames] = usePreference('unifi-log-insight:firewall-expanded-groups', [],
+    value => Array.isArray(value) && value.length <= 500 && value.every(isShortText))
+  const expandedGroups = useMemo(() => new Set(expandedNames), [expandedNames])
+  const scope = JSON.stringify([selectedCell, filters])
+  const previousScope = useRef(scope)
 
   function toggleGroup(name) {
-    setExpandedGroups(prev => {
+    setExpandedNames(prev => {
       const next = new Set(prev)
       next.has(name) ? next.delete(name) : next.add(name)
-      return next
+      return [...next]
     })
   }
 
-  useEffect(() => setExpandedGroups(new Set()), [selectedCell, filters])
+  useEffect(() => {
+    if (scope !== previousScope.current) setExpandedNames([])
+    previousScope.current = scope
+  }, [scope, setExpandedNames])
+
+  useEffect(() => {
+    if (!data?.zones || !selectedCell) return
+    if (![selectedCell.srcZoneId, selectedCell.dstZoneId].every(id => data.zones.some(zone => zone.id === id))) {
+      setSelectedCell(null)
+    }
+  }, [data, selectedCell, setSelectedCell])
 
   useEffect(() => { loadPolicies() }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
