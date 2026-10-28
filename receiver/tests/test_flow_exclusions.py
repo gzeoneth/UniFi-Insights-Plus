@@ -37,6 +37,11 @@ def _load_flows(monkeypatch, connection):
     monkeypatch.setattr(module, 'annotate_ip', lambda cfg, ip, name: (name, None, None))
     app = FastAPI()
     app.include_router(module.router)
+    monkeypatch.delitem(sys.modules, 'routes.stats', raising=False)
+    stats_module = importlib.import_module('routes.stats')
+    monkeypatch.setattr(stats_module, 'load_identity_config', lambda *args: {})
+    monkeypatch.setattr(stats_module, 'annotate_record', lambda *args: None)
+    app.include_router(stats_module.router)
     return TestClient(app), module, deps
 
 
@@ -102,7 +107,7 @@ def pg_flows(monkeypatch):
             rule_name TEXT, rule_desc TEXT, rule_action TEXT, hostname TEXT,
             interface_in TEXT, interface_out TEXT, service_name TEXT,
             direction TEXT, asn_name TEXT, rdns TEXT,
-            event_source TEXT, ips_signature_id TEXT, raw_log TEXT)''')
+            event_source TEXT, ips_signature_id TEXT, raw_log TEXT, threat_score INTEGER)''')
         cur.execute('''CREATE TEMP TABLE unifi_clients (
             ip INET, device_name TEXT, hostname TEXT, oui TEXT,
             network TEXT, vlan INTEGER, mac TEXT, last_seen TIMESTAMPTZ)''')
@@ -126,10 +131,11 @@ def pg_flows(monkeypatch):
         cur.execute('''INSERT INTO logs
             SELECT 7,'2020-01-01T00:00:00Z',log_type,src_ip,dst_ip,protocol,dst_port,
                    rule_name,rule_desc,rule_action,hostname,interface_in,interface_out,
-                   service_name,direction,asn_name,rdns,event_source,ips_signature_id,raw_log
+                   service_name,direction,asn_name,rdns,event_source,ips_signature_id,raw_log,threat_score
             FROM logs WHERE id=3''')
     connection.commit()
     client, _, _ = _load_flows(monkeypatch, connection)
+    client.synthetic_connection = connection
     yield client
     connection.close()
 
@@ -174,3 +180,67 @@ def test_empty_profile_and_broad_profile_preserve_security_records(pg_flows, gro
     response = pg_flows.get('/api/flows/zone-matrix', params=_flow_params(groups))
     assert response.status_code == 200
     assert sum(cell['total'] for cell in response.json()['cells']) == expected
+
+
+@pytest.mark.parametrize('excluded,expected', [('198.51.100.20', 1), ('198.51.100.0/24', 0)])
+def test_exclude_host_matches_graph_matrix_pairs_csv_and_drilldown(pg_flows, excluded, expected):
+    import csv
+    import io
+    filters = [*FILTERS, {'field': 'ip', 'operator': 'exclude', 'value': excluded}]
+    params = {**BOUNDS, 'filter_rules': json.dumps(filters)}
+    graph = pg_flows.get('/api/flows/graph', params=params)
+    matrix = pg_flows.get('/api/flows/zone-matrix', params=params)
+    pairs = pg_flows.get('/api/stats/ip-pairs', params=params)
+    exported = pg_flows.get('/api/stats/ip-pairs/csv', params=params)
+    detail = pg_flows.get('/api/flows/host-detail', params={**params, 'ip': '192.0.2.10'})
+    for response in (graph, matrix, pairs, exported, detail):
+        assert response.status_code == 200, response.text
+    assert sum(node['value'] for node in graph.json()['nodes'] if node['type'] == 'src_ip') == expected
+    assert sum(cell['total'] for cell in matrix.json()['cells']) == expected
+    assert sum(pair['total_count'] for pair in pairs.json()['pairs']) == expected
+    rows = list(csv.DictReader(io.StringIO(exported.text)))
+    assert sum(int(row['allow_count']) + int(row['block_count']) for row in rows) == expected
+    assert detail.json()['summary']['total_events'] == expected
+
+
+@pytest.mark.parametrize('path', ['/api/stats/ip-pairs', '/api/stats/ip-pairs/csv'])
+def test_invalid_pair_filters_fail_before_database_access(flow_client, path):
+    client, _, deps, _ = flow_client
+    response = client.get(path, params={'filter_rules': json.dumps([
+        {'field': 'ip', 'operator': 'exclude', 'value': 'not-an-address'}])})
+    assert response.status_code == 400
+    deps.get_conn.assert_not_called()
+
+
+def test_saved_flow_filters_validate_same_conditions():
+    from query_helpers import validate_view_filters
+    base = {'dims': ['src_ip', 'dst_port', 'dst_ip'], 'topN': 15,
+            'activeActions': ['allow', 'block'], 'activeDirections': ['outbound'],
+            'filter_rules': [{'field': 'ip', 'operator': 'exclude', 'value': '192.0.2.0/24'}]}
+    assert validate_view_filters(base) is None
+    assert validate_view_filters({**base, 'filter_rules': [
+        {'field': 'ip', 'operator': 'exclude', 'value': 'invalid'}]}) is not None
+    assert validate_view_filters({**base, 'filter_rules': '[]'}) == 'filter_rules must be an array'
+    assert validate_view_filters({**base, 'exclude_groups': EXCLUSIONS}) is None
+    assert validate_view_filters({**base, 'exclude_groups': [{'conditions': []}]}) is not None
+
+
+def test_zone_pair_count_preserves_null_and_host_address_semantics(pg_flows):
+    connection = pg_flows.synthetic_connection
+    with connection.cursor() as cursor:
+        cursor.execute('DELETE FROM logs')
+        cursor.executemany("""INSERT INTO logs
+            (id,timestamp,log_type,src_ip,dst_ip,interface_in,interface_out)
+            VALUES (%s,'2026-01-02T12:00:00Z','firewall',%s,%s,'br-example','eth-example')""", [
+            (1, '192.0.2.1/24', '198.51.100.2/24'),
+            (2, '192.0.2.1/32', '198.51.100.2/32'),
+            (3, '2001:db8::1/48', '2001:db8:1::2/64'),
+            (4, '2001:db8::1/128', '2001:db8:1::2/128'),
+            (5, None, '198.51.100.2'),
+            (6, '192.0.2.1', None),
+        ])
+    connection.commit()
+    response = pg_flows.get('/api/flows/zone-matrix', params=BOUNDS)
+    assert response.status_code == 200
+    assert response.json()['cells'][0]['unique_pairs'] == 2
+    assert response.json()['cells'][0]['total'] == 6

@@ -25,6 +25,7 @@ WHERE c.relname = 'logs' AND n.nspname = 'public';
 
 SELECT ci.relname AS index_name, i.indisvalid, i.indisready,
        pg_size_pretty(pg_relation_size(ci.oid)) AS index_size,
+       pg_get_indexdef(ci.oid) AS index_definition,
        s.idx_scan, s.idx_tup_read, s.idx_tup_fetch
 FROM pg_index i
 JOIN pg_class ct ON ct.oid = i.indrelid
@@ -33,6 +34,13 @@ JOIN pg_class ci ON ci.oid = i.indexrelid
 LEFT JOIN pg_stat_user_indexes s ON s.indexrelid = ci.oid
 WHERE ct.relname = 'logs' AND n.nspname = 'public'
 ORDER BY ci.relname;
+
+-- Distribution estimates help explain whether a narrow filter can use an
+-- index effectively. Do not print most-common values or histogram payloads.
+SELECT attname AS column_name, null_frac, n_distinct, avg_width
+FROM pg_stats
+WHERE schemaname = 'public' AND tablename = 'logs'
+ORDER BY attname;
 
 SELECT state, wait_event_type, wait_event, COUNT(*) AS connections
 FROM pg_stat_activity

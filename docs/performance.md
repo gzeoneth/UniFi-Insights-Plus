@@ -16,6 +16,28 @@ Complete addresses use PostgreSQL's native IP equality, and CIDRs use subnet con
 
 Exclusions retain records whose excluded field is missing. Use the separate missing/present operators when you need different behavior. View exclusions still retain raw data and do not change the independent Security view.
 
+Source and destination port parameters accept comma-separated values and inclusive ranges, such as `443,8000-8010`. Prefix the whole expression with `!` to exclude it. Invalid expressions return HTTP 400; they no longer silently remove the port condition. This applies to shared log, export and MCP queries.
+
+## Security searches
+
+The parsed-IPS and retained-CEF predicates have matching partial indexes on timestamp and row ID. Explicit NULL checks preserve classification while letting PostgreSQL use column statistics; wrapping a boolean predicate in `COALESCE` had caused poor selectivity estimates and full chronological scans. Security summaries count their separate candidate sets without applying raw CEF text matching to every ordinary event.
+
+Indexes build concurrently in a background worker after UDP intake starts. The worker uses a separate connection, an advisory lock, a five-second lock timeout and a thirty-minute statement timeout. An interrupted invalid index is rebuilt on the next startup. Check the container's index-maintenance messages and the diagnostic script's `indisvalid` values before assuming the new indexes are available. Queries remain correct while an index is absent, but can remain slow. Concurrent builds still consume I/O and memory.
+
+## Browsing and rule investigation
+
+Flow View has the same advanced include/exclude conditions as Log Stream. For example, choose **Either IP / subnet**, **Exclude**, and `192.0.2.10` to remove flows involving that host. Conditions apply before aggregation to the Sankey graph, zone matrix, endpoint table, host details and CSV exports, and follow a flow into Log Stream. Flow saved views retain them; loading an older view clears conditions that it did not contain. Use exact IPs or CIDRs when recorded device labels are incomplete.
+
+Flow panels serialize changes, defer endpoint aggregation until the matching graph query finishes, and reuse identical results for at most 30 seconds. Manual Refresh bypasses the cache. The cache key includes advanced conditions and view exclusions. A changed filter cannot display data from the previous scope as a current result.
+
+Dashboard tiers, Security and Threat Map serialize their own requests across filter changes and stop starting work while the tab is hidden. Old-scope responses are discarded. Map failures show an error and a Retry button; an unsuccessful new filter cannot leave old-scope points on the map. A browser abort alone does not establish that a database query stopped.
+
+Map and chart dependencies load when their panels are opened. Their loading placeholders no longer import those dependencies into the initial bundle.
+
+Rule Usage starts with **Rule totals**. It groups by recorded gateway, rule, description and action, avoiding a separate group for every endpoint/port combination. Switch to **Endpoint details** to inspect those combinations. A rule-name edit is submitted with **Apply rule filter**, rather than querying after every keystroke. The UI skips an extra total-count scan unless **Count matching events** is selected. API defaults remain endpoint grouping and exact counts; opt into `group_by=rule&count_mode=none` for the new behavior.
+
+These aggregations still inspect the selected time window. A top-200 result does not mean only 200 underlying events were read. Start with a short period, especially for broad exclusions or text matching.
+
 ## Ingestion
 
 UDP reception, parsing/staging and database delivery have separate workers. A slow PostgreSQL batch no longer holds up the worker writing new records to the SQLite retry spool. Staging and acknowledgement retain durable SQLite commits, and database commits remain synchronous before spool acknowledgement. Ingest IDs prevent duplicate rows after a retry or crash following a database commit.
@@ -48,7 +70,9 @@ Run [query-diagnostics.sql](../scripts/query-diagnostics.sql) through `psql` aga
 
 Check actual plans on a disposable restored database with representative filters. Compare row retrieval separately from exact counts. Use `EXPLAIN (ANALYZE, BUFFERS)` only when ready to execute the query; it is not a cost-free preview. Measure both warm and cold-cache behavior where practical, along with insert throughput and index size.
 
-Avoid adding an index for every filter. Indexes cost disk space and insert work; a broad text index can be particularly expensive. This release keeps the existing indexes. Its synthetic checks favored native address predicates, cursor paging and optional counts over adding more indexes. Synthetic timings do not establish production capacity or predict a long-retention database.
+Avoid adding an index for every filter. Indexes cost disk space and insert work; a broad text index can be particularly expensive. The earlier pagination work favored native address predicates, cursor paging and optional counts. This release adds small indexes for sparse security candidates, based on measured query plans. Synthetic timings do not establish production capacity or predict a long-retention database.
+
+See [query and index coverage](query-indexes.md) for the field-by-field audit, measured improvements and remaining scan costs.
 
 Memory settings also need measurement. PostgreSQL `work_mem` applies per sort/hash operation and concurrent queries can use several such allocations. Disk capacity is not a reason to increase it or the connection pool. Keep searchable retention separate from optional archives and summaries.
 

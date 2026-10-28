@@ -36,4 +36,21 @@ describe('LogDetail IPS fields', () => {
     expect(screen.getByText('IPS action').nextSibling.textContent).toBe('Unknown')
     expect(screen.queryByText('AbuseIPDB Score')).toBeNull()
   })
+
+  it('keeps reported aliases separate when the gateway omitted IPs', () => {
+    render(<LogDetail log={{ ...log, src_reported_name: 'Player', dst_reported_name: 'Player', reported_application: 'Media' }} />)
+    const ips = screen.getByRole('region', { name: 'UniFi IPS detection' })
+    expect(within(ips).getAllByText('Player')).toHaveLength(2)
+    expect(within(ips).getAllByText('IP not supplied by gateway')).toHaveLength(2)
+    expect(within(ips).getByText('Reported application')).toBeTruthy()
+    expect(screen.queryByText('Source IP')).toBeNull()
+    expect(screen.queryByText('Destination IP')).toBeNull()
+  })
+
+  it('labels the port registration separately from a reported application', () => {
+    render(<LogDetail log={{ ...log, service_name: 'example-service', dst_port: 9999, reported_application: 'Media' }} />)
+    expect(screen.getByText('Registered port service')).toBeTruthy()
+    expect(screen.getByText(/IANA registration for this port and protocol/)).toBeTruthy()
+    expect(screen.getByText('Media')).toBeTruthy()
+  })
 })

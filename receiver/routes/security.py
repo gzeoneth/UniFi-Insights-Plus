@@ -27,20 +27,34 @@ def security_summary(
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Separate candidate sets so PostgreSQL can use their partial
+            # indexes instead of evaluating raw CEF text on every traffic row.
+            # Reuse the already resolved absolute time bounds in each subquery.
             cur.execute(f"""
-                SELECT
-                    COUNT(*) FILTER (WHERE {PARSED_IPS_SQL}
-                        AND rule_action = 'block') AS ips_blocked,
-                    COUNT(*) FILTER (WHERE {PARSED_IPS_SQL}
-                        AND rule_action = 'allow') AS ips_allowed,
-                    COUNT(*) FILTER (WHERE {PARSED_IPS_SQL}
-                        AND (rule_action IS NULL OR rule_action NOT IN ('block', 'allow'))) AS ips_unknown,
-                    COUNT(*) FILTER (WHERE log_type = 'firewall' AND rule_action = 'block'
-                        AND NOT {PARSED_IPS_SQL}) AS firewall_blocks,
-                    COUNT(*) FILTER (WHERE threat_score > 50) AS reputation_alerts,
-                    COUNT(*) FILTER (WHERE {UNPARSED_CEF_THREAT_SQL}) AS unparsed_cef_threats
-                FROM logs WHERE {where}
-            """, params)
+                SELECT ips.*, blocks.firewall_blocks, reputation.reputation_alerts,
+                       legacy.unparsed_cef_threats
+                FROM (
+                    SELECT
+                        COUNT(*) FILTER (WHERE rule_action = 'block') AS ips_blocked,
+                        COUNT(*) FILTER (WHERE rule_action = 'allow') AS ips_allowed,
+                        COUNT(*) FILTER (WHERE rule_action IS NULL
+                            OR rule_action NOT IN ('block', 'allow')) AS ips_unknown
+                    FROM logs WHERE {where} AND {PARSED_IPS_SQL}
+                ) ips
+                CROSS JOIN (
+                    SELECT COUNT(*) AS firewall_blocks
+                    FROM logs WHERE {where} AND log_type = 'firewall'
+                        AND rule_action = 'block' AND NOT {PARSED_IPS_SQL}
+                ) blocks
+                CROSS JOIN (
+                    SELECT COUNT(*) AS reputation_alerts
+                    FROM logs WHERE {where} AND threat_score > 50
+                ) reputation
+                CROSS JOIN (
+                    SELECT COUNT(*) AS unparsed_cef_threats
+                    FROM logs WHERE {where} AND {UNPARSED_CEF_THREAT_SQL}
+                ) legacy
+            """, params * 4)
             result = dict(cur.fetchone())
             # Select risk/severity from the actual latest event, never MAX(text)
             # or an invented conversion to the AbuseIPDB percentage scale.

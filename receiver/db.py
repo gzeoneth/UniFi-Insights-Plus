@@ -17,8 +17,10 @@ from typing import NamedTuple, Optional
 
 import psycopg2
 import psycopg2.errors
-from psycopg2 import pool, extras
+from psycopg2 import pool, extras, sql as pg_sql
 from psycopg2.extras import Json
+
+from security_predicates import SECURITY_INDEXES
 
 logger = logging.getLogger(__name__)
 
@@ -289,8 +291,10 @@ class Database:
     """PostgreSQL connection pool and operations."""
 
     # Heavyweight indexes created post-boot with CONCURRENTLY for upgrades.
-    # Fresh installs get these from init.sql; this list handles existing installs.
+    # Security indexes are created here on both fresh installs and upgrades;
+    # older performance indexes are also present in init.sql.
     _POST_BOOT_INDEXES = [
+        *SECURITY_INDEXES,
         {
             'name': 'idx_logs_spgist_dst_ip_firewall',
             'sql': "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_logs_spgist_dst_ip_firewall "
@@ -324,6 +328,8 @@ class Database:
         self.pool = None
         self.min_conn = min_conn
         self.max_conn = max_conn
+        self._index_maintenance_connection = None
+        self._index_maintenance_stop = False
 
     def connect(self):
         """Initialize the connection pool."""
@@ -887,71 +893,92 @@ END $$;""",
 
         self._backfill_tz_timestamps()
 
+    def cancel_index_maintenance(self):
+        """Cancel the dedicated maintenance session during receiver shutdown."""
+        self._index_maintenance_stop = True
+        connection = self._index_maintenance_connection
+        if connection is not None:
+            try:
+                connection.cancel()
+            except Exception:
+                logger.debug("Index maintenance connection already closed", exc_info=True)
+
     def ensure_post_boot_indexes(self):
-        """Create heavyweight indexes and drop redundant ones for existing installs.
+        """Build upgrade indexes without delaying intake or locking out inserts.
 
-        Uses a dedicated autocommit connection (CONCURRENTLY cannot run inside
-        a transaction).  Fresh installs get the create list from init.sql;
-        this handles upgrades.  Skips creates for indexes that already exist
-        and issues drops with IF EXISTS.
-
-        A short lock_timeout is set before the drop loop so a stuck
-        DROP CONCURRENTLY cannot stall receiver startup indefinitely — on
-        timeout the drop retries on the next boot.
-
-        Must be called from the receiver startup path only — not from
-        Database.connect() — to avoid the API and receiver both racing on
-        the same concurrent index creation.
+        Run in the receiver's background maintenance worker, never from
+        Database.connect(). A dedicated session owns the advisory lock and
+        concurrent DDL. An interrupted build can leave an invalid index; remove
+        only that unusable index and rebuild it on the next startup.
         """
+        if self._index_maintenance_stop:
+            return
         try:
             conn = psycopg2.connect(**self.conn_params)
             conn.autocommit = True
+            self._index_maintenance_connection = conn
         except Exception:
             logger.warning("Post-boot index maintenance failed (connect) — will retry next boot",
                            exc_info=True)
             return
         try:
+            if self._index_maintenance_stop:
+                return
+            with conn.cursor() as cur:
+                # Session lock prevents overlapping receiver processes from
+                # dropping an invalid index while another build is in progress.
+                cur.execute("SELECT pg_try_advisory_lock(20261029)")
+                lock_row = cur.fetchone()
+                if not lock_row or not lock_row[0]:
+                    logger.info("Index maintenance already running in another receiver")
+                    return
+                cur.execute("SET lock_timeout = '5s'")
+                cur.execute("SET statement_timeout = '30min'")
             for idx in self._POST_BOOT_INDEXES:
+                if self._index_maintenance_stop:
+                    return
                 try:
                     with conn.cursor() as cur:
-                        cur.execute(
-                            "SELECT 1 FROM pg_indexes WHERE indexname = %s",
-                            (idx['name'],),
-                        )
-                        if cur.fetchone():
-                            continue  # already exists
+                        cur.execute("""
+                            SELECT i.indisvalid, n.nspname
+                            FROM pg_index i
+                            JOIN pg_class c ON c.oid = i.indexrelid
+                            JOIN pg_namespace n ON n.oid = c.relnamespace
+                            WHERE i.indrelid = 'logs'::regclass AND c.relname = %s
+                        """, (idx['name'],))
+                        existing = cur.fetchone()
+                        if existing and existing[0]:
+                            continue
+                        if existing:
+                            logger.warning("Rebuilding interrupted index %s", idx['name'])
+                            # Names come only from the static application list.
+                            cur.execute(pg_sql.SQL("DROP INDEX CONCURRENTLY IF EXISTS {}").format(
+                                pg_sql.Identifier(existing[1], idx['name'])))
                         logger.info("Creating %s concurrently (%s)...",
                                     idx['name'], idx['label'])
                         cur.execute(idx['sql'])
                         logger.info("Index %s created successfully", idx['name'])
                 except Exception:
+                    if self._index_maintenance_stop:
+                        return
                     logger.warning("Could not create %s — will retry next boot",
                                    idx['name'], exc_info=True)
-
-            # Drop redundant indexes (idempotent via IF EXISTS). Bound by a
-            # short lock_timeout so a stuck DROP cannot stall receiver boot.
-            # Note: lock_timeout only bounds the final ACCESS EXCLUSIVE phase;
-            # a long-running query holding a snapshot that references the index
-            # can still delay phase (a). The retry-next-boot loop is the real
-            # safety net.
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("SET lock_timeout = '60s'")
-            except Exception:
-                logger.warning("Could not set lock_timeout — skipping post-boot drops, "
-                               "will retry next boot", exc_info=True)
-                return
             for name, sql in self._POST_BOOT_DROPS:
+                if self._index_maintenance_stop:
+                    return
                 try:
                     with conn.cursor() as cur:
-                        logger.info("Dropping redundant index %s...", name)
                         cur.execute(sql)
-                        logger.info("Index %s dropped (if it existed)", name)
                 except Exception:
                     logger.warning("Could not drop %s — will retry next boot",
                                    name, exc_info=True)
+        except Exception:
+            if not self._index_maintenance_stop:
+                logger.warning("Index maintenance setup failed (advisory lock/lock_timeout) — "
+                               "will retry next boot", exc_info=True)
         finally:
-            conn.close()
+            self._index_maintenance_connection = None
+            conn.close()  # Releases the session advisory lock as well.
 
 
     def _backfill_tz_timestamps(self):

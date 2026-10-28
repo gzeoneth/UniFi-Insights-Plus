@@ -162,7 +162,7 @@ def _lookup_ip_info(conn, nodes):
     cfg = load_identity_config(enricher_db)
     for ip_str in ip_set:
         name, vlan, vpn_badge = annotate_ip(cfg, ip_str, device_names.get(ip_str))
-        if name and not device_names.get(ip_str):
+        if name:
             device_names[ip_str] = name
         if vlan is not None:
             gateway_vlans[ip_str] = vlan
@@ -319,7 +319,8 @@ def get_zone_matrix(
         COUNT(*) AS total,
         COUNT(*) FILTER (WHERE rule_action = 'allow') AS allow_count,
         COUNT(*) FILTER (WHERE rule_action = 'block') AS block_count,
-        COUNT(DISTINCT (host(src_ip) || '-' || host(dst_ip))) AS unique_pairs
+        COUNT(DISTINCT (set_masklen(src_ip, -1), set_masklen(dst_ip, -1)))
+            FILTER (WHERE src_ip IS NOT NULL AND dst_ip IS NOT NULL) AS unique_pairs
     FROM logs
     WHERE {where}
       AND interface_in IS NOT NULL AND interface_out IS NOT NULL
@@ -440,7 +441,7 @@ def get_host_detail(
             # Identity annotation (gateway/WAN/VPN) — identity vlan takes precedence; DB network preserved if set
             cfg = load_identity_config(enricher_db)
             name, vlan, vpn_badge = annotate_ip(cfg, ip, device.get('device_name'))
-            if name and not device.get('device_name'):
+            if name:
                 device['device_name'] = name
             if vlan is not None:
                 device['vlan'] = vlan

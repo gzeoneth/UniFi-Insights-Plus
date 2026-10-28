@@ -77,7 +77,7 @@ def _annotate_internal_ips(*ip_lists):
     for ip_list in ip_lists:
         for item in ip_list:
             name, vlan, _ = annotate_ip(cfg, item['ip'], item.get('device_name'))
-            if name and not item.get('device_name'):
+            if name:
                 item['device_name'] = name
             if vlan is not None:
                 item['vlan'] = vlan

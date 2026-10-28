@@ -84,7 +84,7 @@ def test_ips_reputation_and_plain_firewall_counts_are_independent(security_clien
         'ips_blocked': 1, 'ips_allowed': 1, 'ips_unknown': 1,
         'firewall_blocks': 1, 'reputation_alerts': 2}
     assert data['top_signatures'][0]['count'] == 3
-    assert executed[0][1] == executed[1][1]  # Identical bounds, captured only once.
+    assert executed[0][1] == executed[1][1] * 4  # Identical bounds, captured only once.
     deps.put_conn.assert_called_once_with(deps.get_conn.return_value)
 
 
@@ -109,7 +109,7 @@ def test_invalid_time_defaults_to_bounded_range_and_empty_counts(security_client
     assert response.json()['time_range'] == '24h'
     assert response.json()['ips_blocked'] == 0
     assert response.json()['top_signatures'] == []
-    assert len(executed[0][1]) == 1
+    assert len(executed[0][1]) == 4
     assert isinstance(executed[0][1][0], datetime)
 
 

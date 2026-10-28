@@ -21,6 +21,7 @@ from query_helpers import (build_log_query, validate_time_params,
 from log_pagination import (filter_fingerprint, new_window, encode_cursor, decode_cursor,
                             next_cursor as make_next_cursor)
 from services import get_service_description
+from parsers import cef_reported_context
 from field_filters import append_exclusions, compile_exclusions, query_view_counts
 
 
@@ -435,6 +436,8 @@ def _annotate_logs(logs):
     cfg = load_identity_config(enricher_db)
     for log in logs:
         annotate_record(cfg, log)
+        if log.get('event_source') == 'unifi_ips':
+            log.update(cef_reported_context(log.get('raw_log')))
         desc = get_service_description(log.get('dst_port'), log.get('protocol'))
         if desc:
             log['service_description'] = desc
@@ -683,7 +686,7 @@ def export_csv_endpoint(
             ]:
                 ip_str = str(row[ip_idx] or '').split('/')[0]
                 name, vlan, vpn_badge = annotate_ip(cfg, ip_str, row[name_idx])
-                if name and not row[name_idx]:
+                if name:
                     row[name_idx] = name
                 if vlan is not None:
                     row[vlan_idx] = vlan

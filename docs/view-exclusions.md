@@ -33,6 +33,9 @@ The view selector includes built-in queries alongside your saved views. They rep
 - IPS detections and Unparsed CEF candidates, independent of log type.
 - DNS and Firewall action missing, for visibility checks.
 - A/V discovery: UDP with source **or** destination port 5353 or 1900, so replies to high ports are included.
+- Local A/V discovery: the same ports with a private source, excluding public-source probes.
+- Private unicast mDNS replies: UDP source port 5353 between private addresses, including gateway replies.
+- Blocked local broadcasts: private-source UDP blocks to the IPv4 limited broadcast address. This excludes subnet-directed broadcasts and multicast.
 - NAT-PMP/PCP attempts: UDP destination port 5351.
 - High destination ports: 49152–65535, including return traffic.
 
@@ -61,7 +64,7 @@ The exact fields `rule_name_exact`, `rule_desc_exact` and `hostname_exact` match
 
 Limits: 12 groups, eight conditions per group, 48 conditions total and a 16,384-character serialized payload. Group names allow 100 characters and values allow 1,024. Invalid filters return HTTP 400 instead of broadening the query.
 
-`GET /api/logs/exclusion-preview` accepts the source-view filters and returns `view_counts` (`total`, `visible`, `hidden`) plus at most five hidden examples without raw payloads. Logs, Rule Usage and Dashboard overview also return counts. Save a profile as a saved view with `filters.view_type` set to `exclusions` and the group array in `filters.exclude_groups`.
+`GET /api/logs/exclusion-preview` accepts the source-view filters and returns `view_counts` (`total`, `visible`, `hidden`) plus at most five hidden examples without raw payloads. Logs, Rule Usage and Dashboard overview can also return counts. Log Stream and Rule Usage skip the extra count by default in the UI; request it explicitly when needed. Save a profile as a saved view with `filters.view_type` set to `exclusions` and the group array in `filters.exclude_groups`.
 
 Log, aggregate, CSV, flow and IP-pair endpoints accept the same profile parameter. Dashboard stats accept `exclude_groups`; their fixed dashboard queries do not accept arbitrary `filter_rules`. Supported MCP log/stat tools expose the same optional parameter. Existing clients that omit it continue to see unfiltered results.
 

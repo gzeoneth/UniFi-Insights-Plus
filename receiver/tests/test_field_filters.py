@@ -134,3 +134,31 @@ def test_numeric_enum_is_exact_while_text_enum_preserves_case_insensitivity():
     assert predicate == ['(ips_signature_id = %s)'] and params == ['900001']
     predicate, _ = compile_filters([rule('protocol', 'TcP')])
     assert predicate == ['(LOWER(protocol) = LOWER(%s))']
+
+
+def test_directional_interface_filters_are_exact_indexable_and_parameterized():
+    conditions, params = compile_filters([
+        rule('interface_in', 'br-example'), rule('interface_out', 'eth-example,eth-backup')])
+    assert conditions == ['(interface_in = %s)', '(interface_out = %s OR interface_out = %s)']
+    assert params == ['br-example', 'eth-example', 'eth-backup']
+    payload = "br-example' OR TRUE --"
+    conditions, params = compile_filters([rule('interface_in', payload)])
+    assert payload not in ' '.join(conditions)
+    assert params == [payload]
+
+
+def test_postgres_directional_interfaces_keep_reverse_and_missing_fields_distinct(pg_rows):
+    with pg_rows.cursor() as cursor:
+        cursor.execute('ALTER TABLE filter_rows ADD COLUMN interface_in TEXT, ADD COLUMN interface_out TEXT')
+        cursor.executemany('UPDATE filter_rows SET interface_in=%s,interface_out=%s WHERE id=%s', [
+            ('br-example', 'eth-example', 1),
+            ('eth-example', 'br-example', 2),
+            (None, 'eth-example', 3),
+            ('br-example', None, 4),
+            (None, None, 5),
+            ('BR-example', 'eth-example', 6),
+        ])
+    assert selected(pg_rows, [rule('interface_in', 'br-example'), rule('interface_out', 'eth-example')]) == [1]
+    assert selected(pg_rows, [rule('interface_in', 'br-example', 'exclude')]) == [2, 3, 5, 6]
+    assert selected(pg_rows, [rule('interface_in', 'br-example,BR-example')]) == [1, 4, 6]
+    assert selected(pg_rows, [rule('interface_out', operator='missing')]) == [4, 5]

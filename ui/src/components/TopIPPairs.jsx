@@ -1,6 +1,6 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState } from 'react'
 import { fetchIPPairs } from '../api'
-import { readCache, writeCache } from '../lib/sessionCache'
+import useFlowQuery from '../hooks/useFlowQuery'
 import { formatNumber, formatServiceName, resolveIpSublines } from '../utils'
 import IPCell from './IPCell'
 import InfoTooltip from './InfoTooltip'
@@ -55,56 +55,24 @@ function TopIPPairsMenuItems({ onSaveView, onLoadView, savedViews, onDeleteView,
 // onIpClick(ip, rowIndex): rowIndex is used by FlowView's toggle logic:
 // clicking the same IP in the same row closes the panel, different row keeps it open.
 export default function TopIPPairs({ filters, refreshKey, sankeyFilter, onClearSankeyFilter, zoneFilter, onClearZoneFilter, onIpClick, onSaveView, onLoadView, savedViews, onDeleteView, onRefreshViews, deferFetch }) {
-  const [pairs, setPairs] = useState([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(null)
   const [limit, setLimit] = useState(25)
-  const refreshKeyRef = useRef(refreshKey)
-
-  // Build stable dependency key for cross-filters
-  const sankeyKey = sankeyFilter ? `${sankeyFilter.type}:${sankeyFilter.value}` : ''
-  const zoneKey = zoneFilter ? `${zoneFilter.interface_in}:${zoneFilter.interface_out}` : ''
-
-  useEffect(() => {
-    setError(null)
-    if (deferFetch) { setPairs([]); setLoading(true); return }
-
-    const disc = [filters.time_range, filters.time_from, filters.time_to, filters.rule_action, filters.direction, filters.exclude_groups, sankeyKey, zoneKey, limit].join('|')
-    const cached = readCache('ip-pairs', disc)
-    if (cached && refreshKey === refreshKeyRef.current) {
-      setPairs(cached)
-      setLoading(false)
-      return
-    }
-    refreshKeyRef.current = refreshKey
-
-    let cancelled = false
-    setLoading(true)
-    setPairs([])
-    const params = { ...filters, limit }
-    if (sankeyFilter) {
-      const paramKey = SANKEY_PARAM_MAP[sankeyFilter.type] || sankeyFilter.type
-      params[paramKey] = sankeyFilter.value
-    }
-    if (zoneFilter) {
-      params.interface_in = zoneFilter.interface_in
-      params.interface_out = zoneFilter.interface_out
-    }
-    fetchIPPairs(params)
-      .then(data => {
-        if (!cancelled) { setPairs(data.pairs || []); writeCache('ip-pairs', disc, data.pairs || []) }
-      })
-      .catch(() => { if (!cancelled) setError('Could not load IP pairs for the current filters. Refresh to try again.') })
-      .finally(() => { if (!cancelled) setLoading(false) })
-    return () => { cancelled = true }
-  }, [deferFetch, filters.time_range, filters.time_from, filters.time_to, filters.rule_action, filters.direction, filters.exclude_groups, sankeyKey, zoneKey, limit, refreshKey])
+  const params = { ...filters }
+  if (sankeyFilter) params[SANKEY_PARAM_MAP[sankeyFilter.type] || sankeyFilter.type] = sankeyFilter.value
+  if (zoneFilter) {
+    params.interface_in = zoneFilter.interface_in
+    params.interface_out = zoneFilter.interface_out
+  }
+  const { data, loading, error } = useFlowQuery('ip-pairs', { ...params, limit }, fetchIPPairs, refreshKey, !deferFetch)
+  const pairs = data?.pairs || []
 
   const drillToLogs = (pair) => {
     window.dispatchEvent(new CustomEvent('drillToLogs', {
       detail: {
+        ...params,
         src_ip: pair.src_ip,
         dst_ip: pair.dst_ip,
         dst_port: pair.dst_port,
+        protocol: pair.protocol,
         service: pair.service_name,
         time_range: filters.time_range,
         time_from: filters.time_from || undefined,
@@ -168,7 +136,7 @@ export default function TopIPPairs({ filters, refreshKey, sankeyFilter, onClearS
         </div>
       )}
 
-      {error ? <p role="alert" className="p-4 text-sm text-red-400">{error}</p> : loading ? (
+      {error ? <p role="alert" className="p-4 text-sm text-red-400">{error.status === 400 ? error.message : 'Could not load IP pairs for the current filters. Refresh to try again.'}</p> : loading ? (
         <div className="overflow-y-auto overflow-x-hidden min-h-0 flex-1 animate-pulse">
           <table className="w-full table-fixed">
             <thead>

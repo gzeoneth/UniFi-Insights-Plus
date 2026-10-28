@@ -152,6 +152,7 @@ class SyslogReceiver:
         self._health_stop = threading.Event()
         self._shutdown_deadline = None
         self.config_reload_callback = None
+        self.started_callback = None
         self.config_reload_requested = False
         self.geoip_reload_requested = False
         self._spool = None
@@ -210,6 +211,8 @@ class SyslogReceiver:
         logger.info("Syslog receiver listening on UDP port %d (queue capacity=%d)",
                     SYSLOG_PORT, self.queue.maxsize)
         try:
+            if self.started_callback:
+                self.started_callback()
             while self.running and not self._shutdown_requested:
                 try:
                     data, addr = self.sock.recvfrom(SYSLOG_BUFFER_SIZE)
@@ -817,9 +820,6 @@ def main():
     db = Database(conn_params)
     db.connect()
 
-    # Create performance indexes that require CONCURRENTLY (existing installs)
-    db.ensure_post_boot_indexes()
-
     # Load system configuration and apply to parsers module
     # Check for existing user migration
     setup_complete = get_config(db, "setup_complete", None)
@@ -867,6 +867,20 @@ def main():
 
     # Start receiver
     receiver = SyslogReceiver(db, enricher)
+    index_thread = None
+
+    def start_index_maintenance():
+        nonlocal index_thread
+        # Intake is bound and workers are running before upgrade scans begin.
+        index_thread = threading.Thread(target=db.ensure_post_boot_indexes,
+                                        name='index-maintenance', daemon=True)
+        try:
+            index_thread.start()
+        except RuntimeError:
+            index_thread = None
+            logger.warning("Could not start index maintenance; intake continues", exc_info=True)
+
+    receiver.started_callback = start_index_maintenance
 
     # Handle graceful shutdown
     def shutdown(signum, frame):
@@ -916,6 +930,9 @@ def main():
         unifi_api.stop_polling()
         pihole.stop_polling()
         enricher.close()
+        db.cancel_index_maintenance()
+        if index_thread is not None:
+            index_thread.join(timeout=5)
         db.close()
 
 

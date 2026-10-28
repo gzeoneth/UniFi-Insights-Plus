@@ -14,12 +14,12 @@ export function cacheKey(prefix, discriminator) {
   return `${prefix}:${CACHE_VERSION}:${discriminator}`
 }
 
-export function readCache(prefix, discriminator) {
+export function readCache(prefix, discriminator, maxAgeMs = CACHE_TTL_MS) {
   try {
     const raw = sessionStorage.getItem(cacheKey(prefix, discriminator))
     if (!raw) return null
     const { fetchedAt, data } = JSON.parse(raw)
-    if (Date.now() - fetchedAt > CACHE_TTL_MS) return null
+    if (Date.now() - fetchedAt >= maxAgeMs) return null
     return data
   } catch (e) { console.warn('Cache read failed:', e); return null }
 }

@@ -305,23 +305,20 @@ def build_log_query(
             conditions.append(f"asn_name {op} %s ESCAPE '\\'") 
         params.append(f"%{escaped_asn}%")
 
-    if dst_port:
-        negated, port_val = _parse_port(dst_port)
-        if port_val is not None:
-            if negated:
-                conditions.append("(dst_port != %s OR dst_port IS NULL)")
+    for column, value in (('dst_port', dst_port), ('src_port', src_port)):
+        if value:
+            from field_filters import compile_filters
+            negated, clean = _parse_negation(value.strip())
+            port_conditions, port_params = compile_filters([{
+                'field': column, 'operator': 'exclude' if negated else 'include', 'value': clean,
+            }])
+            # Preserve the simple indexed equality path for a single port.
+            if clean.isascii() and clean.isdecimal():
+                conditions.append(f'({column} != %s OR {column} IS NULL)' if negated else f'{column} = %s')
+                params.append(int(clean))
             else:
-                conditions.append("dst_port = %s")
-            params.append(port_val)
-
-    if src_port:
-        negated, port_val = _parse_port(src_port)
-        if port_val is not None:
-            if negated:
-                conditions.append("(src_port != %s OR src_port IS NULL)")
-            else:
-                conditions.append("src_port = %s")
-            params.append(port_val)
+                conditions.extend(port_conditions)
+                params.extend(port_params)
 
     if protocol:
         negated, val = _parse_negation(protocol)
@@ -476,6 +473,20 @@ def validate_view_filters(filters: dict) -> str | None:
                 except ValueError:
                     return f'{key} must be an ISO timestamp'
         return None
+
+    # Flow views persist the same advanced conditions sent to graph, matrix,
+    # pair lists, drill-down and export. Reject malformed saved conditions now
+    # instead of storing a preset that fails only when it is opened later.
+    from field_filters import compile_filters, compile_exclusions
+    from fastapi import HTTPException
+    for key in ('filter_rules', 'exclude_groups'):
+        if filters.get(key) is not None and not isinstance(filters[key], list):
+            return f'{key} must be an array'
+    try:
+        compile_filters(filters.get('filter_rules'))
+        compile_exclusions(filters.get('exclude_groups'))
+    except HTTPException as exc:
+        return str(exc.detail)
 
     dims = filters.get('dims')
     if not isinstance(dims, list) or len(dims) != 3:

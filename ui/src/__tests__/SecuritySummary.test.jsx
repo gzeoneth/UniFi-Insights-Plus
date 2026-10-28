@@ -54,9 +54,10 @@ describe('SecuritySummary', () => {
     const { rerender } = render(<SecuritySummary timeRange="24h" />)
     const oldSignal = fetchSecuritySummary.mock.calls[0][1].signal
     rerender(<SecuritySummary timeRange="1h" />)
-    await screen.findByText('Synthetic detection')
-    expect(oldSignal.aborted).toBe(true)
+    expect(fetchSecuritySummary).toHaveBeenCalledTimes(1)
+    expect(oldSignal.aborted).toBe(false)
     await act(async () => resolveOld({ ...summary, ips_blocked: 999 }))
+    await screen.findByText('Synthetic detection')
     const blocked = screen.getByText('IPS blocked').parentElement
     expect(within(blocked).getByText('9')).toBeTruthy()
     expect(screen.queryByText('999')).toBeNull()

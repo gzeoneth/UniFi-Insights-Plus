@@ -7,6 +7,7 @@ import SankeyChart from './SankeyChart'
 import TopIPPairs from './TopIPPairs'
 import HostSlidePanel from './HostSlidePanel'
 import DateRangePicker from './DateRangePicker'
+import FieldFilters, { readFilterRules } from './FieldFilters'
 
 const ZoneMatrix = lazy(() => import('./ZoneMatrix'))
 
@@ -19,15 +20,24 @@ const SUB_TABS = [
 
 const SESSION_KEY = 'flowview_filters'
 
+function readSessionFilters() {
+  try {
+    const value = JSON.parse(sessionStorage.getItem(SESSION_KEY) || '{}')
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+  } catch { return {} }
+}
+
 export default function FlowView({ maxFilterDays }) {
   const { excludeGroups } = useExclusionProfile()
+  const [initialFilters] = useState(readSessionFilters)
   const [timeRange, setTimeRange, visibleRanges] = useTimeRange(maxFilterDays)
-  const [activeActions, setActiveActions] = useState(ACTIONS)
-  const [activeDirections, setActiveDirections] = useState(DIRECTIONS)
+  const [activeActions, setActiveActions] = useState(initialFilters.activeActions || ACTIONS)
+  const [activeDirections, setActiveDirections] = useState(initialFilters.activeDirections || DIRECTIONS)
   const [refreshKey, setRefreshKey] = useState(0)
-  const [dims, setDims] = useState(['src_ip', 'dst_port', 'dst_ip'])
-  const [topN, setTopN] = useState(15)
-  const [activeViewName, setActiveViewName] = useState(null)
+  const [dims, setDims] = useState(initialFilters.dims || ['src_ip', 'dst_port', 'dst_ip'])
+  const [topN, setTopN] = useState(initialFilters.topN || 15)
+  const [activeViewName, setActiveViewName] = useState(initialFilters.activeViewName || null)
+  const [filterRules, setFilterRules] = useState(() => readFilterRules(initialFilters.filter_rules))
 
   // Saved views list
   const [savedViews, setSavedViews] = useState([])
@@ -49,65 +59,38 @@ export default function FlowView({ maxFilterDays }) {
   const [hostHistory, setHostHistory] = useState([])
   const [hostSearchInput, setHostSearchInput] = useState('')
   const [filtersExpanded, setFiltersExpanded] = useState(false)
-  const [timeFrom, setTimeFrom] = useState(null)
-  const [timeTo, setTimeTo] = useState(null)
+  const [timeFrom, setTimeFrom] = useState(initialFilters.timeFrom || null)
+  const [timeTo, setTimeTo] = useState(initialFilters.timeTo || null)
 
   // Ref to suppress badge clear during bulk-set operations (load, hydration, initial render)
   const skipBadgeClear = useRef(true)
-  // Guard: don't save to sessionStorage until hydration is complete (prevents
-  // overwriting saved state with defaults on mount before state updates apply)
-  const isHydrated = useRef(false)
-
-  // Session persistence: hydrate on mount
   useEffect(() => {
-    try {
-      const stored = sessionStorage.getItem(SESSION_KEY)
-      if (stored) {
-        const s = JSON.parse(stored)
-        skipBadgeClear.current = true
-        if (s.dims) setDims(s.dims)
-        if (s.topN) setTopN(s.topN)
-        if (s.activeActions) setActiveActions(s.activeActions)
-        if (s.activeDirections) setActiveDirections(s.activeDirections)
-        // timeRange is NOT restored here — useTimeRange already reads
-        // from the shared TR_KEY in sessionStorage. Overwriting it with
-        // FlowView's stale saved value would clobber cross-tab changes.
-        if (s.timeFrom) setTimeFrom(s.timeFrom)
-        if (s.timeTo) setTimeTo(s.timeTo)
-        if (s.activeViewName) setActiveViewName(s.activeViewName)
-      }
-    } catch (e) {
-      console.warn('FlowView: invalid session state, resetting', e)
-      try { sessionStorage.removeItem(SESSION_KEY) } catch {}
-    }
-    // setTimeout defers past React's synchronous re-renders so the badge
-    // clear and save effects don't fire until hydrated state is committed
-    setTimeout(() => { isHydrated.current = true; skipBadgeClear.current = false }, 0)
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+    const timer = setTimeout(() => { skipBadgeClear.current = false }, 0)
+    return () => clearTimeout(timer)
+  }, [])
 
-  // Session persistence: save on every filter change (skip until hydrated)
+  // Initial filters are read before children can start a query.
   useEffect(() => {
-    if (!isHydrated.current) return
     try {
       sessionStorage.setItem(SESSION_KEY, JSON.stringify({
         dims, topN, activeActions, activeDirections,
-        timeFrom, timeTo, activeViewName,
+        timeFrom, timeTo, activeViewName, filter_rules: filterRules,
       }))
     } catch { /* ignore quota errors */ }
-  }, [dims, topN, activeActions, activeDirections, timeFrom, timeTo, activeViewName])
+  }, [dims, topN, activeActions, activeDirections, timeFrom, timeTo, activeViewName, filterRules])
 
   // Badge clear: any manual filter change clears the active view badge
   useEffect(() => {
     if (skipBadgeClear.current) return
     setActiveViewName(null)
-  }, [activeActions, activeDirections, timeRange, timeFrom, timeTo, dims, topN])
+  }, [activeActions, activeDirections, timeRange, timeFrom, timeTo, dims, topN, filterRules])
 
   // Derive a request key from the same deps SankeyChart uses to fetch.
   // When sankeyFulfilledKey matches, Sankey has satisfied the current request.
   const sankeyRequestKey = [timeRange, timeFrom, timeTo,
     activeActions.length === ACTIONS.length ? null : activeActions.join(','),
     activeDirections.length === DIRECTIONS.length ? null : activeDirections.join(','),
-    dims.join(','), topN, expandedRow?.ip || '', refreshKey, excludeGroups].join('|')
+    dims.join(','), topN, expandedRow?.ip || '', refreshKey, excludeGroups, JSON.stringify(filterRules)].join('|')
 
   const refreshSavedViews = useCallback(() => {
     fetchSavedViews()
@@ -123,7 +106,7 @@ export default function FlowView({ maxFilterDays }) {
   // Save view handler
   const handleSaveView = useCallback((name) => {
     const snapshot = {
-      dims, topN, activeActions, activeDirections,
+      dims, topN, activeActions, activeDirections, filter_rules: filterRules,
       timeRange: (timeFrom || timeTo) ? null : timeRange,
       timeFrom: timeFrom || null,
       timeTo: timeTo || null,
@@ -135,7 +118,7 @@ export default function FlowView({ maxFilterDays }) {
         setTimeout(() => { skipBadgeClear.current = false }, 0)
         refreshSavedViews()
       })
-  }, [dims, topN, activeActions, activeDirections, timeRange, timeFrom, timeTo, refreshSavedViews])
+  }, [dims, topN, activeActions, activeDirections, timeRange, timeFrom, timeTo, filterRules, refreshSavedViews])
 
   // Load view handler
   const handleLoadView = useCallback((view) => {
@@ -146,6 +129,12 @@ export default function FlowView({ maxFilterDays }) {
     if (f.topN) setTopN(f.topN)
     if (f.activeActions) setActiveActions(f.activeActions)
     if (f.activeDirections) setActiveDirections(f.activeDirections)
+    setFilterRules(readFilterRules(f.filter_rules))
+    setSankeyFilter(null)
+    setZoneFilter(null)
+    setExpandedRow(null)
+    setHostSearchInput('')
+    setHostHistory([])
     if (f.timeFrom || f.timeTo) {
       setTimeFrom(f.timeFrom || null)
       setTimeTo(f.timeTo || null)
@@ -186,6 +175,7 @@ export default function FlowView({ maxFilterDays }) {
   const isCustomTime = !!(timeFrom || timeTo)
   const filters = {
     exclude_groups: excludeGroups,
+    filter_rules: filterRules.length ? JSON.stringify(filterRules) : null,
     time_range: isCustomTime ? null : timeRange,
     time_from: timeFrom,
     time_to: timeTo,
@@ -198,6 +188,7 @@ export default function FlowView({ maxFilterDays }) {
 
   // Sankey node click — toggle filter, clear zone filter (mutual exclusivity)
   const handleSankeyNodeClick = useCallback(({ type, value }) => {
+    if ((type === 'interface_in' || type === 'interface_out') && !value) return
     setSankeyFilter(prev => {
       if (prev && prev.type === type && prev.value === value) return null
       return { type, value }
@@ -243,6 +234,7 @@ export default function FlowView({ maxFilterDays }) {
     activeDirections.length !== DIRECTIONS.length,
     isCustomTime || timeRange !== '24h',
     hostSearchInput,
+    filterRules.length,
   ].filter(Boolean).length
 
   return (
@@ -365,6 +357,7 @@ export default function FlowView({ maxFilterDays }) {
               setHostSearchInput('')
               setHostHistory([])
               setActiveViewName(null)
+              setFilterRules([])
             }}
             className="shrink-0 text-xs text-gray-400 hover:text-gray-200 transition-colors"
           >
@@ -382,6 +375,15 @@ export default function FlowView({ maxFilterDays }) {
         </button>
         </div>
       </div>
+
+      <details className="shrink-0 max-h-[45vh] overflow-y-auto" open={filterRules.length > 0 || undefined}>
+        <summary className="cursor-pointer text-xs text-gray-300">Include / exclude hosts and traffic{filterRules.length ? ` (${filterRules.length})` : ''}</summary>
+        <div className="mt-2">
+          <FieldFilters filters={{ filter_rules: filters.filter_rules }} savedViews={false}
+            onChange={next => setFilterRules(readFilterRules(next.filter_rules))} />
+          <p className="text-xs text-gray-500 mt-2">Use Either IP / subnet for reliable host exclusion on both sides. Device-name filters search recorded labels, which can be stale or absent. Conditions apply to every chart, host detail and export, and are saved with the flow view. The selected exclusion profile remains separate.</p>
+        </div>
+      </details>
 
       {/* Sub-tabs */}
       <div className="flex items-center gap-1">
@@ -460,6 +462,7 @@ export default function FlowView({ maxFilterDays }) {
           {expandedRow && (
             <HostSlidePanel
               ip={expandedRow.ip}
+              refreshKey={refreshKey}
               filters={filters}
               onClose={() => { setExpandedRow(null); setHostSearchInput(''); setHostHistory([]) }}
               onPeerClick={(ip) => {

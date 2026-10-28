@@ -6,6 +6,7 @@ import { fetchThreatGeo } from '../api'
 import { formatNumber } from '../utils'
 import { THREAT_LEVELS } from '../lib/threatPresentation'
 import useTimeRange from '../hooks/useTimeRange'
+import useSerializedPoll from '../hooks/useSerializedPoll'
 import ThreatSidebar from './ThreatSidebar'
 import DateRangePicker from './DateRangePicker'
 
@@ -199,18 +200,6 @@ function applyLayers(map, geoData, view, _retry) {
   }
 }
 
-export function ThreatMapSkeleton() {
-  return (
-    <div className="h-full flex flex-col animate-pulse">
-      <div className="flex items-center gap-2 px-4 py-2 border-b border-gray-800">
-        <div className="h-7 w-10 bg-gray-800 rounded" />
-        <div className="h-7 w-10 bg-gray-800 rounded" />
-        <div className="h-7 w-10 bg-gray-800 rounded" />
-      </div>
-      <div className="flex-1 bg-black" />
-    </div>
-  )
-}
 
 export default function ThreatMap({ maxFilterDays, flyTo, onFlyToDone }) {
   const mapContainer = useRef(null)
@@ -220,8 +209,6 @@ export default function ThreatMap({ maxFilterDays, flyTo, onFlyToDone }) {
   const [mode, setMode] = useState('threats')
   const [view, setView] = useState('heatmap')
   const [filtersExpanded, setFiltersExpanded] = useState(false)
-  const [geoData, setGeoData] = useState(null)
-  const [loading, setLoading] = useState(true)
   const [sidebarLocation, setSidebarLocation] = useState(null)
   const [hasFlyToMarker, setHasFlyToMarker] = useState(false)
   const [timeFrom, setTimeFrom] = useState(null)
@@ -231,12 +218,6 @@ export default function ThreatMap({ maxFilterDays, flyTo, onFlyToDone }) {
 
   const closeSidebar = useCallback(() => setSidebarLocation(null), [])
 
-  // Keep refs in sync so applyLayers always has latest values
-  const viewRef = useRef(view)
-  const geoDataRef = useRef(geoData)
-  viewRef.current = view
-  geoDataRef.current = geoData
-
   const geoParams = {
     time_range: isCustomTime ? null : timeRange,
     time_from: timeFrom,
@@ -244,28 +225,16 @@ export default function ThreatMap({ maxFilterDays, flyTo, onFlyToDone }) {
     mode,
   }
 
-  // Fetch geo data
-  useEffect(() => {
-    let mounted = true
-    setLoading(true)
-    setSidebarLocation(null)
-    fetchThreatGeo(geoParams)
-      .then(data => { if (mounted) setGeoData(data) })
-      .catch(() => {})
-      .finally(() => { if (mounted) setLoading(false) })
-    return () => { mounted = false }
-  }, [timeRange, timeFrom, timeTo, mode])
+  const { data: geoData, loading, error: geoError, refresh: refreshGeo } = useSerializedPoll({
+    params: geoParams, fetcher: fetchThreatGeo, intervalMs: 60000,
+  })
+  useEffect(() => { setSidebarLocation(null) }, [timeRange, timeFrom, timeTo, mode])
 
-  // Auto-refresh every 60s
-  useEffect(() => {
-    let mounted = true
-    const interval = setInterval(() => {
-      fetchThreatGeo(geoParams)
-        .then(data => { if (mounted) setGeoData(data) })
-        .catch(() => {})
-    }, 60000)
-    return () => { mounted = false; clearInterval(interval) }
-  }, [timeRange, timeFrom, timeTo, mode])
+  // Keep refs in sync so applyLayers always has latest values
+  const viewRef = useRef(view)
+  const geoDataRef = useRef(geoData)
+  viewRef.current = view
+  geoDataRef.current = geoData
 
   // Initialize map
   useEffect(() => {
@@ -375,7 +344,7 @@ export default function ThreatMap({ maxFilterDays, flyTo, onFlyToDone }) {
   // Re-apply layers when geoData or view changes
   useEffect(() => {
     const map = mapRef.current
-    if (!map || !geoData) return
+    if (!map) return
 
     // If style isn't ready yet, wait for idle then apply
     if (!map.isStyleLoaded()) {
@@ -611,6 +580,11 @@ export default function ThreatMap({ maxFilterDays, flyTo, onFlyToDone }) {
         </div>
       </div>
 
+      {geoError && <div role="alert" className="text-amber-400 text-xs px-4 py-2 flex gap-2">
+        <span>Map data could not be refreshed. {geoData ? 'Showing the previous result.' : 'Results are unavailable.'}</span>
+        <button type="button" className="underline" onClick={() => refreshGeo()}>Retry</button>
+      </div>}
+
       {/* Map + sidebar row */}
       <div className="flex-1 flex min-h-0">
         {/* Map container */}
@@ -618,7 +592,7 @@ export default function ThreatMap({ maxFilterDays, flyTo, onFlyToDone }) {
           <div ref={mapContainer} className="absolute inset-0" />
 
           {/* Empty state */}
-          {!loading && geoData?.features?.length === 0 && !hasFlyToMarker && (
+          {!loading && !geoError && geoData?.features?.length === 0 && !hasFlyToMarker && (
             <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-10">
               <div className="bg-gray-950/80 border border-gray-800 rounded-lg px-6 py-4 text-center">
                 <div className="text-gray-400 text-sm">No geo data available</div>

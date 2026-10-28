@@ -2,10 +2,10 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 // A changed filter invalidates the response, but waits for the request to settle
 // before starting another. Aborting fetch alone does not cancel a database query.
-export default function useSerializedPoll({ params, fetcher, enabled = true, intervalMs = 5000 }) {
+export default function useSerializedPoll({ params, fetcher, enabled = true, ready = true, intervalMs = 5000 }) {
   const key = JSON.stringify(params)
   const latest = useRef(null)
-  latest.current = { params, fetcher, enabled, intervalMs, key }
+  latest.current = { params, fetcher, enabled, ready, intervalMs, key }
   const state = useRef({ active: false, inflight: null, pending: null, timer: null, revision: 0 })
   const [result, setResult] = useState({ data: null, error: null, loading: true, key: null, loadedAt: null })
   const [visible, setVisible] = useState(() => document.visibilityState !== 'hidden')
@@ -23,7 +23,7 @@ export default function useSerializedPoll({ params, fetcher, enabled = true, int
 
   pump.current = () => {
     const s = state.current
-    if (!s.active || s.inflight || document.visibilityState === 'hidden') return
+    if (!s.active || s.inflight || !latest.current.ready || document.visibilityState === 'hidden') return
     const job = s.pending
     if (!job) return
     s.pending = null
@@ -44,7 +44,7 @@ export default function useSerializedPoll({ params, fetcher, enabled = true, int
         if (s.inflight === controller) s.inflight = null
         if (!s.active) return
         if (s.pending) pump.current()
-        else if (latest.current.enabled && document.visibilityState !== 'hidden') {
+        else if (latest.current.enabled && latest.current.ready && document.visibilityState !== 'hidden') {
           s.timer = setTimeout(() => request({}, { background: true }), latest.current.intervalMs)
         }
       })
@@ -59,7 +59,7 @@ export default function useSerializedPoll({ params, fetcher, enabled = true, int
       clearTimeout(s.timer)
       if (nextVisible) {
         if (s.pending) pump.current()
-        else if (latest.current.enabled && !s.inflight) request({}, { background: true })
+        else if (latest.current.enabled && latest.current.ready && !s.inflight) request({}, { background: true })
       }
     }
     document.addEventListener('visibilitychange', onVisibility)
@@ -73,15 +73,22 @@ export default function useSerializedPoll({ params, fetcher, enabled = true, int
     }
   }, [request])
 
-  useEffect(() => { request() }, [key, request])
+  useEffect(() => {
+    if (ready) request()
+    else {
+      state.current.revision++
+      state.current.pending = null
+      clearTimeout(state.current.timer)
+    }
+  }, [key, ready, request])
   useEffect(() => {
     const s = state.current
     clearTimeout(s.timer)
-    if (enabled && !s.inflight && !s.pending && document.visibilityState !== 'hidden') {
+    if (enabled && ready && !s.inflight && !s.pending && document.visibilityState !== 'hidden') {
       s.timer = setTimeout(() => request({}, { background: true }), intervalMs)
     }
     return () => clearTimeout(s.timer)
-  }, [enabled, intervalMs, request])
+  }, [enabled, ready, intervalMs, request])
 
   return { ...result, data: result.key === key ? result.data : null,
     error: result.key === key ? result.error : null, loadedAt: result.key === key ? result.loadedAt : null,

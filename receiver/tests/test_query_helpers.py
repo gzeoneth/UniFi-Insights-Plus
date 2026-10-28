@@ -199,11 +199,23 @@ class TestBuildLogQuery:
         assert 'dst_port = %s' in where
         assert 443 in params
 
-    def test_dst_port_invalid_ignored(self):
-        where, params = self._build(dst_port='abc')
-        # Invalid port ignored; only the 24h time fallback remains
-        assert 'dst_port' not in where
-        assert 'timestamp >= %s' in where
+    @pytest.mark.parametrize('value', ['abc', '70000', '65536', '80,', '!','90-80','80 OR TRUE'])
+    def test_invalid_port_rejected(self, value):
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as error:
+            self._build(dst_port=value)
+        assert error.value.status_code == 400
+
+    def test_port_list_and_range(self):
+        where, params = self._build(dst_port='1900,5353-5354')
+        assert 'dst_port BETWEEN %s AND %s' in where
+        assert params[-4:] == [1900, 1900, 5353, 5354]
+
+    def test_negated_source_port_list_keeps_nulls(self):
+        where, params = self._build(src_port='!1900,5353')
+        assert 'NOT (COALESCE(' in where
+        assert params[-4:] == [1900, 1900, 5353, 5353]
+
 
     def test_negated_protocol(self):
         where, params = self._build(protocol='!tcp')

@@ -44,10 +44,10 @@ class TestAnnotateIpPrecedence:
         assert name == 'ISP WAN'
         assert vlan is None
 
-    def test_wan_skipped_if_existing_name(self):
+    def test_current_wan_binding_replaces_saved_name(self):
         cfg = _cfg(wan_ip_names={'203.0.113.5': 'ISP WAN'})
         name, vlan, badge = annotate_ip(cfg, '203.0.113.5', existing_name='CustomDevice')
-        assert name == 'CustomDevice'
+        assert name == 'ISP WAN'
 
     def test_gateway_wins_over_wan(self):
         cfg = _cfg(
@@ -157,12 +157,26 @@ class TestAnnotateRecord:
         annotate_record(cfg, record)
         assert 'src_device_name' not in record
 
-    def test_preserves_existing_device_name(self):
+    def test_replaces_saved_wan_device_name(self):
         cfg = _cfg(wan_ip_names={'1.2.3.4': 'WAN'})
         record = {'src_ip': '1.2.3.4', 'src_device_name': 'CustomDevice'}
         annotate_record(cfg, record)
-        # existing name wins, WAN name NOT applied
-        assert record['src_device_name'] == 'CustomDevice'
+        assert record['src_device_name'] == 'WAN'
+        assert record['src_identity_source'] == 'wan_configuration'
+
+    def test_unknown_inventory_name_is_not_claimed_verified(self):
+        record = {'src_ip': '192.0.2.10', 'src_device_name': 'Speaker'}
+        annotate_record(_cfg(), record)
+        assert record['src_device_name'] == 'Speaker'
+        assert record['src_identity_source'] == 'inventory_or_log'
+
+    def test_gateway_address_does_not_verify_an_existing_inventory_name(self):
+        record = {'src_ip': '192.0.2.1', 'src_device_name': 'Saved label'}
+        cfg = _cfg(gateway_vlans={'192.0.2.1': {'vlan': 2}})
+        annotate_record(cfg, record)
+        assert record['src_device_name'] == 'Saved label'
+        assert record['src_identity_source'] == 'inventory_or_log'
+        assert record['src_device_vlan'] == 2
 
     def test_vpn_gateway_sets_network_badge(self):
         net = ipaddress.ip_network('10.13.13.0/24')

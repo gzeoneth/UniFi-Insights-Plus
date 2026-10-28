@@ -9,6 +9,7 @@ import Pagination from './Pagination'
 import { LOG_PRESETS, buildLogPresetFilters } from '../lib/logPresets'
 import useSerializedPoll from '../hooks/useSerializedPoll'
 import { LOG_PAGE_SIZE_KEY, logPageSize } from '../lib/pageSizes'
+import { flowDrillScope } from '../lib/flowDrillScope'
 
 const DEFAULT_FILTERS = {
   time_range: '24h',
@@ -67,15 +68,10 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
     if (drillFilters) {
       return {
         ...DEFAULT_FILTERS,
+        ...flowDrillScope(drillFilters),
         time_range: drillFilters.time_range || restored.time_range,
         time_from: drillFilters.time_from || null,
         time_to: drillFilters.time_to || null,
-        ip: null,
-        src_ip: drillFilters.src_ip || null,
-        dst_ip: drillFilters.dst_ip || null,
-        dst_port: drillFilters.dst_port?.toString() || null,
-        service: drillFilters.service || null,
-        log_type: 'firewall',
         page: 1,
         per_page: restored.per_page,
         sort: restored.sort,
@@ -122,15 +118,10 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
     if (!drillFilters) return
     setFilters(prev => ({
       ...DEFAULT_FILTERS,
+      ...flowDrillScope(drillFilters),
       time_range: drillFilters.time_range || prev.time_range,
       time_from: drillFilters.time_from || null,
       time_to: drillFilters.time_to || null,
-      ip: null,
-      src_ip: drillFilters.src_ip || null,
-      dst_ip: drillFilters.dst_ip || null,
-      dst_port: drillFilters.dst_port?.toString() || null,
-      service: drillFilters.service || null,
-      log_type: 'firewall',
       page: 1,
       per_page: prev.per_page,
       sort: prev.sort,
@@ -218,7 +209,8 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
   const data = poll.data || { data: [], total: null, pages: null, view_counts: null }
   const loading = poll.loading
   const lastUpdate = poll.loadedAt
-  const loadError = poll.error ? 'Could not load events for the current filters. Refresh to try again.' : ''
+  const loadError = poll.error
+    ? (poll.error.status === 400 ? poll.error.message : 'Could not load events for the current filters. Refresh to try again.') : ''
   const showDnsHelp = Boolean(poll.data) && !loading && !loadError && page === 1 && data.data.length === 0
     && filters.log_type === 'dns' && !excludeGroups
     && !Object.entries(filters).some(([key, value]) => !DNS_VIEW_CONTROLS.has(key) && value != null && value !== '' && value !== false)

@@ -10,6 +10,10 @@ Old stored source names are retained as a fallback unless the controller gives e
 
 This change does not rewrite historical rows. Names that cannot be checked against a controller record remain unchanged. The original stored value remains available in raw database backups and retention archives.
 
+WAN ownership is matched by configured gateway or per-device WAN addresses. A gateway-capable model can run as an access point, so its device type alone is insufficient. Current WAN mappings replace stale saved WAN labels on read. Ambiguous ownership uses the generic Gateway label. Names inherited from inventory or a saved log remain unverified; a shared MAC or an incorrect controller inventory cannot establish which physical endpoint sent a packet.
+
+Detailed UniFi CEF events show reported source/destination aliases and application separately from IP identity. Missing endpoint IPs remain missing. These fields are the gateway's claims, not reconstructed addresses. The registered port service is an IANA label for a port/protocol pair; it does not identify the actual application.
+
 The top-threat-IP query now groups by `remote_ip` and joins its reputation categories using that same address. For outbound traffic, this assigns the score to the remote destination. Rows without a known `remote_ip` are omitted from that table; they are not guessed to belong to the local source.
 
 ## Verification

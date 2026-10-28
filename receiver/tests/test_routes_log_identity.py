@@ -94,3 +94,16 @@ def test_threats_join_and_group_the_scored_remote_endpoint(identity_routes):
     assert 'l.src_ip' not in sql
     assert params == [stamp, ['0.0.0.0']]
     assert rows[0]['last_seen'] == stamp.isoformat()
+
+
+def test_api_exposes_cef_context_without_creating_endpoint_identity(identity_routes):
+    _, logs, _, _ = identity_routes
+    record = {'event_source': 'unifi_ips', 'src_ip': None, 'dst_ip': None,
+              'raw_log': '<14>Jan 01 00:00:00 gateway CEF:0|Ubiquiti|UniFi Network|1|201|Threat|7|'
+                         'UNIFIsrcClientAlias=Player UNIFIdstClientAlias=Player app=Media'}
+    logs._annotate_logs([record])
+    assert record['src_reported_name'] == 'Player'
+    assert record['dst_reported_name'] == 'Player'
+    assert record['reported_application'] == 'Media'
+    assert record['src_ip'] is None and record['dst_ip'] is None
+    assert 'src_device_name' not in record and 'dst_device_name' not in record

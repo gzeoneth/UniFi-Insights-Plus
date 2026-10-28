@@ -2,6 +2,17 @@
 
 The changes were tested against the upstream v3.7.2 base using synthetic events and disposable local databases. No live collector, gateway or production database was modified for these checks.
 
+## Flow and query performance release: 3.7.2-gzeon.5
+
+- 1,264 backend tests passed with all disposable PostgreSQL checks enabled. All 275 UI tests, the production UI build and a local ARM64 image build passed. All 48 runtime receiver files matched the tested checkout by SHA-256.
+- A disposable container received and inserted 1,207 synthetic firewall events and three DNS query events through UDP, with zero reported drops, parsing failures or flush errors. Both new security indexes were valid after startup.
+- Excluding a synthetic host removed its 1,205 firewall records consistently from the graph, matrix, pairs, host details, CSV and Log Stream, leaving two events between other endpoints. Rule totals returned one group without an implicit exact-count query. Port-list filters and 1,000-row cursor pagination returned the expected results.
+- Browser checks against that container confirmed the host exclusion, remaining graph/table entries and Flow-to-Log Stream drilldown with the exclusion and row protocol intact. Shared-hook tests cover rapid filter changes, deferred panels, hidden tabs, cache expiry and explicit refresh.
+- PostgreSQL tests cover full security-predicate equivalence, index-backed plans, qualified repair of a genuinely interrupted concurrent index, repeat upgrades, and IPv4/IPv6/masked/NULL zone pairs. Directional interface filters preserve reverse-path distinctions.
+- Independent review found and fixed lost drilldown scope and ambiguous empty-interface matrix selection. Empty-interface cells retain counts but cannot be selected. Oversized drill scopes fail validation instead of silently dropping conditions.
+
+Synthetic query measurements and field coverage are documented in [query indexes](query-indexes.md). The initial JavaScript bundle fell from approximately 2.03 MB to 613 KB before compression by loading map/chart dependencies only with their panels. The map chunk remains large when opened. None of these tests establishes production capacity or proves an image was published or deployed.
+
 ## Collection-status release: 3.7.2-gzeon.4
 
 - 1,226 backend tests passed with all disposable PostgreSQL checks enabled. All 243 UI tests and the production UI build passed. A local ARM64 image build passed.

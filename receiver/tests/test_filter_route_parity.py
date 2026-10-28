@@ -167,3 +167,35 @@ def test_rule_usage_keeps_conflicting_saved_type_and_reports_truncation(pg_clien
     assert len(body['data']) == 1
     assert body['truncated'] is True
     assert body['data'][0]['log_hits'] == 2
+
+
+def test_rule_totals_merge_endpoints_without_implicit_count(pg_client, monkeypatch):
+    client, _ = pg_client
+    module = sys.modules['routes.rule_usage']
+    count = MagicMock(side_effect=AssertionError('unrequested count'))
+    monkeypatch.setattr(module, 'query_view_counts', count)
+    response = client.get('/api/rules/usage?group_by=rule&count_mode=none')
+    assert response.status_code == 200
+    body = response.json()
+    assert body['view_counts'] is None and body['timings']['count_ms'] is None
+    assert body['timings']['query_ms'] >= 0
+    assert len(body['data']) == 1
+    assert body['data'][0]['log_hits'] == 4
+    assert 'src_ip' not in body['data'][0]
+    count.assert_not_called()
+
+
+def test_rule_totals_keep_actions_and_emitters_separate(pg_client):
+    client, conn = pg_client
+    with conn.cursor() as cur:
+        cur.execute("UPDATE logs SET hostname='gateway-a'")
+        cur.execute("UPDATE logs SET hostname='gateway-b' WHERE id=2")
+        cur.execute("UPDATE logs SET rule_action='block' WHERE id=3")
+    conn.commit()
+    response = client.get('/api/rules/usage?group_by=rule')
+    body = response.json()
+    assert body['view_counts'] == {'total': 4, 'visible': 4, 'hidden': 0}
+    assert {(r['hostname'], r['rule_action'], r['log_hits']) for r in body['data']} == {
+        ('gateway-a', 'allow', 2), ('gateway-a', 'block', 1), ('gateway-b', 'allow', 1)}
+    assert client.get('/api/rules/usage?group_by=invalid').status_code == 422
+    assert client.get('/api/rules/usage?count_mode=invalid').status_code == 422

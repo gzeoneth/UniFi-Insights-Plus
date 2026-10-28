@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react'
 import { fetchSecuritySummary } from '../api'
 import { formatNumber } from '../utils'
 import { CACHE_TTL_MS } from '../lib/sessionCache'
+import useSerializedPoll from '../hooks/useSerializedPoll'
 
 const COUNTERS = [
   ['ips_blocked', 'IPS blocked', 'text-red-400'],
@@ -12,28 +12,10 @@ const COUNTERS = [
 ]
 
 export default function SecuritySummary({ timeRange = '24h', timeFrom, timeTo }) {
-  const [data, setData] = useState(null)
-  const [error, setError] = useState(false)
-  const [refresh, setRefresh] = useState(0)
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      if (document.visibilityState === 'visible') setRefresh(value => value + 1)
-    }, CACHE_TTL_MS)
-    return () => clearInterval(interval)
-  }, [])
-
-  useEffect(() => {
-    const controller = new AbortController()
-    let active = true
-    setData(null)
-    setError(false)
-    fetchSecuritySummary({ time_range: timeRange, time_from: timeFrom, time_to: timeTo },
-      { signal: controller.signal })
-      .then(value => { if (active) setData(value) })
-      .catch(() => { if (active) setError(true) })
-    return () => { active = false; controller.abort() }
-  }, [timeRange, timeFrom, timeTo, refresh])
+  const { data, error, refresh } = useSerializedPoll({
+    params: { time_range: timeRange, time_from: timeFrom, time_to: timeTo },
+    fetcher: fetchSecuritySummary, intervalMs: CACHE_TTL_MS,
+  })
 
   return (
     <section aria-label="Security events" className="border border-gray-800 rounded-lg p-4">
@@ -41,7 +23,7 @@ export default function SecuritySummary({ timeRange = '24h', timeFrom, timeTo })
       {error ? (
         <div role="alert" className="text-sm text-red-400 flex items-center gap-3">
           <span>Security summary could not be loaded.</span>
-          <button type="button" onClick={() => setRefresh(value => value + 1)}
+          <button type="button" onClick={() => refresh()}
             className="text-teal-400 underline hover:text-teal-300">Retry</button>
         </div>
       ) : !data ? (

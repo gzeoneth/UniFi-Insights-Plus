@@ -8,7 +8,7 @@ export const FILTER_FIELDS = [
   ['protocol', 'Protocol'], ['log_type', 'Log type'], ['direction', 'Direction'], ['rule_action', 'Action'],
   ['rule_name', 'Rule name'], ['device', 'Either recorded device name'], ['src_device', 'Recorded source device name'],
   ['dst_device', 'Recorded destination device name'], ['country', 'Country code'], ['asn', 'ASN name'],
-  ['service', 'Service'], ['interface', 'Interface'], ['hostname', 'Hostname'], ['search', 'Raw message'],
+  ['service', 'Service'], ['interface', 'Either interface'], ['interface_in', 'Inbound interface'], ['interface_out', 'Outbound interface'], ['hostname', 'Hostname'], ['search', 'Raw message'],
   ['event_source', 'Event source'], ['source', 'Collector source'], ['ips_signature', 'IPS signature'],
   ['security_event', 'Security classification'],
   ['ips_signature_id', 'IPS signature ID'], ['ips_risk', 'IPS risk'], ['ips_severity', 'IPS severity (0–10)'],

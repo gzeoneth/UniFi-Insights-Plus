@@ -8,6 +8,7 @@ import {
 import { getThreatLevel } from '../lib/threatPresentation'
 import LogDetail from './LogDetail'
 import IPCell from './IPCell'
+import { PORT_SERVICE_DESCRIPTION } from '../lib/identityPresentation'
 
 // UniFi firewall icon (brick-wall pattern, fill-based)
 const UNIFI_FIREWALL_ICON = (
@@ -187,7 +188,7 @@ function LogRow({ log, isExpanded, detailedLog, onToggle, hiddenColumns, colCoun
 
         {/* Source */}
         <td className="px-2 py-1.5 text-[13px] whitespace-nowrap max-w-[120px] sm:max-w-[180px] truncate">
-          <IPCell ip={log.src_ip} port={log.src_port} deviceName={log.src_device_name} vlan={log.src_device_vlan} networkLabel={log.src_device_network} subline={srcSubline} />
+          <IPCell ip={log.src_ip} port={log.src_port} deviceName={log.src_device_name} identitySource={log.src_identity_source} vlan={log.src_device_vlan} networkLabel={log.src_device_network} subline={srcSubline} />
         </td>
 
         {/* Direction */}
@@ -197,7 +198,7 @@ function LogRow({ log, isExpanded, detailedLog, onToggle, hiddenColumns, colCoun
 
         {/* Destination */}
         <td className="px-2 py-1.5 text-[13px] whitespace-nowrap max-w-[120px] sm:max-w-[180px] truncate">
-          <IPCell ip={log.dst_ip} port={log.dst_port} deviceName={log.dst_device_name} vlan={log.dst_device_vlan} networkLabel={log.dst_device_network} subline={dstSubline} />
+          <IPCell ip={log.dst_ip} port={log.dst_port} deviceName={log.dst_device_name} identitySource={log.dst_identity_source} vlan={log.dst_device_vlan} networkLabel={log.dst_device_network} subline={dstSubline} />
         </td>
 
         {/* Country */}
@@ -236,7 +237,7 @@ function LogRow({ log, isExpanded, detailedLog, onToggle, hiddenColumns, colCoun
         )}
 
         {/* Service */}
-        <td className="hidden sm:table-cell px-2 py-1.5 text-[12px] text-gray-400">
+        <td className="hidden sm:table-cell px-2 py-1.5 text-[12px] text-gray-400" title={PORT_SERVICE_DESCRIPTION}>
           {formatServiceName(log.service_name)}
         </td>
 

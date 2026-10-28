@@ -659,6 +659,30 @@ def parse_cef_log(raw_log: str) -> dict | None:
     return parse_cef_threat(envelope[1]) if envelope else None
 
 
+def cef_reported_context(raw_log: str) -> dict:
+    """Read display context from retained UniFi CEF without resolving endpoints.
+
+    These aliases are the emitter's claims, not an address-to-device binding.
+    They remain separate from IP/name enrichment, including when IPs are absent.
+    """
+    if not isinstance(raw_log, str):
+        return {}
+    envelope = _syslog_envelope(raw_log)
+    header = _cef_header(envelope[1]) if envelope else None
+    if not header or header[1:3] != ['Ubiquiti', 'UniFi Network']:
+        return {}
+    ext = _parse_cef_extensions(header[-1])
+    result = {}
+    for prefix in ('src', 'dst'):
+        name = (ext.get(f'UNIFI{prefix}ClientAlias')
+                or ext.get(f'UNIFI{prefix}ClientHostname'))
+        if name:
+            result[f'{prefix}_reported_name'] = name[:255]
+    if ext.get('app'):
+        result['reported_application'] = ext['app'][:255]
+    return result
+
+
 def parse_system(body: str) -> dict:
     """Parse a system log line. Stores raw log only."""
     return {'log_type': 'system'}

@@ -518,3 +518,23 @@ def test_shutdown_reports_volatile_work_if_producer_cannot_finish(receiver, monk
         receiver._worker.join(2)
     assert receiver.stats['staged'] == 1
     assert receiver._spool.snapshot()['rows'] == 1
+
+
+def test_started_callback_runs_only_after_socket_and_intake_workers(receiver, monkeypatch):
+    import main
+    events = []
+    sock = MagicMock()
+    sock.bind.side_effect = lambda address: events.append('bound')
+    def receive(_size):
+        events.append('received')
+        receiver.request_stop()
+        return b'synthetic event', ('192.0.2.1', 514)
+    sock.recvfrom.side_effect = receive
+    monkeypatch.setattr(main.socket, 'socket', lambda *args: sock)
+    monkeypatch.setattr(receiver, '_start_workers', lambda: events.append('workers'))
+    monkeypatch.setattr(receiver, '_health_loop', lambda: None)
+    monkeypatch.setattr(receiver, 'stop', lambda: events.append('stopped'))
+    receiver.started_callback = lambda: events.append('maintenance-started')
+    receiver.start()
+    assert events == ['bound', 'workers', 'maintenance-started', 'received', 'stopped']
+    assert receiver.stats['received'] == 1

@@ -6,6 +6,11 @@ import re
 
 from fastapi import HTTPException
 
+# Keep existing imports compatible; the same predicates define partial indexes.
+from security_predicates import (
+    PARSED_IPS_SQL, UNPARSED_CEF_THREAT_SQL, SECURITY_EVENT_PREDICATES,
+)
+
 # SQL expressions are constants, never supplied by the caller.
 FIELDS = {
     'src_ip': ('ip', ('src_ip',)), 'dst_ip': ('ip', ('dst_ip',)),
@@ -16,6 +21,8 @@ FIELDS = {
     'direction': ('enum', ('direction',)), 'rule_action': ('enum', ('rule_action',)),
     'country': ('enum', ('geo_country',)), 'service': ('enum', ('service_name',)),
     'interface': ('enum', ('interface_in', 'interface_out')),
+    'interface_in': ('identifier', ('interface_in',)),
+    'interface_out': ('identifier', ('interface_out',)),
     'event_source': ('enum', ('event_source',)), 'source': ('enum', ('source',)),
     'ips_risk': ('enum', ('ips_risk',)),
     'ips_signature_id': ('enum', ('ips_signature_id',)),
@@ -77,6 +84,8 @@ def compile_filters(value, *, null_safe=False):
     to control NULLs. Text matches literal substrings (not wildcard patterns).
     Exact fields match the whole case-sensitive value, including commas and
     surrounding whitespace, rather than splitting comma-separated terms.
+    Directional interface identifiers are case-sensitive exact values, with
+    comma-separated alternatives; they retain plain indexable predicates.
     security_event selects the fixed categories ips and unparsed_cef; its
     present/missing operators mean any/no security classification.
     """
@@ -130,7 +139,7 @@ def compile_filters(value, *, null_safe=False):
                         _invalid(f'numeric value must be within 0..{upper}')
                     matches.append(f'{column} BETWEEN %s AND %s')
                     params.extend((low, high))
-                elif kind == 'exact':
+                elif kind in ('exact', 'identifier'):
                     matches.append(f'{column} = %s')
                     params.append(term)
                 elif kind == 'enum':
@@ -156,22 +165,6 @@ def compile_filters(value, *, null_safe=False):
     return conditions, params
 
 
-# Keep security detections visible even when an Everyday profile is broad.
-# Raw CEF protection also covers historical rows awaiting parser backfill.
-# Deliberately conservative: keep Threat-prefixed names and explicit IPS
-# metadata even when the old parser did not recognize the CEF header.
-PARSED_IPS_SQL = "(COALESCE(event_source IN ('unifi_ips', 'ips'), FALSE) OR ips_signature_id IS NOT NULL)"
-UNPARSED_CEF_THREAT_SQL = (
-    "(COALESCE(event_source NOT IN ('unifi_ips', 'ips'), TRUE) "
-    "AND ips_signature_id IS NULL "
-    "AND COALESCE(raw_log LIKE '%%CEF:%%' AND ("
-    "raw_log LIKE '%%|Threat%%' OR raw_log LIKE '%%UNIFIipsSignature%%' "
-    "OR raw_log ILIKE '%%UNIFIpolicyType=IDS/IPS%%'), FALSE))"
-)
-SECURITY_EVENT_PREDICATES = {
-    'ips': PARSED_IPS_SQL,
-    'unparsed_cef': UNPARSED_CEF_THREAT_SQL,
-}
 _SECURITY_VISIBLE = ' OR '.join(SECURITY_EVENT_PREDICATES.values())
 
 
