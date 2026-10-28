@@ -1,5 +1,6 @@
 import useSerializedPoll from '../hooks/useSerializedPoll'
 import { apiFetch } from '../api'
+import { collectionStatus } from '../lib/collectionStatus'
 
 const PROVIDERS = [
   ['geoip', 'GeoIP'], ['asn', 'ASN'], ['rdns', 'Reverse DNS'],
@@ -9,11 +10,13 @@ const LABELS = {
   ready: 'Ready', not_configured: 'Not configured', missing: 'Files missing',
   error: 'Error', pending: 'Pending', stalled: 'Worker stalled', unknown: 'Unknown',
   unavailable: 'Unavailable', stale: 'Stale', fresh: 'Fresh',
+  processing: 'Processing', delayed: 'Delayed',
 }
 const COLORS = {
   ready: 'text-emerald-400', fresh: 'text-emerald-400',
   error: 'text-red-400', stalled: 'text-red-400',
   pending: 'text-amber-300', missing: 'text-amber-300', stale: 'text-amber-300',
+  delayed: 'text-amber-300', processing: 'text-gray-200',
 }
 const number = value => typeof value === 'number' ? value.toLocaleString() : '—'
 const age = seconds => seconds == null ? 'Not observed' : seconds < 60
@@ -57,12 +60,13 @@ export default function CollectionHealth() {
   const queue = ingestion?.queue || {}
   const spool = ingestion?.spool || {}
   const enrichment = ingestion?.enrichment || {}
-  const state = snapshotError ? 'unavailable' : ingestion?.state || 'unknown'
+  const collection = collectionStatus(ingestion)
+  const state = snapshotError ? 'unavailable' : collection.receiverState
   const fresh = ingestion?.status === 'fresh'
   const rates = fresh ? ingestion?.rates || {} : {}
   const rate = value => typeof value === 'number' && Number.isFinite(value) ? `${value.toFixed(1)}/s` : 'Unknown'
-  const incomplete = ingestion?.collection?.incomplete || stats.dropped > 0 || stats.failed > 0 || stats.parse_exceptions > 0
-  const reasons = ingestion?.collection?.reasons || []
+  const reasons = collection.activeReasons
+  const parseLoss = stats.failed > 0 || stats.parse_exceptions > 0
   const timings = fresh ? ingestion?.timings || {} : {}
   const batch = fresh ? ingestion?.batch || {} : {}
 
@@ -87,11 +91,16 @@ export default function CollectionHealth() {
         {stats.dropped > 0 && <p role="alert" className="text-sm text-amber-300">
           Known collection loss this receiver session: {number(stats.dropped)} dropped rows/packets. This is a cumulative counter; it does not by itself indicate that collection is currently failing.
         </p>}
-        {incomplete && <p role="alert" className="text-sm text-amber-300">
-          Results may be incomplete: {reasons.includes('backlog') ? 'events are waiting to be written. ' : ''}
-          {stats.dropped > 0 ? 'Known lost events cannot appear in filters or counts. ' : ''}
-          {stats.failed > 0 || stats.parse_exceptions > 0 ? 'Some packets could not be parsed and are missing from searchable events. ' : ''}
-          {reasons.some(reason => ['worker_error', 'storage_error'].includes(reason)) ? 'A collection worker or retry store reported an error. ' : ''}
+        {collection.processing && !collection.attentionRequired && <p role="status" className="text-sm text-gray-400">
+          Processing recent events. New events are being collected and written; this is normal.
+        </p>}
+        {(reasons.length > 0 || parseLoss) && <p role="alert" className="text-sm text-amber-300">
+          Results may be incomplete: {reasons.includes('backlog_lag') ? 'events are taking longer than expected to be written. ' : ''}
+          {reasons.includes('queue_pressure') ? 'The receiver queue is nearing capacity. ' : ''}
+          {reasons.includes('delivery_retry') ? 'Database delivery is retrying after a failure. ' : ''}
+          {parseLoss ? 'Some packets could not be parsed and are missing from searchable events. ' : ''}
+          {reasons.some(reason => ['worker_error', 'storage_error', 'worker_stalled'].includes(reason)) ? 'A collection worker or retry store needs attention. ' : ''}
+          {reasons.some(reason => ['stale_snapshot', 'unavailable_snapshot'].includes(reason)) ? 'Current receiver status cannot be confirmed. ' : ''}
           An empty result does not prove that no matching traffic occurred.
         </p>}
         <dl className="grid grid-cols-2 lg:grid-cols-4 gap-3">

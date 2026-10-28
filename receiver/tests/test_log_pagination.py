@@ -58,6 +58,30 @@ def test_legacy_default_still_counts(logs_api):
     assert any('COUNT(*)' in call.args[0] for call in cur.execute.call_args_list)
 
 
+@pytest.mark.parametrize('per_page', [500, 1000])
+def test_large_pages_are_bounded_and_preserve_has_more(logs_api, per_page):
+    api, _, deps = logs_api
+    cur = deps.get_conn.return_value.cursor.return_value.__enter__.return_value
+    stamp = datetime.now(timezone.utc)
+    cur.fetchall.return_value = [
+        {'id': i, 'timestamp': stamp} for i in range(per_page + 1, 0, -1)
+    ]
+    response = api.get('/api/logs', params={'count_mode': 'none', 'per_page': per_page})
+    assert response.status_code == 200
+    result = response.json()
+    assert len(result['data']) == result['per_page'] == per_page
+    assert result['has_more'] is True
+    assert result['data'][-1]['id'] == 2
+    assert cur.execute.call_args.args[1][-2:] == [per_page + 1, 0]
+
+
+@pytest.mark.parametrize('per_page', [0, -1, 1001])
+def test_page_size_limit_rejects_unbounded_requests_before_database(logs_api, per_page):
+    api, _, deps = logs_api
+    assert api.get('/api/logs', params={'per_page': per_page}).status_code == 422
+    deps.get_conn.assert_not_called()
+
+
 @pytest.mark.parametrize('params', [
     {'count_mode': 'estimate'}, {'pagination': 'key'},
     {'cursor': 'bad'}, {'pagination': 'cursor', 'cursor': 'bad'},
@@ -174,6 +198,32 @@ def test_cursor_ties_frozen_window_new_inserts_counts_and_back(pg_api, order):
     for change in ({'src_ip': '192.0.2.2'}, {'order': 'asc' if order == 'desc' else 'desc'},
                    {'time_range': '24h'}, {'exclude_groups': '[]'}):
         assert api.get('/api/logs', params={**params, 'cursor': first['page_cursor'], **change}).status_code == 400
+
+
+def test_large_cursor_pages_cover_every_row_once_with_frozen_count(pg_api):
+    api, _, conn = pg_api
+    with conn.cursor() as cur:
+        cur.execute("""INSERT INTO logs(timestamp,log_type,src_ip,raw_log)
+            SELECT now() - interval '1 minute', 'dns', '192.0.2.10'::inet,
+                'synthetic query ' || n FROM generate_series(1,1205) AS n""")
+    conn.commit()
+    params = {'pagination': 'cursor', 'count_mode': 'none', 'per_page': 1000,
+              'time_range': '1h', 'order': 'asc', 'log_type': 'dns'}
+    first_response = api.get('/api/logs', params=params)
+    assert first_response.status_code == 200, first_response.text
+    first = first_response.json()
+    assert len(first['data']) == 1000 and first['has_more'] is True
+    second_response = api.get('/api/logs', params={**params, 'cursor': first['next_cursor']})
+    assert second_response.status_code == 200, second_response.text
+    second = second_response.json()
+    assert len(second['data']) == 205 and second['has_more'] is False
+    assert second['next_cursor'] is None and second['window'] == first['window']
+    assert [row['id'] for row in first['data'] + second['data']] == list(range(1, 1206))
+    recount = api.get('/api/logs', params={
+        **params, 'cursor': first['page_cursor'], 'count_mode': 'exact'
+    }).json()
+    assert recount['total'] == 1205 and recount['pages'] == 2
+    assert recount['data'] == first['data']
 
 
 @pytest.mark.parametrize('value,expected', [

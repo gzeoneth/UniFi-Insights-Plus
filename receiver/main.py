@@ -31,6 +31,7 @@ from db import (Database, get_config, set_config, build_conn_params, is_external
 from enrichment import Enricher
 from ingest_queue import RetrySpool, positive_env
 from ingest_metrics import IngestMetrics, bounded_seconds_env
+from ingest_health import collection_state
 from backfill import BackfillTask
 from blacklist import BlacklistFetcher
 from unifi_api import UniFiAPI
@@ -120,6 +121,7 @@ class SyslogReceiver:
         self.running = False
         self._shutdown_requested = False
         self.batch: list[dict] = []
+        self._batch_started_at = None
         self._processing_rows = 0
         self._staging_rows = 0
         self.batch_lock = threading.Lock()
@@ -361,6 +363,8 @@ class SyslogReceiver:
             finally:
                 self._metrics.observe('enrich', started)
             parsed['ingest_id'] = str(uuid.uuid4())
+            if not self.batch:
+                self._batch_started_at = time.monotonic()
             self.batch.append(parsed)
             if len(self.batch) >= self.batch_size:
                 self._flush_batch()
@@ -380,6 +384,7 @@ class SyslogReceiver:
     def _flush_batch(self):
         """Commit parsed events locally, then wake independent delivery."""
         if not self.batch:
+            self._batch_started_at = None
             self.last_flush = time.monotonic()
             return
         rows, self.batch = self.batch, []
@@ -407,6 +412,7 @@ class SyslogReceiver:
             return
         finally:
             self._staging_rows = 0
+            self._batch_started_at = None
             self._metrics.observe('spool_stage', started)
         self._delivery_wake.set()
 
@@ -502,16 +508,8 @@ class SyslogReceiver:
                        ('producer', self._workers['producer'], self._worker),
                        ('delivery', self._workers['delivery'], self._delivery_worker))}
         spool = self._spool.snapshot() if self._spool is not None else dict(self._spool_state)
-        reasons = []
-        if stats['dropped'] or stats['failed'] or stats['parse_exceptions']:
-            reasons.append('historical_loss')
-        if queue_depth or self.batch or self._processing_rows or self._staging_rows or spool['rows']:
-            reasons.append('backlog')
-        if any(value['failed'] or (self.running and not value['alive']) for value in workers.values()):
-            reasons.append('worker_error')
-        if self._spool_failed:
-            reasons.append('storage_error')
-        return {
+        batch_started = self._batch_started_at
+        snapshot = {
             'providers': providers,
             'enrichment': enrichment,
             'schema_version': 1, 'updated_at': time.time(), 'running': self.running,
@@ -522,11 +520,14 @@ class SyslogReceiver:
             'spool': dict(spool, failed=self._spool_failed),
             'workers': workers, 'rates': rates, 'timings': timings,
             'batch': {'size': self.batch_size, 'flush_interval_seconds': self.batch_timeout,
-                      'pending': len(self.batch), 'inflight': max(self._processing_rows, self._staging_rows)},
-            'collection': {'incomplete': bool(reasons), 'reasons': reasons},
+                      'pending': len(self.batch), 'inflight': max(self._processing_rows, self._staging_rows),
+                      'oldest_age_seconds': max(0, time.monotonic() - batch_started)
+                      if batch_started is not None else None},
             'retry': {'consecutive_failures': self.consecutive_flush_errors,
                       'next_retry_at': self._db_retry_at},
         }
+        snapshot['collection'] = collection_state(snapshot)
+        return snapshot
 
     def _write_status(self):
         if not self._status_path:

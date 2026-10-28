@@ -236,7 +236,7 @@ def _tools_catalog() -> list[dict]:
                     "pagination": {"type": "string", "enum": ["offset", "cursor"]},
                     "cursor": {"type": "string", "description": "Opaque next_cursor from an unchanged timestamp-sorted query"},
                     "page": {"type": "integer", "minimum": 1},
-                    "per_page": {"type": "integer", "description": "1-200"},
+                    "per_page": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Rows per page, 1-1000; default 50"},
                 },
             },
         },
@@ -480,8 +480,8 @@ def _encoded_exclusion_groups(value):
 def _tool_search_logs(args: dict) -> dict:
     page = _as_int(args.get('page'), 1)
     per_page = _as_int(args.get('per_page'), 50)
-    if per_page is not None and (per_page < 1 or per_page > 200):
-        raise ValueError("per_page must be between 1 and 200")
+    if per_page is not None and (per_page < 1 or per_page > 1000):
+        raise ValueError("per_page must be between 1 and 1000")
     return logs_routes.get_logs(
         log_type=args.get('log_type'),
         time_range=args.get('time_range'),

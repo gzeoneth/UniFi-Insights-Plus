@@ -168,3 +168,7 @@ def test_search_pagination_count_contract_and_legacy_defaults(mcp):
     schema = next(t for t in mcp._tools_catalog() if t['name'] == 'search_logs')['inputSchema']['properties']
     assert schema['count_mode']['enum'] == ['exact', 'none']
     assert schema['pagination']['enum'] == ['offset', 'cursor']
+    assert schema['per_page']['minimum'] == 1
+    assert schema['per_page']['maximum'] == 1000
+    mcp._tool_search_logs({'per_page': 1000})
+    assert mcp.logs_routes.get_logs.call_args.kwargs['per_page'] == 1000

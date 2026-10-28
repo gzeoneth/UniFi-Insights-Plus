@@ -37,6 +37,9 @@ def test_missing_file_is_unavailable_not_healthy(route):
     result = module.read_ingest_health()
     assert result['status'] == 'unavailable'
     assert result['state'] == 'unknown'
+    assert result['collection']['attention_required'] is True
+    assert result['collection']['attention_reasons'] == ['unavailable_snapshot']
+    assert result['collection']['state'] == 'unknown'
     deps.get_conn.assert_not_called()
 
 
@@ -62,6 +65,8 @@ def test_stale_snapshot_does_not_claim_provider_readiness(route):
     result = module.read_ingest_health()
     assert result['status'] == 'stale' and result['state'] == 'unknown'
     assert result['providers']['rdns']['status'] == 'pending'
+    assert 'stale_snapshot' in result['collection']['attention_reasons']
+    assert result['collection']['state'] == 'unknown'
 
 
 def test_legacy_retry_total_is_exposed_as_deliveries_not_actual_retries(route):
@@ -94,7 +99,9 @@ def test_fresh_publisher_does_not_hide_stalled_ingestion_worker(route):
 def test_invalid_snapshots_fail_closed(route, payload):
     module, path, _ = route
     path.write_text(payload)
-    assert module.read_ingest_health()['status'] == 'unavailable'
+    result = module.read_ingest_health()
+    assert result['status'] == 'unavailable'
+    assert result['collection']['attention_reasons'] == ['unavailable_snapshot']
 
 
 def test_snapshot_route_works_without_database(route):

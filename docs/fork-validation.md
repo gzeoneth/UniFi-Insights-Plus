@@ -2,6 +2,16 @@
 
 The changes were tested against the upstream v3.7.2 base using synthetic events and disposable local databases. No live collector, gateway or production database was modified for these checks.
 
+## Collection-status release: 3.7.2-gzeon.4
+
+- 1,226 backend tests passed with all disposable PostgreSQL checks enabled. All 243 UI tests and the production UI build passed. A local ARM64 image build passed.
+- A disposable container received 1,205 synthetic firewall events and three dnsmasq queries through UDP. All 1,208 were parsed and inserted, with zero reported drops, parse errors or flush errors. Ten observed snapshots of ordinary processing had pending records without requiring attention.
+- REST cursor pagination returned 1,000 and 205 firewall rows with 1,205 unique IDs. The browser displayed 1,000 rows on the first page and the remaining 208 mixed firewall/DNS rows on the next page. The page-size control and version label matched the build.
+- Health tests cover normal batching, aged queues/spools/batches, queue pressure, retries, worker/storage failures, stale snapshots and historical loss. Empty-batch timestamps cannot incorrectly classify newly queued work as stalled. The public endpoint recomputes collection status from allowlisted fields.
+- UI tests cover neutral processing, delayed collection, historical loss, older snapshots, persisted page size, cursor resets and DNS-only empty-state guidance. Synthetic A, AAAA and HTTPS query messages reached the DNS view through the built container's parser and database.
+
+These checks validate application behavior with supplied query messages. They do not establish that a particular gateway exports DNS query names. See [DNS logging](dns-logging.md) for source-side diagnosis.
+
 ## Performance release: 3.7.2-gzeon.3
 
 - 1,179 backend tests passed with all disposable PostgreSQL checks enabled. 218 UI tests and the production UI build passed. A local ARM64 container build passed; its application source hashes matched the tested checkout.

@@ -458,6 +458,36 @@ def test_worker_failure_is_visible_while_health_publisher_is_alive(receiver, mon
     assert 'worker_error' in snapshot['collection']['reasons']
 
 
+def test_batch_age_resets_after_staging_and_matches_public_classification(receiver, monkeypatch):
+    import main
+    monkeypatch.delitem(sys.modules, 'routes.health', raising=False)
+    health = importlib.import_module('routes.health')
+    started = time.monotonic()
+    clock = [started]
+    monkeypatch.setattr(main.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(main, 'parse_log', lambda raw: {'raw_log': raw})
+    # Model live workers while exercising the actual producer and snapshot path.
+    monkeypatch.setattr(receiver, '_worker', MagicMock())
+    monkeypatch.setattr(receiver, '_delivery_worker', MagicMock())
+    receiver.running = True
+    receiver._handle_message(b'synthetic first packet', ('192.0.2.1', 514))
+    clock[0] += 0.5
+    snapshot = receiver.health_snapshot()
+    assert snapshot['batch']['oldest_age_seconds'] == 0.5
+    assert snapshot['collection']['state'] == 'processing'
+    assert snapshot['collection']['attention_required'] is False
+    receiver._write_status()
+    assert health.read_ingest_health()['collection'] == snapshot['collection']
+
+    clock[0] += 12
+    assert receiver.health_snapshot()['collection']['attention_reasons'] == ['backlog_lag']
+    receiver._flush_batch()
+    assert receiver.health_snapshot()['batch']['oldest_age_seconds'] is None
+    receiver._handle_message(b'synthetic second packet', ('192.0.2.1', 514))
+    clock[0] += 0.2
+    assert receiver.health_snapshot()['batch']['oldest_age_seconds'] == pytest.approx(0.2)
+
+
 def test_shutdown_reports_volatile_work_if_producer_cannot_finish(receiver, monkeypatch):
     import main
     entered, release = threading.Event(), threading.Event()
@@ -482,7 +512,7 @@ def test_shutdown_reports_volatile_work_if_producer_cannot_finish(receiver, monk
         assert snapshot['workers']['producer']['alive'] is True
         assert snapshot['batch']['inflight'] == 1
         assert snapshot['batch']['pending'] == 0
-        assert 'backlog' in snapshot['collection']['reasons']
+        assert 'processing' in snapshot['collection']['reasons']
     finally:
         release.set()
         receiver._worker.join(2)

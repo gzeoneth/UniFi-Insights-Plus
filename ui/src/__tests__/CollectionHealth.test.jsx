@@ -91,7 +91,7 @@ describe('CollectionHealth', () => {
     await screen.findByText('120.5/s')
     expect(within(screen.getByText('Write rate').parentElement).getByText('80.5/s')).toBeTruthy()
     expect(within(screen.getByText('Current loss rate').parentElement).getByText('0.0/s')).toBeTruthy()
-    expect(screen.getByText(/Results may be incomplete/)).toHaveTextContent('events are waiting to be written')
+    expect(screen.getByText(/Results may be incomplete/)).toHaveTextContent('events are taking longer than expected to be written')
     expect(screen.getByText(/Results may be incomplete/)).toHaveTextContent('empty result does not prove')
     expect(screen.getByText(/oldest row 2m ago/)).toBeTruthy()
     expect(within(screen.getByText('Database delivery worker').parentElement).getByText('Error')).toBeTruthy()
@@ -108,6 +108,63 @@ describe('CollectionHealth', () => {
     }
     expect(screen.queryByText('100.0/s')).toBeNull()
     expect(screen.queryByText('0.0/s')).toBeNull()
+  })
+
+  it.each([
+    { incomplete: true, reasons: ['processing'], attention_required: false, attention_reasons: [], state: 'processing' },
+    { incomplete: true, reasons: ['backlog'] },
+  ])('shows ordinary batching as neutral processing with snapshot %o', async collection => {
+    apiFetch.mockImplementation(url => Promise.resolve(url.endsWith('/ingest') ? {
+      ...ingestion, state: 'pending', stats: { received: 100, inserted: 90, failed: 0, dropped: 0 },
+      queue: { depth: 0, capacity: 4096, oldest_age_seconds: 0 },
+      spool: { rows: 0, oldest_age_seconds: 0 },
+      batch: { pending: 10, inflight: 5, flush_interval_seconds: 1 }, collection,
+    } : {}))
+    render(<CollectionHealth />)
+    const message = await screen.findByText(/Processing recent events/)
+    expect(message).toHaveAttribute('role', 'status')
+    expect(message).not.toHaveClass('text-amber-300')
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(within(screen.getByText('Receiver').parentElement).getByText('Processing')).toBeTruthy()
+  })
+
+  it('keeps historical loss distinct from a current delivery problem', async () => {
+    apiFetch.mockImplementation(url => Promise.resolve(url.endsWith('/ingest') ? {
+      ...ingestion, stats: { dropped: 4, failed: 0 }, queue: { depth: 0 }, spool: { rows: 0 },
+      collection: { state: 'loss', attention_required: true, attention_reasons: ['historical_loss'] },
+    } : {}))
+    render(<CollectionHealth />)
+    await screen.findByText(/Known collection loss/)
+    expect(screen.queryByText(/Results may be incomplete/)).toBeNull()
+    expect(screen.queryByText(/Processing recent events/)).toBeNull()
+    expect(within(screen.getByText('Receiver').parentElement).getByText('Ready')).toBeTruthy()
+  })
+
+  it('shows actionable delay and failure reasons without treating them as normal processing', async () => {
+    apiFetch.mockImplementation(url => Promise.resolve(url.endsWith('/ingest') ? {
+      ...ingestion, stats: { dropped: 0, failed: 0 },
+      collection: { state: 'error', attention_required: true,
+        attention_reasons: ['backlog_lag', 'queue_pressure', 'delivery_retry', 'worker_stalled'] },
+    } : {}))
+    render(<CollectionHealth />)
+    const alert = await screen.findByText(/Results may be incomplete/)
+    expect(alert).toHaveTextContent('taking longer than expected')
+    expect(alert).toHaveTextContent('nearing capacity')
+    expect(alert).toHaveTextContent('retrying after a failure')
+    expect(alert).toHaveTextContent('needs attention')
+    expect(screen.queryByText(/Processing recent events/)).toBeNull()
+  })
+
+  it('detects an aged partial batch from an older snapshot without a queue backlog', async () => {
+    apiFetch.mockImplementation(url => Promise.resolve(url.endsWith('/ingest') ? {
+      ...ingestion, state: 'pending', stats: { dropped: 0, failed: 0 },
+      queue: { depth: 0 }, spool: { rows: 0 }, batch: { pending: 2, oldest_age_seconds: 25, flush_interval_seconds: 1 },
+      collection: { incomplete: true, reasons: ['backlog'] },
+    } : {}))
+    render(<CollectionHealth />)
+    expect(await screen.findByText(/Results may be incomplete/)).toHaveTextContent('taking longer than expected')
+    expect(screen.queryByText(/Processing recent events/)).toBeNull()
+    expect(within(screen.getByText('Receiver').parentElement).getByText('Delayed')).toBeTruthy()
   })
 
   it('shows batch and stage diagnostics on demand with missing timings left unknown', async () => {

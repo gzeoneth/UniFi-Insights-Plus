@@ -78,7 +78,7 @@ def get_logs(
     sort: str = Query("timestamp", description="Sort field"),
     order: str = Query("desc", description="asc or desc"),
     page: int = Query(1, ge=1),
-    per_page: int = Query(50, ge=1, le=200),
+    per_page: int = Query(50, ge=1, le=1000),
     count_mode: str = "exact",
     pagination: str = "offset",
     cursor: Optional[str] = None,
@@ -89,7 +89,7 @@ def get_logs(
         raise HTTPException(400, detail='cursor requires pagination=cursor')
     if pagination == 'cursor' and (sort != 'timestamp' or order.lower() not in ('asc', 'desc')):
         raise HTTPException(400, detail='Cursor pagination requires timestamp sort and asc/desc order')
-    if page < 1 or not 1 <= per_page <= 200:
+    if page < 1 or not 1 <= per_page <= 1000:
         raise HTTPException(400, detail='Invalid page or per_page')
     if pagination == 'cursor' and page != 1 and not cursor:
         raise HTTPException(400, detail='Use next_cursor to advance cursor pages')

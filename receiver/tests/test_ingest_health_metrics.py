@@ -85,7 +85,10 @@ def test_busy_producer_does_not_hide_stalled_database_delivery(read_snapshot):
         'producer': {'alive': True, 'failed': False, 'last_progress_at': now},
         'delivery': {'alive': True, 'failed': False, 'last_progress_at': now - 65}})
     assert result['state'] == 'stalled'
-    assert result['collection'] == {'incomplete': True, 'reasons': ['backlog']}
+    assert result['collection']['incomplete'] is True
+    assert result['collection']['attention_required'] is True
+    assert 'worker_stalled' in result['collection']['attention_reasons']
+    assert 'backlog_lag' in result['collection']['attention_reasons']
 
 
 def test_failed_delivery_worker_is_visible(read_snapshot):
@@ -124,17 +127,49 @@ def test_cumulative_loss_stays_visible_after_current_rate_recovers(read_snapshot
                            rates={'window_seconds': 60, 'dropped_per_second': 0})
     assert result['state'] == 'ready'
     assert result['rates']['dropped_per_second'] == 0
-    assert result['collection'] == {'incomplete': True, 'reasons': ['historical_loss']}
+    assert result['collection']['incomplete'] is True
+    assert result['collection']['attention_reasons'] == ['historical_loss']
+    assert result['collection']['state'] == 'loss'
 
 
 @pytest.mark.parametrize('counter', ['failed', 'parse_exceptions'])
 def test_parse_loss_is_incomplete_even_without_queue_drops(read_snapshot, counter):
     result = read_snapshot(stats={counter: 1})
-    assert result['collection'] == {'incomplete': True, 'reasons': ['historical_loss']}
+    assert result['collection']['incomplete'] is True
+    assert result['collection']['attention_reasons'] == ['historical_loss']
 
 
 @pytest.mark.parametrize('field', ['pending', 'inflight'])
 def test_unstaged_batch_is_pending(read_snapshot, field):
     result = read_snapshot(batch={field: 5})
     assert result['state'] == 'pending'
-    assert 'backlog' in result['collection']['reasons']
+    assert result['collection']['reasons'] == ['processing']
+    assert result['collection']['attention_required'] is False
+    assert result['collection']['state'] == 'processing'
+
+
+def test_recent_batches_are_incomplete_without_attention_warning(read_snapshot):
+    result = read_snapshot(queue={'depth': 2, 'capacity': 4096, 'oldest_age_seconds': 0.005},
+                           spool={'rows': 90, 'oldest_age_seconds': 0.06},
+                           batch={'pending': 12, 'oldest_age_seconds': 0.2,
+                                  'flush_interval_seconds': 1})
+    assert result['state'] == 'pending'
+    assert result['collection'] == {
+        'incomplete': True, 'reasons': ['processing'], 'attention_required': False,
+        'attention_reasons': [], 'state': 'processing', 'lag_threshold_seconds': 10.0}
+
+
+def test_partial_batch_age_is_allowlisted_and_exposes_lag(read_snapshot):
+    result = read_snapshot(batch={'pending': 4, 'oldest_age_seconds': 15})
+    assert result['batch']['oldest_age_seconds'] == 15
+    assert result['collection']['state'] == 'delayed'
+    assert result['collection']['attention_reasons'] == ['backlog_lag']
+
+
+def test_untrusted_collection_classification_is_recomputed(read_snapshot):
+    result = read_snapshot(spool={'rows': 1, 'oldest_age_seconds': 15},
+                           collection={'attention_required': False, 'attention_reasons': [],
+                                       'state': 'ready', 'lag_threshold_seconds': 999999})
+    assert result['collection']['attention_required'] is True
+    assert result['collection']['attention_reasons'] == ['backlog_lag']
+    assert result['collection']['lag_threshold_seconds'] == 10.0

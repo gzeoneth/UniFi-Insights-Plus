@@ -8,6 +8,7 @@ import LogTable from './LogTable'
 import Pagination from './Pagination'
 import { LOG_PRESETS, buildLogPresetFilters } from '../lib/logPresets'
 import useSerializedPoll from '../hooks/useSerializedPoll'
+import { LOG_PAGE_SIZE_KEY, logPageSize } from '../lib/pageSizes'
 
 const DEFAULT_FILTERS = {
   time_range: '24h',
@@ -38,6 +39,7 @@ const STORAGE_KEY = 'unifi-log-insight:log-types'
 const ACTION_STORAGE_KEY = 'unifi-log-insight:rule-action'
 const DIRECTION_STORAGE_KEY = 'unifi-log-insight:direction'
 const COLUMNS_STORAGE_KEY = 'unifi-log-insight:hidden-columns'
+const DNS_VIEW_CONTROLS = new Set(['log_type', 'time_range', 'time_from', 'time_to', 'page', 'per_page', 'sort', 'order'])
 
 const TOGGLEABLE_COLUMNS = [
   { key: 'country', label: 'Country' },
@@ -54,6 +56,7 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
     const restored = { ...DEFAULT_FILTERS }
     try {
       restored.time_range = sessionStorage.getItem(TR_KEY) || '24h'
+      restored.per_page = logPageSize(localStorage.getItem(LOG_PAGE_SIZE_KEY))
       const savedTypes = localStorage.getItem(STORAGE_KEY)
       if (savedTypes) restored.log_type = savedTypes
       const savedAction = localStorage.getItem(ACTION_STORAGE_KEY)
@@ -155,6 +158,10 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
 
   // Persist filter toggles to localStorage
   useEffect(() => {
+    try { localStorage.setItem(LOG_PAGE_SIZE_KEY, String(filters.per_page)) } catch (e) { /* private browsing */ }
+  }, [filters.per_page])
+
+  useEffect(() => {
     try {
       if (filters.log_type) localStorage.setItem(STORAGE_KEY, filters.log_type)
       else localStorage.removeItem(STORAGE_KEY)
@@ -212,6 +219,9 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
   const loading = poll.loading
   const lastUpdate = poll.loadedAt
   const loadError = poll.error ? 'Could not load events for the current filters. Refresh to try again.' : ''
+  const showDnsHelp = Boolean(poll.data) && !loading && !loadError && page === 1 && data.data.length === 0
+    && filters.log_type === 'dns' && !excludeGroups
+    && !Object.entries(filters).some(([key, value]) => !DNS_VIEW_CONTROLS.has(key) && value != null && value !== '' && value !== false)
 
   useEffect(() => {
     if (!poll.data) return
@@ -275,6 +285,13 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
     const nextCursor = cursorHistory.current.scopeKey === scopeKey ? cursorHistory.current.pages[page] : null
     if (cursorMode && !nextCursor) return
     setNavigation({ scopeKey, page, cursor: nextCursor })
+  }
+
+  const handlePerPageChange = (size) => {
+    setExpandedId(null)
+    setNavigation(null)
+    setFilters(prev => ({ ...prev, per_page: logPageSize(size), page: 1 }))
+    scrollRef.current?.scrollTo?.({ top: 0 })
   }
 
   const handlePresetSelect = preset => {
@@ -394,6 +411,13 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
         </div>
       </div>
 
+      {showDnsHelp && <aside aria-label="DNS logging help" className="mx-4 my-3 rounded border border-gray-700 px-3 py-2 text-xs text-gray-400">
+        <p>No parsed DNS query records match this time window. Firewall flows on port 53 do not contain the queried domain names.</p>
+        <p className="mt-1">Gateway DNS flow logging alone does not confirm DNS query logging or export. Check the time range and the resolver's query-log settings; a resolver query-log integration may be needed.{' '}
+          <a className="text-teal-400 underline hover:text-teal-300" href="https://github.com/gzeoneth/UniFi-Insights-Plus/blob/gzeon/insights-improvements/docs/dns-logging.md" target="_blank" rel="noreferrer">DNS logging guide</a>
+        </p>
+      </aside>}
+
       {/* Log table */}
       <div className="flex-1 relative overflow-hidden">
         <div className="h-full overflow-auto" ref={scrollRef}>
@@ -422,6 +446,7 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
         cursorMode={cursorMode}
         loading={loading}
         perPage={filters.per_page}
+        onPerPageChange={handlePerPageChange}
         onChange={handlePageChange}
         version={version}
         latestRelease={latestRelease}

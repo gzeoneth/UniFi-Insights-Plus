@@ -118,6 +118,70 @@ describe('Log Stream request scheduling', () => {
 })
 
 describe('count-free cursor browsing', () => {
+  it('explains DNS query logging only for an empty DNS-only view', async () => {
+    localStorage.setItem('unifi-log-insight:log-types', 'dns')
+    fetchLogs.mockResolvedValue(pageResult(null, { data: [], has_more: false }))
+    render(<LogStream />); await flush()
+    expect(screen.getByRole('complementary', { name: 'DNS logging help' })).toHaveTextContent('Firewall flows on port 53 do not contain the queried domain names')
+    expect(screen.getByRole('link', { name: 'DNS logging guide' })).toHaveAttribute('href', expect.stringContaining('docs/dns-logging.md'))
+    fireEvent.change(screen.getByLabelText('Source IP'), { target: { value: '192.0.2.10' } }); await flush()
+    expect(screen.queryByRole('complementary', { name: 'DNS logging help' })).toBeNull()
+  })
+
+  it.each(['firewall,dns', 'firewall', ''])('does not show DNS configuration guidance for empty %s views', async logType => {
+    localStorage.setItem('unifi-log-insight:log-types', logType)
+    fetchLogs.mockResolvedValue(pageResult(null, { data: [], has_more: false }))
+    render(<LogStream />); await flush()
+    expect(screen.queryByRole('complementary', { name: 'DNS logging help' })).toBeNull()
+  })
+
+  it('does not show DNS configuration guidance when records exist or the query failed', async () => {
+    localStorage.setItem('unifi-log-insight:log-types', 'dns')
+    render(<LogStream />); await flush()
+    expect(screen.queryByRole('complementary', { name: 'DNS logging help' })).toBeNull()
+    fetchLogs.mockRejectedValue(new Error('temporarily unavailable'))
+    fireEvent.click(screen.getByRole('button', { name: /Refresh/ })); await flush()
+    expect(screen.getByRole('alert')).toHaveTextContent('Could not load events')
+    expect(screen.queryByRole('complementary', { name: 'DNS logging help' })).toBeNull()
+  })
+
+  it('offers larger pages and discards the old cursor and count when page size changes', async () => {
+    render(<LogStream />); await flush()
+    const size = screen.getByRole('combobox', { name: 'Rows per page' })
+    expect([...size.options].map(option => option.value)).toEqual(['50', '100', '200', '500', '1000'])
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' })); await flush()
+    expect(fetchLogs.mock.lastCall[0]).toMatchObject({ page: 2, cursor: 'next-token', per_page: 50 })
+    fireEvent.change(size, { target: { value: '1000' } }); await flush()
+    expect(fetchLogs.mock.lastCall[0]).toMatchObject({ page: 1, cursor: null, per_page: 1000, count_mode: 'none' })
+    expect(screen.getByText('Page 1')).toBeTruthy()
+    expect(localStorage.getItem('unifi-log-insight:rows-per-page')).toBe('1000')
+    fireEvent.change(screen.getByLabelText('Source IP'), { target: { value: '192.0.2.10' } }); await flush()
+    expect(fetchLogs.mock.lastCall[0]).toMatchObject({ src_ip: '192.0.2.10', per_page: 1000, cursor: null })
+  })
+
+  it('restores a supported page size on remount and preserves pause while changing it', async () => {
+    localStorage.setItem('unifi-log-insight:rows-per-page', '500')
+    const { unmount } = render(<LogStream />); await flush()
+    expect(fetchLogs.mock.lastCall[0].per_page).toBe(500)
+    fireEvent.click(screen.getByRole('button', { name: 'Live' }))
+    fireEvent.change(screen.getByRole('combobox', { name: 'Rows per page' }), { target: { value: '200' } }); await flush()
+    expect(fetchLogs.mock.lastCall[0].per_page).toBe(200)
+    expect(screen.getByRole('button', { name: 'Paused' })).toBeTruthy()
+    const calls = fetchLogs.mock.calls.length
+    await advance(10000)
+    expect(fetchLogs).toHaveBeenCalledTimes(calls)
+    unmount()
+    render(<LogStream />); await flush()
+    expect(fetchLogs.mock.lastCall[0].per_page).toBe(200)
+  })
+
+  it.each(['999999', 'NaN', '-1', '0', '1000.5', '75'])('ignores invalid persisted page size %s', async value => {
+    localStorage.setItem('unifi-log-insight:rows-per-page', value)
+    render(<LogStream />); await flush()
+    expect(fetchLogs.mock.lastCall[0].per_page).toBe(50)
+    expect(screen.getByRole('combobox', { name: 'Rows per page' })).toHaveValue('50')
+  })
+
   it('uses next and previous page tokens, freezes recounts, and refreshes to the newest page', async () => {
     fetchLogs.mockImplementation(async params => params.cursor === 'next-token'
       ? pageResult('second-row', { page_cursor: 'next-token', next_cursor: null, has_more: false })

@@ -2,6 +2,8 @@
 
 Log Stream requests rows without an exact count by default. A filter matching millions of records no longer needs to count all of them before showing its first page. Use **Count matching events** when you need an exact total; counting pauses automatic refresh, and changing filters or refreshing invalidates that total. An unknown total is shown as unknown, not zero.
 
+Choose 50, 100, 200, 500 or 1,000 rows per page. The default remains 50; larger pages require more transfer and browser rendering work. Changing page size starts a new traversal. API and MCP requests also accept up to 1,000 rows per page.
+
 Timestamp sorting uses a cursor containing the last timestamp and row ID. The ID makes equal timestamps deterministic. Each traversal fixes its time window so moving to the next page does not slide a relative time filter forward. Refresh to start a new traversal and see newer records. Other sorts retain offset pagination. Cursor traversal is not a database snapshot: retention, backfill or edits can still change the records between requests.
 
 Pausing Log Stream stops its automatic row requests. Hidden tabs also suspend polling. Refreshes run serially, with the next scheduled after the current request finishes. Changing filters cancels or discards obsolete browser responses. A browser abort does not guarantee that an already submitted database statement stopped immediately; database statement timeouts still bound that work.
@@ -34,7 +36,9 @@ Larger batches amortize commit cost but use more memory and can increase latency
 
 The database-independent `/api/health/ingest` snapshot includes rolling rates, queue/spool age, producer and delivery worker state, batch settings and stage timings. Older snapshots report unavailable new metrics as unknown. Stale snapshots do not claim a current throughput rate.
 
-Current drop rate and cumulative dropped records have different meanings. A rate returning to zero means new loss has stopped during the sampled window; it does not restore missing history. Backlog means the view may be delayed. Failed workers or spool errors require investigation even if the API still answers. The public snapshot contains only allowlisted metrics, never raw events, query text, device names or credentials.
+Recent queued, batched or currently writing events show **Processing recent events** without an amber warning. Pending counts and completeness metadata remain available. Attention is required when recorded waiting time exceeds the greater of ten seconds or twice the flush interval, when the intake queue reaches 80% of capacity, or when retries, worker/storage failure, stalls or stale/missing health data prevent a healthy assessment.
+
+Current drop rate and cumulative dropped records have different meanings. A rate returning to zero means new loss has stopped during the sampled window; it does not restore missing history. Historical loss stays visible separately from current processing. Failed workers or spool errors require investigation even if the API still answers. The public snapshot contains only allowlisted metrics, never raw events, query text, device names or credentials.
 
 An empty filtered view is not proof that traffic did not occur. Check collection health, time range, view exclusions and gateway logging before using absence as evidence for a firewall change.
 

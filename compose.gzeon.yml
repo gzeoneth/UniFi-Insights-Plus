@@ -1,7 +1,7 @@
 name: unifi-insights-gzeon
 services:
   insights:
-    image: ${INSIGHTS_IMAGE:-ghcr.io/gzeoneth/unifi-insights-plus:3.7.2-gzeon.3}
+    image: ${INSIGHTS_IMAGE:-ghcr.io/gzeoneth/unifi-insights-plus:3.7.2-gzeon.4}
     pull_policy: ${INSIGHTS_PULL_POLICY:-missing}
     restart: unless-stopped
     stop_grace_period: 90s

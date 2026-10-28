@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException
 
 from db import Database, estimate_log_count, get_config, is_external_db
 from enrichment import get_abuseipdb_stats
+from ingest_health import collection_state, receiver_state
 from deps import get_conn, put_conn, enricher_db, APP_VERSION
 
 logger = logging.getLogger('api.health')
@@ -59,7 +60,8 @@ def _performance_snapshot(raw, snapshot, now):
                 for field in _TIMING_FIELDS} for stage in _TIMING_STAGES
     }
     snapshot['batch'] = {field: _number(_mapping(raw.get('batch')).get(field))
-                         for field in ('size', 'flush_interval_seconds', 'pending', 'inflight')}
+                         for field in ('size', 'flush_interval_seconds', 'pending', 'inflight',
+                                       'oldest_age_seconds')}
     snapshot['spool']['oldest_age_seconds'] = _number(
         _mapping(raw.get('spool')).get('oldest_age_seconds'))
     # Old receivers did not count staged records; do not imply they staged zero.
@@ -77,34 +79,6 @@ def _performance_snapshot(raw, snapshot, now):
         snapshot['workers'][name] = clean
 
 
-def _collection_state(snapshot):
-    """Derive completeness from sanitized evidence, not arbitrary producer text."""
-    reasons = []
-    if any(snapshot['stats'][key] for key in ('dropped', 'failed', 'parse_exceptions')):
-        reasons.append('historical_loss')
-    if (snapshot['queue']['depth'] or snapshot['spool']['rows']
-            or snapshot['batch']['pending'] or snapshot['batch']['inflight']):
-        reasons.append('backlog')
-    if (not snapshot['worker_alive'] or any(worker['failed'] is True or worker['alive'] is False
-                                           for worker in snapshot['workers'].values())):
-        reasons.append('worker_error')
-    if snapshot['spool']['failed']:
-        reasons.append('storage_error')
-    if snapshot['status'] != 'fresh':
-        reasons.append('stale_snapshot')
-    return {'incomplete': bool(reasons), 'reasons': reasons}
-
-
-def _worker_stalled(worker, pending, now, backlog_age=None):
-    if not pending or worker['alive'] is not True:
-        return False
-    if worker['busy_since']:
-        return now - worker['busy_since'] > 30
-    ages = [value for value in (worker['progress_age_seconds'], backlog_age) if value is not None]
-    # Old idle progress alone cannot make a newly arrived backlog stalled.
-    return bool(ages) and min(ages) > 30
-
-
 def read_ingest_health():
     """Read a bounded, allowlisted process snapshot; never query DB or providers.
 
@@ -113,6 +87,7 @@ def read_ingest_health():
     """
     unavailable = {'status': 'unavailable', 'state': 'unknown', 'updated_at': None,
                    'age_seconds': None, 'providers': {}}
+    unavailable['collection'] = collection_state(unavailable)
     path = os.environ.get('INGEST_STATUS_PATH', '/run/unifi-log-insight/receiver-health.json')
     try:
         with open(path, 'r', encoding='utf-8') as stream:
@@ -171,27 +146,9 @@ def read_ingest_health():
         progress = snapshot['last_progress_at']
         snapshot['progress_age_seconds'] = max(0, now - progress) if progress else None
         snapshot['receive_age_seconds'] = max(0, now - snapshot['last_receive_at']) if snapshot['last_receive_at'] else None
-        if snapshot['status'] == 'stale':
-            snapshot['state'] = 'unknown'
-        elif (not snapshot['running'] or not snapshot['worker_alive'] or snapshot['spool']['failed']
-              or any(worker['failed'] is True or worker['alive'] is False
-                     for worker in snapshot['workers'].values())):
-            snapshot['state'] = 'error'
-        elif (_worker_stalled(snapshot['workers']['producer'],
-                              snapshot['queue']['depth'] or snapshot['batch']['pending']
-                              or snapshot['batch']['inflight'], now,
-                              snapshot['queue']['oldest_age_seconds'] if snapshot['queue']['depth'] else None)
-              or _worker_stalled(snapshot['workers']['delivery'], snapshot['spool']['rows'], now,
-                                 snapshot['spool']['oldest_age_seconds'])):
-            snapshot['state'] = 'stalled'
-        elif (all(worker['alive'] is None for worker in snapshot['workers'].values())
-              and (snapshot['queue']['depth'] or snapshot['spool']['rows'])
-              and (not progress or now - progress > 30)):
-            snapshot['state'] = 'stalled'
-        elif (snapshot['retry']['consecutive_failures'] or snapshot['queue']['depth']
-              or snapshot['spool']['rows'] or snapshot['batch']['pending'] or snapshot['batch']['inflight']):
-            snapshot['state'] = 'pending'
-        snapshot['collection'] = _collection_state(snapshot)
+        snapshot['state'] = receiver_state(snapshot, now)
+        # Recompute from allowlisted evidence; never trust producer reason text.
+        snapshot['collection'] = collection_state(snapshot, now)
         return snapshot
     except FileNotFoundError:
         return dict(unavailable, reason='not_started')

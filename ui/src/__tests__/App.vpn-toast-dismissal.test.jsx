@@ -88,6 +88,29 @@ beforeEach(() => {
 })
 
 describe('collection status indicator', () => {
+  it('keeps normal pending processing neutral despite incomplete metadata', async () => {
+    fetchHealth.mockResolvedValue({ status: 'ok', version: '3.3.0', ingestion: {
+      status: 'fresh', state: 'pending', stats: { dropped: 0 }, batch: { pending: 12, inflight: 3 },
+      collection: { incomplete: true, reasons: ['processing'], attention_required: false, attention_reasons: [], state: 'processing' },
+    } })
+    render(<App />)
+    await screen.findByRole('button', { name: 'Processing recent events' })
+    expect(screen.queryByRole('button', { name: 'Collection needs attention' })).toBeNull()
+    expect(screen.queryByText('Collection incomplete')).toBeNull()
+    expect(screen.getByRole('button', { name: 'System status' }).querySelector('span')).toHaveClass('bg-emerald-400')
+  })
+
+  it.each(['backlog_lag', 'queue_pressure', 'worker_stalled', 'delivery_retry', 'stale_snapshot', 'unavailable_snapshot'])(
+    'shows an attention indicator for %s', async reason => {
+      fetchHealth.mockResolvedValue({ status: 'ok', version: '3.3.0', ingestion: {
+        stats: { dropped: 0 }, collection: { incomplete: true, attention_required: true, attention_reasons: [reason], state: 'delayed' },
+      } })
+      render(<App />)
+      await screen.findByRole('button', { name: 'Collection needs attention' })
+      expect(screen.queryByRole('button', { name: 'Processing recent events' })).toBeNull()
+      expect(screen.getByRole('button', { name: 'System status' }).querySelector('span')).toHaveClass('bg-amber-400')
+    })
+
   it('shows an amber loss indicator even when the API and database are reachable', async () => {
     fetchHealth.mockResolvedValue({ status: 'ok', version: '3.3.0', ingestion: { stats: { dropped: 4 } } })
     render(<App />)

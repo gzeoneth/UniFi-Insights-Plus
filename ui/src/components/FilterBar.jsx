@@ -672,7 +672,7 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
               setSrcPortSearch('')
               setProtocolSearch('')
               setSelectedProtocols([])
-              wrappedOnChange(RESET_FILTERS)
+              wrappedOnChange({ ...RESET_FILTERS, per_page: filters.per_page || RESET_FILTERS.per_page })
             }}
             className="text-xs text-gray-400 hover:text-gray-200 transition-colors"
           >

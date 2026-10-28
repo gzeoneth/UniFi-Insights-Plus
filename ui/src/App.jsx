@@ -16,6 +16,7 @@ import { fetchHealth, fetchConfig, fetchLatestRelease, dismissUpgradeModal, dism
 import { loadInterfaceLabels } from './utils'
 import { isVpnInterface } from './vpnUtils'
 import useSerializedPoll from './hooks/useSerializedPoll'
+import { collectionStatus } from './lib/collectionStatus'
 
 const fetchStatusHealth = (_params, options) => fetchHealth(options)
 
@@ -124,6 +125,7 @@ export default function App() {
   })
   const healthPoll = useSerializedPoll({ params: {}, fetcher: fetchStatusHealth, intervalMs: 15000 })
   const health = healthPoll.data
+  const collection = collectionStatus(health?.ingestion)
   const [latestRelease, setLatestRelease] = useState(null)
   const [showWizard, setShowWizard] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
@@ -800,11 +802,17 @@ export default function App() {
                 title="The receiver snapshot reports cumulative collection loss in its session. Open Collection health for current status and details.">
                 Collection loss: {health.ingestion.stats.dropped.toLocaleString()}
               </button>}
-              {health.ingestion?.collection?.incomplete && !(health.ingestion?.stats?.dropped > 0) && <button type="button"
+              {collection.attentionRequired && !(health.ingestion?.stats?.dropped > 0) && <button type="button"
                 onClick={() => setActiveTab('operations')}
                 className="text-xs text-amber-300 hover:text-amber-200"
-                title="Receiver backlog, errors or a stale snapshot mean recent results may be incomplete. Open Collection health.">
-                Collection incomplete
+                title="Collection delay, errors, missing events or an unavailable snapshot need attention. Open Collection health.">
+                Collection needs attention
+              </button>}
+              {collection.processing && !collection.attentionRequired && <button type="button"
+                onClick={() => setActiveTab('operations')}
+                className="hidden sm:inline text-xs text-gray-400 hover:text-gray-200"
+                title="Recent events are being collected and written. This is normal processing. Open Collection health.">
+                Processing recent events
               </button>}
               <div className="relative" ref={statusRef}>
                 <button
@@ -812,10 +820,10 @@ export default function App() {
                   onClick={() => setShowStatusTooltip(v => !v)}
                   className="flex items-center justify-center w-6 h-6 -m-1"
                   aria-label="System status"
-                  title={health.status !== 'ok' ? 'API/database health is not OK.' : health.ingestion?.stats?.dropped > 0 ? 'API/database reachable. Known collection loss was reported during this receiver session; this does not establish a current outage.' : 'API/database reachable. This does not confirm complete log collection.'}
+                  title={health.status !== 'ok' ? 'API/database health is not OK.' : health.ingestion?.stats?.dropped > 0 ? 'API/database reachable. Known collection loss was reported during this receiver session; this does not establish a current outage.' : collection.attentionRequired ? 'API/database reachable. Collection needs attention; open Collection health for details.' : 'API/database reachable. This does not confirm complete log collection.'}
                 >
                   <span className={`w-1.5 h-1.5 rounded-full ${
-                    health.status !== 'ok' ? 'bg-red-400' : health.ingestion?.stats?.dropped > 0 || health.ingestion?.collection?.incomplete ? 'bg-amber-400' : 'bg-emerald-400'
+                    health.status !== 'ok' ? 'bg-red-400' : collection.attentionRequired ? 'bg-amber-400' : 'bg-emerald-400'
                   }`} />
                 </button>
                 {showStatusTooltip && (
