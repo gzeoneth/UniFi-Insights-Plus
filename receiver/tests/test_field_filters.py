@@ -120,3 +120,17 @@ def test_existing_query_builder_keeps_basic_and_advanced_conditions_together(pg_
     with pg_rows.cursor() as cursor:
         cursor.execute('SELECT id FROM filter_rows WHERE ' + where, params)
         assert cursor.fetchall() == [(1,)]
+
+
+def test_positive_exact_ip_exposes_btree_predicate_and_exclusion_groups_remain_null_safe():
+    predicate, params = compile_filters([rule('src_ip', '192.0.2.1')])
+    assert predicate == ['(src_ip = %s::inet)'] and params == ['192.0.2.1']
+    nullable, _ = compile_filters([rule('src_ip', '192.0.2.1')], null_safe=True)
+    assert nullable == ['COALESCE((src_ip = %s::inet), FALSE)']
+
+
+def test_numeric_enum_is_exact_while_text_enum_preserves_case_insensitivity():
+    predicate, params = compile_filters([rule('ips_signature_id', '900001')])
+    assert predicate == ['(ips_signature_id = %s)'] and params == ['900001']
+    predicate, _ = compile_filters([rule('protocol', 'TcP')])
+    assert predicate == ['(LOWER(protocol) = LOWER(%s))']

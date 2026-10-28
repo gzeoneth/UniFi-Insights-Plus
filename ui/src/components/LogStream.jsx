@@ -7,6 +7,7 @@ import FieldFilters from './FieldFilters'
 import LogTable from './LogTable'
 import Pagination from './Pagination'
 import { LOG_PRESETS, buildLogPresetFilters } from '../lib/logPresets'
+import useSerializedPoll from '../hooks/useSerializedPoll'
 
 const DEFAULT_FILTERS = {
   time_range: '24h',
@@ -49,7 +50,6 @@ const TOGGLEABLE_COLUMNS = [
 
 export default function LogStream({ version, latestRelease, maxFilterDays, drillFilters, onDrillConsumed, interfaces: prefetchedInterfaces, onPauseChange, uiSettings }) {
   const { excludeGroups, openDraft, setShowAll } = useExclusionProfile()
-  const requestEpoch = useRef(0)
   const [filters, setFilters] = useState(() => {
     const restored = { ...DEFAULT_FILTERS }
     try {
@@ -81,14 +81,9 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
     }
     return restored
   })
-  const [data, setData] = useState({ data: [], total: 0, page: 1, pages: 0 })
-  const [loading, setLoading] = useState(true)
-  const [loadError, setLoadError] = useState('')
   const [autoRefresh, setAutoRefresh] = useState(true)
-  const [lastUpdate, setLastUpdate] = useState(null)
   const [expandedId, setExpandedId] = useState(null)
   const [detailedLog, setDetailedLog] = useState(null)
-  const [pendingCount, setPendingCount] = useState(0)
   const [hiddenColumns, setHiddenColumns] = useState(() => {
     try {
       const saved = localStorage.getItem(COLUMNS_STORAGE_KEY)
@@ -98,9 +93,6 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
   })
   const [showColumnsMenu, setShowColumnsMenu] = useState(false)
   const columnsMenuRef = useRef(null)
-  const filtersRef = useRef(filters)
-  filtersRef.current = filters
-  const pendingRef = useRef(null)
   const scrollRef = useRef(null)
   const [showScrollTop, setShowScrollTop] = useState(false)
   const [drillContext, setDrillContext] = useState(null)
@@ -206,32 +198,37 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
     return () => document.removeEventListener('mousedown', handler)
   }, [showColumnsMenu])
 
-  // Effective auto-refresh: paused when a row is expanded
-  const isRefreshing = autoRefresh && expandedId === null
+  const scopeKey = JSON.stringify({ ...filters, page: undefined, exclude_groups: excludeGroups })
+  const [navigation, setNavigation] = useState(null)
+  const page = navigation?.scopeKey === scopeKey ? navigation.page : 1
+  const cursor = navigation?.scopeKey === scopeKey ? navigation.cursor : null
+  const cursorHistory = useRef({ scopeKey: null, pages: [] })
+  const cursorMode = !filters.sort || filters.sort === 'timestamp'
+  const isRefreshing = autoRefresh && expandedId === null && page === 1 && !cursor
+  const params = { ...filters, page, sort: filters.sort || 'timestamp', order: filters.order || 'desc', exclude_groups: excludeGroups, count_mode: 'none',
+    pagination: cursorMode ? 'cursor' : 'offset', cursor: cursorMode ? cursor : null }
+  const poll = useSerializedPoll({ params, fetcher: fetchLogs, enabled: isRefreshing })
+  const data = poll.data || { data: [], total: null, pages: null, view_counts: null }
+  const loading = poll.loading
+  const lastUpdate = poll.loadedAt
+  const loadError = poll.error ? 'Could not load events for the current filters. Refresh to try again.' : ''
 
-  // Notify parent of pause state changes
-  useEffect(() => { onPauseChange?.(!isRefreshing) }, [isRefreshing, onPauseChange])
-
-  // When paused (manually or by expanding a row), silently check for new logs count
   useEffect(() => {
-    let active = true
-    if (pendingRef.current) clearInterval(pendingRef.current)
-    if (!isRefreshing && filters.page === 1) {
-      pendingRef.current = setInterval(async () => {
-        try {
-          const qs = new URLSearchParams()
-          for (const [k, v] of Object.entries({ ...filters, exclude_groups: excludeGroups })) {
-            if (v !== null && v !== undefined && v !== '') qs.set(k, v)
-          }
-          qs.set('per_page', '1')
-          const result = await fetchLogs(Object.fromEntries(qs))
-          const diff = result.total - data.total
-          if (active && diff > 0) setPendingCount(diff)
-        } catch {}
-      }, 5000)
+    if (!poll.data) return
+    if (cursorHistory.current.scopeKey !== scopeKey || (page === 1 && !cursor)) {
+      cursorHistory.current = { scopeKey, pages: [] }
     }
-    return () => { active = false; if (pendingRef.current) clearInterval(pendingRef.current) }
-  }, [isRefreshing, filters, data.total, excludeGroups])
+    cursorHistory.current.pages[page] = poll.data.page_cursor || cursor
+    cursorHistory.current.pages[page + 1] = poll.data.next_cursor
+  }, [poll.data, scopeKey, page, cursor])
+
+  useEffect(() => { onPauseChange?.(!isRefreshing || !poll.visible) }, [isRefreshing, poll.visible, onPauseChange])
+
+  const refreshLatest = () => {
+    setExpandedId(null)
+    if (page !== 1 || cursor) setNavigation(null)
+    else poll.refresh()
+  }
 
   // Fetch detail data when a row is expanded
   useEffect(() => {
@@ -243,16 +240,12 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
     return () => { cancelled = true }
   }, [expandedId])
 
-  // Auto-resume: when row is collapsed, refresh immediately
+  // Collapsing resumes the regular polling delay without adding a second request.
   const handleToggleExpand = (id) => {
     if (expandedId === id) {
       setExpandedId(null)
-      setPendingCount(0)
-      // Refresh silently on collapse — no skeleton so the user keeps their place
-      load(filters, { background: true })
     } else {
       setExpandedId(id)
-      setPendingCount(0)
     }
   }
 
@@ -265,47 +258,10 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
     return () => el.removeEventListener('scroll', handleScroll)
   }, [])
 
-  // Stable load function — reads filters from ref to avoid effect cascades
-  const load = useCallback(async (f, { background } = {}) => {
-    const epoch = ++requestEpoch.current
-    try {
-      if (!background) setLoading(true)
-      const result = await fetchLogs({ ...(f || filtersRef.current), exclude_groups: excludeGroups })
-      if (epoch !== requestEpoch.current) return
-      setData(result)
-      setLoadError('')
-      setLastUpdate(new Date())
-    } catch (err) {
-      if (epoch === requestEpoch.current) {
-        setLoadError('Could not load events for the current filters. Refresh to try again.')
-        if (!background) setData({ data: [], total: 0, page: 1, pages: 0 })
-      }
-    } finally {
-      if (epoch === requestEpoch.current) setLoading(false)
-    }
-  }, [excludeGroups])
-
-  useEffect(() => {
-    setFilters(current => ({ ...current, page: 1 }))
-    setExpandedId(null); setPendingCount(0)
-  }, [excludeGroups])
-
-  // Load on filter change
-  useEffect(() => {
-    load(filters)
-    return () => { requestEpoch.current++ }
-  }, [filters, load])
-
-  // Auto-refresh every 5s when on page 1 and no row expanded
-  useEffect(() => {
-    if (!isRefreshing || filters.page !== 1) return
-    const id = setInterval(() => load(null, { background: true }), 5000)
-    return () => clearInterval(id)
-  }, [isRefreshing, filters.page, load])
+  useEffect(() => { setExpandedId(null) }, [excludeGroups])
 
   const handleFilterChange = (newFilters) => {
     setExpandedId(null)
-    setPendingCount(0)
     setFilters({ ...newFilters, page: 1 })
     // Persist time range within this session (shared across views via sessionStorage)
     try {
@@ -316,8 +272,9 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
 
   const handlePageChange = (page) => {
     setExpandedId(null)
-    setPendingCount(0)
-    setFilters(f => ({ ...f, page }))
+    const nextCursor = cursorHistory.current.scopeKey === scopeKey ? cursorHistory.current.pages[page] : null
+    if (cursorMode && !nextCursor) return
+    setNavigation({ scopeKey, page, cursor: nextCursor })
   }
 
   const handlePresetSelect = preset => {
@@ -341,7 +298,7 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
       <div className="px-4 py-2.5 border-b border-gray-800 bg-gray-950 relative z-20">
         <FilterBar filters={filters} onChange={handleFilterChange} maxFilterDays={maxFilterDays} prefetchedInterfaces={prefetchedInterfaces} hiddenLogTypes={hiddenLogTypes} />
         <FieldFilters filters={filters} onChange={handleFilterChange} presets={LOG_PRESETS} onPresetSelect={handlePresetSelect} profileApplied={!!excludeGroups} />
-        {!loading && <ExclusionCounts counts={data.view_counts} />}
+        {!loading && <ExclusionCounts counts={data.view_counts} unknown={Boolean(excludeGroups)} />}
         {loadError && <p role="alert" className="text-sm text-red-400">{loadError}</p>}
       </div>
 
@@ -349,27 +306,26 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
       <div className="flex items-center justify-between px-4 py-1.5 border-b border-gray-800/50 bg-gray-950">
         <div className="flex items-center gap-3">
           <button
-            onClick={() => { setAutoRefresh(!autoRefresh); setPendingCount(0) }}
+            onClick={() => {
+              if (cursor || page > 1) { setNavigation(null); setAutoRefresh(true) }
+              else setAutoRefresh(value => !value)
+            }}
             className={`flex items-center gap-1.5 text-[11px] transition-colors ${
               isRefreshing ? 'text-emerald-400' : 'text-amber-400'
             }`}
           >
-            <span className={`w-1.5 h-1.5 rounded-full ${isRefreshing ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
-            {isRefreshing ? 'Live' : 'Paused'}
+            <span className={`w-1.5 h-1.5 rounded-full ${isRefreshing && poll.visible ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
+            {isRefreshing && poll.visible ? 'Live' : 'Paused'}
           </button>
-          {pendingCount > 0 && (
-            <button
-              onClick={() => { setExpandedId(null); setPendingCount(0); load(filters) }}
-              className="text-[11px] text-amber-400 hover:text-amber-300 transition-colors"
-            >
-              {pendingCount} new log{pendingCount !== 1 ? 's' : ''} ↻
-            </button>
-          )}
+          {(!isRefreshing || !poll.visible) && <span className="text-[10px] text-gray-500">Automatic requests stopped</span>}
           {lastUpdate && (
             <span className="text-[10px] text-gray-500">
               Updated {lastUpdate.toLocaleTimeString('en-GB')}
             </span>
           )}
+          {data.timings?.query_ms != null && <span className="text-[10px] text-gray-500">
+            Page {Math.round(data.timings.query_ms)} ms{data.timings.count_ms != null ? ` · count ${Math.round(data.timings.count_ms)} ms` : ''}
+          </span>}
         </div>
         <div className="flex items-center gap-2">
           <div className="relative inline-flex items-center" ref={columnsMenuRef}>
@@ -415,10 +371,19 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
             })()}
           </div>
           <button
-            onClick={() => load(filters)}
+            onClick={refreshLatest}
             className="text-[11px] text-gray-400 hover:text-gray-200 transition-colors"
           >
             ↻ Refresh
+          </button>
+          <button type="button" disabled={loading}
+            onClick={() => {
+              setAutoRefresh(false)
+              poll.refresh({ count_mode: 'exact', cursor: data.page_cursor || cursor })
+            }}
+            className="text-[11px] text-gray-400 hover:text-gray-200 disabled:opacity-40"
+            title="Pause updates and count all matching events in this time window. This can take longer than loading a page.">
+            Count matching events
           </button>
           <a
             href={getExportUrl({ ...filters, exclude_groups: excludeGroups })}
@@ -449,9 +414,13 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
 
       {/* Pagination */}
       <Pagination
-        page={data.page}
+        page={page}
         pages={data.pages}
         total={data.total}
+        rowCount={data.data.length}
+        hasMore={data.has_more ?? (data.pages != null && page < data.pages)}
+        cursorMode={cursorMode}
+        loading={loading}
         perPage={filters.per_page}
         onChange={handlePageChange}
         version={version}

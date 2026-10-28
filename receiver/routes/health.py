@@ -20,18 +20,89 @@ router = APIRouter()
 
 
 _COUNTERS = (
-    'received', 'parsed', 'filtered', 'failed', 'inserted', 'duplicates',
+    'received', 'parsed', 'filtered', 'failed', 'staged', 'inserted', 'duplicates',
     'flush_errors', 'dropped', 'parse_exceptions', 'enrich_exceptions',
     'queue_dropped', 'spool_dropped', 'spool_errors', 'delivery_attempts', 'retry_attempts', 'shutdown_dropped',
 )
 _PROVIDER_NAMES = ('geoip', 'asn', 'rdns', 'abuseipdb', 'unifi')
 _PROVIDER_STATES = {'not_configured', 'ready', 'missing', 'error', 'pending'}
+_RATE_FIELDS = ('received_per_second', 'staged_per_second', 'inserted_per_second',
+                'dropped_per_second', 'queue_dropped_per_second')
+_TIMING_STAGES = ('parse', 'enrich', 'spool_stage', 'db_insert', 'spool_ack')
+_TIMING_FIELDS = ('count', 'total_ms', 'last_ms', 'max_ms', 'mean_ms')
 
 
 def _number(value, default=None):
-    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
-        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            if math.isfinite(value) and value >= 0:
+                return value
+        except OverflowError:
+            pass
     return default
+
+
+def _mapping(value):
+    return value if isinstance(value, dict) else {}
+
+
+def _performance_snapshot(raw, snapshot, now):
+    """Allowlist additive metrics; missing older metrics remain unknown."""
+    fresh = snapshot['status'] == 'fresh'
+    rates = _mapping(raw.get('rates'))
+    window = _number(rates.get('window_seconds'))
+    snapshot['rates'] = {'window_seconds': window}
+    for field in _RATE_FIELDS:
+        snapshot['rates'][field] = _number(rates.get(field)) if fresh and window else None
+    snapshot['timings'] = {
+        stage: {field: _number(_mapping(_mapping(raw.get('timings')).get(stage)).get(field))
+                for field in _TIMING_FIELDS} for stage in _TIMING_STAGES
+    }
+    snapshot['batch'] = {field: _number(_mapping(raw.get('batch')).get(field))
+                         for field in ('size', 'flush_interval_seconds', 'pending', 'inflight')}
+    snapshot['spool']['oldest_age_seconds'] = _number(
+        _mapping(raw.get('spool')).get('oldest_age_seconds'))
+    # Old receivers did not count staged records; do not imply they staged zero.
+    snapshot['stats']['staged'] = _number(_mapping(raw.get('stats')).get('staged'))
+    snapshot['workers'] = {}
+    for name in ('producer', 'delivery'):
+        worker = _mapping(_mapping(raw.get('workers')).get(name))
+        clean = {field: worker.get(field) if isinstance(worker.get(field), bool) else None
+                 for field in ('alive', 'failed')}
+        for field in ('last_progress_at', 'busy_since'):
+            value = _number(worker.get(field))
+            clean[field] = value if value and value <= now + 5 else None
+        clean['progress_age_seconds'] = (
+            max(0, now - clean['last_progress_at']) if clean['last_progress_at'] else None)
+        snapshot['workers'][name] = clean
+
+
+def _collection_state(snapshot):
+    """Derive completeness from sanitized evidence, not arbitrary producer text."""
+    reasons = []
+    if any(snapshot['stats'][key] for key in ('dropped', 'failed', 'parse_exceptions')):
+        reasons.append('historical_loss')
+    if (snapshot['queue']['depth'] or snapshot['spool']['rows']
+            or snapshot['batch']['pending'] or snapshot['batch']['inflight']):
+        reasons.append('backlog')
+    if (not snapshot['worker_alive'] or any(worker['failed'] is True or worker['alive'] is False
+                                           for worker in snapshot['workers'].values())):
+        reasons.append('worker_error')
+    if snapshot['spool']['failed']:
+        reasons.append('storage_error')
+    if snapshot['status'] != 'fresh':
+        reasons.append('stale_snapshot')
+    return {'incomplete': bool(reasons), 'reasons': reasons}
+
+
+def _worker_stalled(worker, pending, now, backlog_age=None):
+    if not pending or worker['alive'] is not True:
+        return False
+    if worker['busy_since']:
+        return now - worker['busy_since'] > 30
+    ages = [value for value in (worker['progress_age_seconds'], backlog_age) if value is not None]
+    # Old idle progress alone cannot make a newly arrived backlog stalled.
+    return bool(ages) and min(ages) > 30
 
 
 def read_ingest_health():
@@ -83,6 +154,7 @@ def read_ingest_health():
             snapshot['stats']['retry_attempts'] = None
         spool = raw.get('spool')
         snapshot['spool']['failed'] = isinstance(spool, dict) and spool.get('failed') is True
+        _performance_snapshot(raw, snapshot, now)
         providers = raw.get('providers')
         providers = providers if isinstance(providers, dict) else {}
         snapshot['providers'] = {}
@@ -101,12 +173,25 @@ def read_ingest_health():
         snapshot['receive_age_seconds'] = max(0, now - snapshot['last_receive_at']) if snapshot['last_receive_at'] else None
         if snapshot['status'] == 'stale':
             snapshot['state'] = 'unknown'
-        elif not snapshot['running'] or not snapshot['worker_alive'] or snapshot['spool']['failed']:
+        elif (not snapshot['running'] or not snapshot['worker_alive'] or snapshot['spool']['failed']
+              or any(worker['failed'] is True or worker['alive'] is False
+                     for worker in snapshot['workers'].values())):
             snapshot['state'] = 'error'
-        elif (snapshot['queue']['depth'] or snapshot['spool']['rows']) and (not progress or now - progress > 30):
+        elif (_worker_stalled(snapshot['workers']['producer'],
+                              snapshot['queue']['depth'] or snapshot['batch']['pending']
+                              or snapshot['batch']['inflight'], now,
+                              snapshot['queue']['oldest_age_seconds'] if snapshot['queue']['depth'] else None)
+              or _worker_stalled(snapshot['workers']['delivery'], snapshot['spool']['rows'], now,
+                                 snapshot['spool']['oldest_age_seconds'])):
             snapshot['state'] = 'stalled'
-        elif snapshot['retry']['consecutive_failures'] or snapshot['queue']['depth'] or snapshot['spool']['rows']:
+        elif (all(worker['alive'] is None for worker in snapshot['workers'].values())
+              and (snapshot['queue']['depth'] or snapshot['spool']['rows'])
+              and (not progress or now - progress > 30)):
+            snapshot['state'] = 'stalled'
+        elif (snapshot['retry']['consecutive_failures'] or snapshot['queue']['depth']
+              or snapshot['spool']['rows'] or snapshot['batch']['pending'] or snapshot['batch']['inflight']):
             snapshot['state'] = 'pending'
+        snapshot['collection'] = _collection_state(snapshot)
         return snapshot
     except FileNotFoundError:
         return dict(unavailable, reason='not_started')
@@ -136,7 +221,7 @@ def health():
             oldest, latest = cur.fetchone()
         conn.commit()
 
-        # Retention days — shared resolver handles UI > env > default + validation.
+        # The shared retention resolver handles UI > env > default + validation.
         retention_days = Database.resolve_retention_days(enricher_db).general
 
         # AbuseIPDB rate limit stats (written by receiver process)

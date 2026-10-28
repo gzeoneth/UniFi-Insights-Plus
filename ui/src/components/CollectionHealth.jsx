@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import useSerializedPoll from '../hooks/useSerializedPoll'
 import { apiFetch } from '../api'
 
 const PROVIDERS = [
@@ -20,6 +20,11 @@ const age = seconds => seconds == null ? 'Not observed' : seconds < 60
   ? `${Math.floor(seconds)}s ago` : seconds < 3600 ? `${Math.floor(seconds / 60)}m ago`
     : `${Math.floor(seconds / 3600)}h ago`
 const bytes = value => typeof value === 'number' ? `${(value / 1048576).toFixed(1)} MiB` : '—'
+const milliseconds = value => typeof value === 'number' && Number.isFinite(value) ? `${value.toFixed(1)} ms` : 'Unknown'
+const STAGES = [
+  ['parse', 'Parse packet'], ['enrich', 'Enrichment lookup'], ['spool_stage', 'Save retry batch'],
+  ['db_insert', 'Commit database batch'], ['spool_ack', 'Acknowledge retry batch'],
+]
 
 function Metric({ label, value, detail, state }) {
   return (
@@ -33,47 +38,20 @@ function Metric({ label, value, detail, state }) {
   )
 }
 
-export default function CollectionHealth() {
-  const [health, setHealth] = useState(null)
-  const [ingestion, setIngestion] = useState(null)
-  const [databaseError, setDatabaseError] = useState(false)
-  const [snapshotError, setSnapshotError] = useState(false)
-  const [loaded, setLoaded] = useState(false)
-  const [refresh, setRefresh] = useState(0)
+async function fetchCollectionHealth(_params, options) {
+  const [database, collector] = await Promise.allSettled([
+    apiFetch('/api/health', options), apiFetch('/api/health/ingest', options),
+  ])
+  return { database, collector }
+}
 
-  useEffect(() => {
-    let active = true
-    let timer
-    let controller
-    let timeout
-    const load = async () => {
-      controller = new AbortController()
-      timeout = setTimeout(() => controller.abort(), 15000)
-      const [database, collector] = await Promise.allSettled([
-        apiFetch('/api/health', { signal: controller.signal }),
-        apiFetch('/api/health/ingest', { signal: controller.signal }),
-      ])
-      clearTimeout(timeout)
-      if (!active) return
-      setLoaded(true)
-      setDatabaseError(database.status !== 'fulfilled')
-      setSnapshotError(collector.status !== 'fulfilled')
-      setHealth(database.status === 'fulfilled' ? database.value : null)
-      setIngestion(collector.status === 'fulfilled' ? collector.value : null)
-      timer = setTimeout(tick, 10000)
-    }
-    const tick = () => {
-      if (document.visibilityState === 'visible') load()
-      else timer = setTimeout(tick, 10000)
-    }
-    load()
-    return () => {
-      active = false
-      clearTimeout(timer)
-      clearTimeout(timeout)
-      controller?.abort()
-    }
-  }, [refresh])
+export default function CollectionHealth() {
+  const poll = useSerializedPoll({ params: {}, fetcher: fetchCollectionHealth, intervalMs: 10000 })
+  const health = poll.data?.database.status === 'fulfilled' ? poll.data.database.value : null
+  const ingestion = poll.data?.collector.status === 'fulfilled' ? poll.data.collector.value : null
+  const databaseError = poll.data?.database.status === 'rejected'
+  const snapshotError = poll.data?.collector.status === 'rejected'
+  const loaded = Boolean(poll.data)
 
   const stats = ingestion?.stats || {}
   const queue = ingestion?.queue || {}
@@ -81,15 +59,21 @@ export default function CollectionHealth() {
   const enrichment = ingestion?.enrichment || {}
   const state = snapshotError ? 'unavailable' : ingestion?.state || 'unknown'
   const fresh = ingestion?.status === 'fresh'
+  const rates = fresh ? ingestion?.rates || {} : {}
+  const rate = value => typeof value === 'number' && Number.isFinite(value) ? `${value.toFixed(1)}/s` : 'Unknown'
+  const incomplete = ingestion?.collection?.incomplete || stats.dropped > 0 || stats.failed > 0 || stats.parse_exceptions > 0
+  const reasons = ingestion?.collection?.reasons || []
+  const timings = fresh ? ingestion?.timings || {} : {}
+  const batch = fresh ? ingestion?.batch || {} : {}
 
   return (
     <section aria-label="Collection health" className="border border-gray-800 rounded-lg p-4 space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
           <h2 className="text-sm font-semibold text-gray-200">Collection health</h2>
-          <p className="text-xs text-gray-500 mt-1">Current receiver session · refreshes every 10 seconds</p>
+          <p className="text-xs text-gray-500 mt-1">Current receiver session · refreshes while this tab is visible</p>
         </div>
-        <button type="button" onClick={() => setRefresh(value => value + 1)}
+        <button type="button" onClick={() => poll.refresh()} disabled={poll.loading}
           className="text-xs text-teal-400 hover:text-teal-300 underline">Refresh health</button>
       </div>
       {!loaded ? <p role="status" className="text-sm text-gray-400">Loading collection health…</p> : <>
@@ -103,15 +87,33 @@ export default function CollectionHealth() {
         {stats.dropped > 0 && <p role="alert" className="text-sm text-amber-300">
           Known collection loss this receiver session: {number(stats.dropped)} dropped rows/packets. This is a cumulative counter; it does not by itself indicate that collection is currently failing.
         </p>}
+        {incomplete && <p role="alert" className="text-sm text-amber-300">
+          Results may be incomplete: {reasons.includes('backlog') ? 'events are waiting to be written. ' : ''}
+          {stats.dropped > 0 ? 'Known lost events cannot appear in filters or counts. ' : ''}
+          {stats.failed > 0 || stats.parse_exceptions > 0 ? 'Some packets could not be parsed and are missing from searchable events. ' : ''}
+          {reasons.some(reason => ['worker_error', 'storage_error'].includes(reason)) ? 'A collection worker or retry store reported an error. ' : ''}
+          An empty result does not prove that no matching traffic occurred.
+        </p>}
+        <dl className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+          <Metric label="Incoming rate" value={rate(rates.received_per_second)}
+            detail="UDP packets received" />
+          <Metric label="Write rate" value={rate(rates.inserted_per_second)}
+            detail="New rows committed to PostgreSQL" />
+          <Metric label="Current loss rate" value={rate(rates.dropped_per_second)}
+            state={rates.dropped_per_second > 0 ? 'error' : undefined}
+            detail="Dropped rows/packets during the sampled window" />
+          <Metric label="Rate window" value={rates.window_seconds == null ? 'Unknown' : `${Math.round(rates.window_seconds)} seconds`}
+            detail="Packets and rows differ when events are filtered or retried. A zero loss rate does not erase historical loss." />
+        </dl>
         <dl className="grid grid-cols-2 lg:grid-cols-4 gap-3">
           <Metric label="Receiver" value={LABELS[state] || state} state={state}
             detail={ingestion?.updated_at ? `Snapshot ${age(ingestion.age_seconds)}` : 'No receiver snapshot'} />
           <Metric label="Last packet received" value={age(ingestion?.receive_age_seconds)}
             detail={ingestion?.last_receive_at ? new Date(ingestion.last_receive_at * 1000).toLocaleString() : 'No UDP packet observed this session'} />
           <Metric label="Waiting in memory" value={`${number(queue.depth)} / ${number(queue.capacity)}`}
-            detail={queue.depth > 0 ? `Oldest packet ${age(queue.oldest_age_seconds)}` : 'No packets waiting'} />
+            detail={queue.depth > 0 ? `Oldest packet ${age(queue.oldest_age_seconds)}` : queue.depth === 0 ? 'No packets waiting' : 'Queue depth unavailable'} />
           <Metric label="Saved for retry" value={number(spool.rows)} state={spool.failed ? 'error' : undefined}
-            detail={`${bytes(spool.bytes)} / ${bytes(spool.max_bytes)}${spool.failed ? ' · storage error' : ''}`} />
+            detail={`${bytes(spool.bytes)} / ${bytes(spool.max_bytes)}${spool.failed ? ' · storage error' : ''}${spool.rows > 0 ? ` · oldest row ${age(spool.oldest_age_seconds)}` : ''}`} />
         </dl>
         <dl className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
           {[
@@ -134,6 +136,33 @@ export default function CollectionHealth() {
           <Metric label="Retry batch sends" value={stats.retry_attempts == null ? 'Unknown' : number(stats.retry_attempts)}
             detail={stats.retry_attempts == null ? 'This snapshot does not report a separate retry count.' : 'Sends containing rows from a previously failed delivery.'} />
         </dl>
+        <dl className="grid grid-cols-2 gap-3">
+          {Object.entries({ producer: 'Packet processing worker', delivery: 'Database delivery worker' }).map(([key, label]) => {
+            const worker = fresh ? ingestion?.workers?.[key] : null
+            const workerState = worker?.failed ? 'error' : worker?.alive === true ? 'ready' : worker?.alive === false ? 'stalled' : 'unknown'
+            return <Metric key={key} label={label} value={LABELS[workerState]} state={workerState}
+              detail={worker?.busy_since ? 'Working on a batch' : undefined} />
+          })}
+        </dl>
+        <details className="border border-gray-800 rounded-lg p-3">
+          <summary className="text-sm text-gray-300 cursor-pointer">Collection performance details</summary>
+          <p className="text-xs text-gray-500 mt-3">Timings describe this receiver session. Parsing and enrichment run per event; retry storage and database timings run per batch. Compare each stage with itself over time.</p>
+          <dl className="grid grid-cols-2 lg:grid-cols-4 gap-3 my-3">
+            <Metric label="Staging rate" value={rate(rates.staged_per_second)} detail="Rows saved to durable retry storage" />
+            <Metric label="Batch size" value={number(batch.size)} detail={batch.flush_interval_seconds == null ? 'Flush interval unknown' : `Flush after ${batch.flush_interval_seconds} seconds`} />
+            <Metric label="Pending batch rows" value={number(batch.pending)} detail="Parsed rows awaiting durable staging" />
+            <Metric label="In-flight rows" value={number(batch.inflight)} detail="Rows currently being processed; not yet durable" />
+          </dl>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs text-left" aria-label="Collection stage timings">
+              <thead className="text-gray-400"><tr><th className="py-2">Stage</th><th>Samples</th><th>Mean</th><th>Last</th><th>Maximum</th></tr></thead>
+              <tbody className="text-gray-300">{STAGES.map(([key, label]) => <tr key={key} className="border-t border-gray-800">
+                <th scope="row" className="py-2 font-normal">{label}</th><td>{number(timings[key]?.count)}</td>
+                <td>{milliseconds(timings[key]?.mean_ms)}</td><td>{milliseconds(timings[key]?.last_ms)}</td><td>{milliseconds(timings[key]?.max_ms)}</td>
+              </tr>)}</tbody>
+            </table>
+          </div>
+        </details>
         <div className="border-t border-gray-800 pt-4">
           <h3 className="text-xs font-medium text-gray-300 mb-3">Enrichment providers</h3>
           <dl className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">

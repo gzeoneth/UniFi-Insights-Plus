@@ -3,6 +3,7 @@
 import csv
 import io
 import logging
+from time import perf_counter
 from datetime import datetime
 from typing import Optional
 
@@ -17,6 +18,8 @@ from ip_identity import load_identity_config, annotate_record, annotate_ip
 from query_helpers import (build_log_query, validate_time_params,
                           device_name_client_lateral, device_name_device_lateral,
                           device_name_coalesce, sanitize_csv_cell)
+from log_pagination import (filter_fingerprint, new_window, encode_cursor, decode_cursor,
+                            next_cursor as make_next_cursor)
 from services import get_service_description
 from field_filters import append_exclusions, compile_exclusions, query_view_counts
 
@@ -54,9 +57,9 @@ def get_logs(
     time_range: Optional[str] = Query(None, description="1h,6h,24h,7d,30d,60d"),
     time_from: Optional[str] = Query(None, description="ISO datetime"),
     time_to: Optional[str] = Query(None, description="ISO datetime"),
-    src_ip: Optional[str] = Query(None, description="Source IP search (prefix with ! to negate)"),
-    dst_ip: Optional[str] = Query(None, description="Dest IP search (prefix with ! to negate)"),
-    ip: Optional[str] = Query(None, description="Search both src and dst (prefix with ! to negate)"),
+    src_ip: Optional[str] = Query(None, description="Source IP/CIDR; partial text supported, contains: forces substring, ! negates"),
+    dst_ip: Optional[str] = Query(None, description="Destination IP/CIDR; partial text supported, contains: forces substring, ! negates"),
+    ip: Optional[str] = Query(None, description="Both endpoint IPs/CIDRs; contains: forces substring, ! negates"),
     direction: Optional[str] = Query(None, description="Comma-separated: inbound,outbound,inter_vlan,nat"),
     rule_action: Optional[str] = Query(None, description="Comma-separated: allow,block,redirect (prefix with ! to negate)"),
     rule_name: Optional[str] = Query(None, description="Rule name search (prefix with ! to negate)"),
@@ -76,20 +79,40 @@ def get_logs(
     order: str = Query("desc", description="asc or desc"),
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=200),
+    count_mode: str = "exact",
+    pagination: str = "offset",
+    cursor: Optional[str] = None,
 ):
+    if count_mode not in ('exact', 'none') or pagination not in ('offset', 'cursor'):
+        raise HTTPException(400, detail='Use count_mode exact/none and pagination offset/cursor')
+    if cursor and pagination != 'cursor':
+        raise HTTPException(400, detail='cursor requires pagination=cursor')
+    if pagination == 'cursor' and (sort != 'timestamp' or order.lower() not in ('asc', 'desc')):
+        raise HTTPException(400, detail='Cursor pagination requires timestamp sort and asc/desc order')
+    if page < 1 or not 1 <= per_page <= 200:
+        raise HTTPException(400, detail='Invalid page or per_page')
+    if pagination == 'cursor' and page != 1 and not cursor:
+        raise HTTPException(400, detail='Use next_cursor to advance cursor pages')
+
     time_range, time_from, time_to = validate_time_params(time_range, time_from, time_to)
-    where, params = build_log_query(
-        log_type, time_range, time_from, time_to,
-        src_ip, dst_ip, ip, direction, rule_action,
-        rule_name, country, threat_min, search, service,
-        interface, vpn_only, asn=asn,
+    query_filters = dict(
+        log_type=log_type, time_range=time_range, time_from=time_from, time_to=time_to,
+        src_ip=src_ip, dst_ip=dst_ip, ip=ip, direction=direction, rule_action=rule_action,
+        rule_name=rule_name, country=country, threat_min=threat_min, search=search,
+        service=service, interface=interface, vpn_only=vpn_only, asn=asn,
         dst_port=dst_port, src_port=src_port, protocol=protocol, filter_rules=filter_rules,
     )
+    state = None
+    if pagination == 'cursor':
+        fingerprint = filter_fingerprint({**query_filters, 'exclude_groups': exclude_groups,
+                                          'sort': sort, 'order': order.lower()})
+        state = decode_cursor(cursor, fingerprint) if cursor else new_window(
+            fingerprint, time_range, time_from, time_to)
+        query_filters.update(time_range=None, time_from=state['from'], time_to=state['to'])
+    base_where, base_params = build_log_query(**query_filters)
+    # Validate exclusions before checking out a pooled connection.
+    append_exclusions(base_where, base_params, exclude_groups)
 
-    base_where, base_params = where, params
-    where, params = append_exclusions(base_where, base_params, exclude_groups)
-
-    # Whitelist sort columns
     allowed_sorts = {
         'timestamp', 'log_type', 'src_ip', 'dst_ip', 'src_port', 'dst_port',
         'protocol', 'service_name', 'direction', 'rule_action', 'rule_name',
@@ -97,19 +120,37 @@ def get_logs(
     }
     sort_col = sort if sort in allowed_sorts else 'timestamp'
     sort_dir = 'ASC' if order.lower() == 'asc' else 'DESC'
-    offset = (page - 1) * per_page
-
+    offset = (page - 1) * per_page if pagination == 'offset' else 0
+    view_counts = total = count_ms = None
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            view_counts = query_view_counts(cur, base_where, base_params, exclude_groups)
-            total = view_counts['visible']
+            started = perf_counter()
+            if state is not None:
+                if state['max_id'] is None:
+                    cur.execute('SELECT COALESCE(MAX(id), 0) AS max_id FROM logs')
+                    state['max_id'] = cur.fetchone()['max_id']
+                base_where += ' AND id <= %s'
+                base_params = base_params + [state['max_id']]
+            setup_ms = (perf_counter() - started) * 1000
+            if count_mode == 'exact':
+                started = perf_counter()
+                view_counts = query_view_counts(cur, base_where, base_params, exclude_groups)
+                count_ms = (perf_counter() - started) * 1000
+                total = view_counts['visible']
+            where, params = append_exclusions(base_where, base_params, exclude_groups)
+            if state is not None and state['after'] is not None:
+                comparator = '>' if sort_dir == 'ASC' else '<'
+                where += f' AND (timestamp, id) {comparator} (%s::timestamptz, %s)'
+                params += state['after']
 
-            # Fetch page, enriching with live device names from unifi_clients + unifi_devices
+            started = perf_counter()
+            # Bound joins to one page. The id tiebreaker makes timestamp ties
+            # deterministic in both directions, including legacy offset mode.
             cur.execute(
                 f"""WITH page AS (
                         SELECT * FROM logs WHERE {where}
-                        ORDER BY {sort_col} {sort_dir} LIMIT %s OFFSET %s
+                        ORDER BY {sort_col} {sort_dir}, id {sort_dir} LIMIT %s OFFSET %s
                     )
                     SELECT page.*,
                         {_source_device_name_select('page')},
@@ -119,22 +160,28 @@ def get_logs(
                     {device_name_client_lateral('page.dst_ip', 'c2')}
                     {device_name_device_lateral('page.src_ip', 'd1')}
                     {device_name_device_lateral('page.dst_ip', 'd2')}
-                    ORDER BY page.{sort_col} {sort_dir}""",
-                params + [per_page, offset]
+                    ORDER BY page.{sort_col} {sort_dir}, page.id {sort_dir}""",
+                params + [per_page + 1, offset]
             )
             rows = cur.fetchall()
+            query_ms = setup_ms + (perf_counter() - started) * 1000
 
+        has_more = len(rows) > per_page
+        rows = rows[:per_page]
+        following = make_next_cursor(state, rows[-1]) if state is not None and has_more else None
         logs = [_serialize_log(row) for row in rows]
         _annotate_logs(logs)
-
         conn.commit()
         return {
-            'data': logs,
-            'total': total,
-            'view_counts': view_counts,
-            'page': page,
-            'per_page': per_page,
-            'pages': (total + per_page - 1) // per_page if per_page else 0,
+            'data': logs, 'total': total, 'view_counts': view_counts,
+            'page': page, 'per_page': per_page,
+            'pages': (total + per_page - 1) // per_page if total is not None else None,
+            'has_more': has_more, 'pagination': pagination,
+            'page_cursor': encode_cursor(state) if state is not None else None,
+            'next_cursor': following,
+            'window': {'time_from': state['from'], 'time_to': state['to']} if state is not None else None,
+            'timings': {'query_ms': round(query_ms, 3),
+                        'count_ms': round(count_ms, 3) if count_ms is not None else None},
         }
     except Exception as e:
         conn.rollback()
@@ -423,9 +470,9 @@ def preview_exclusions(
     time_range: Optional[str] = Query(None, description="1h,6h,24h,7d,30d,60d"),
     time_from: Optional[str] = Query(None, description="ISO datetime"),
     time_to: Optional[str] = Query(None, description="ISO datetime"),
-    src_ip: Optional[str] = Query(None, description="Source IP search (prefix with ! to negate)"),
-    dst_ip: Optional[str] = Query(None, description="Dest IP search (prefix with ! to negate)"),
-    ip: Optional[str] = Query(None, description="Search both src and dst (prefix with ! to negate)"),
+    src_ip: Optional[str] = Query(None, description="Source IP/CIDR; partial text supported, contains: forces substring, ! negates"),
+    dst_ip: Optional[str] = Query(None, description="Destination IP/CIDR; partial text supported, contains: forces substring, ! negates"),
+    ip: Optional[str] = Query(None, description="Both endpoint IPs/CIDRs; contains: forces substring, ! negates"),
     direction: Optional[str] = Query(None, description="Comma-separated: inbound,outbound,inter_vlan,nat"),
     rule_action: Optional[str] = Query(None, description="Comma-separated: allow,block,redirect (prefix with ! to negate)"),
     rule_name: Optional[str] = Query(None, description="Rule name search (prefix with ! to negate)"),

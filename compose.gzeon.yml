@@ -1,7 +1,7 @@
 name: unifi-insights-gzeon
 services:
   insights:
-    image: ${INSIGHTS_IMAGE:-ghcr.io/gzeoneth/unifi-insights-plus:3.7.2-gzeon.2}
+    image: ${INSIGHTS_IMAGE:-ghcr.io/gzeoneth/unifi-insights-plus:3.7.2-gzeon.3}
     pull_policy: ${INSIGHTS_PULL_POLICY:-missing}
     restart: unless-stopped
     stop_grace_period: 90s
@@ -13,7 +13,9 @@ services:
       TZ: '${TZ:-UTC}'
       INGEST_SPOOL_PATH: /var/lib/unifi-log-insight/ingest/retry.sqlite3
       INGEST_STATUS_PATH: /run/unifi-log-insight/receiver-health.json
-      INGEST_QUEUE_CAPACITY: '4096'
+      INGEST_QUEUE_CAPACITY: '${INGEST_QUEUE_CAPACITY:-4096}'
+      INGEST_BATCH_SIZE: '${INGEST_BATCH_SIZE:-200}'
+      INGEST_FLUSH_INTERVAL_SECONDS: '${INGEST_FLUSH_INTERVAL_SECONDS:-1.0}'
       ENRICHMENT_QUEUE_CAPACITY: '256'
     ports:
       - '${WEB_BIND_IP:-127.0.0.1}:${WEB_PORT:-8091}:8000'

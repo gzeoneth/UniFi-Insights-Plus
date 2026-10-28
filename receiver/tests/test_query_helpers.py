@@ -153,12 +153,13 @@ class TestBuildLogQuery:
         assert 'dns' in params
 
     def test_negated_ip(self):
-        where, params = self._build(ip='!1.2.3.4')
-        assert 'NOT LIKE' in where
+        where, params = self._build(ip='!192.0.2.4')
+        assert 'IS NOT TRUE' in where
+        assert 'src_ip = %s::inet' in where
 
     def test_src_ip_filter(self):
-        where, params = self._build(src_ip='10.0.0.1')
-        assert 'src_ip::text LIKE' in where
+        where, params = self._build(src_ip='192.0.2.1')
+        assert 'src_ip = %s::inet' in where
 
     def test_negated_rule_action(self):
         where, params = self._build(rule_action='!block')

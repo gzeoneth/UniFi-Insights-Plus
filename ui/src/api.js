@@ -44,8 +44,8 @@ async function apiFetchRaw(url, options = {}) {
   return resp
 }
 
-export async function fetchLogs(params = {}) {
-  return apiFetch(`${BASE}/logs?${buildQS(params)}`)
+export async function fetchLogs(params = {}, options = {}) {
+  return apiFetch(`${BASE}/logs?${buildQS(params)}`, options)
 }
 
 export async function fetchLog(id) {
@@ -76,8 +76,8 @@ export async function fetchSecuritySummary(params = {}, options = {}) {
   return apiFetch(`${BASE}/security/summary?${buildQS(params)}`, options)
 }
 
-export async function fetchHealth() {
-  return apiFetch(`${BASE}/health`)
+export async function fetchHealth(options = {}) {
+  return apiFetch(`${BASE}/health`, options)
 }
 
 export async function fetchAbuseIPDBStatus() {

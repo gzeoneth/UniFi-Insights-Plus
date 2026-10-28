@@ -38,10 +38,12 @@ export function ruleExclusionGroup(row) {
 
 export function useExclusionProfile() { return useContext(ExclusionContext) }
 
-export function ExclusionCounts({ counts }) {
-  if (!counts) return null
+export function ExclusionCounts({ counts, unknown = false }) {
+  if (!counts && !unknown) return null
+  const count = value => typeof value === 'number' ? value.toLocaleString() : 'Not counted'
   return <p className="text-xs text-gray-400" aria-label="View event counts">
-    {Number(counts.visible).toLocaleString()} visible · {Number(counts.hidden).toLocaleString()} hidden by profile · {Number(counts.total).toLocaleString()} matching events before profile
+    {counts ? <>{count(counts.visible)} visible · {count(counts.hidden)} hidden by profile · {count(counts.total)} matching events before profile</>
+      : 'Profile applied · visible and hidden totals not counted. Use Count matching events for exact totals.'}
   </p>
 }
 

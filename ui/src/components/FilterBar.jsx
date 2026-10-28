@@ -388,8 +388,8 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
         <div className="relative">
           <input
             type="text"
-            placeholder="IP address..."
-            title="Prefix with ! to exclude matching IPs"
+            placeholder="IP address or subnet..."
+            title="Full IP addresses match exactly; CIDRs match the subnet. Partial text still matches text. Prefix with contains: to force a text search, or ! to exclude."
             value={ipSearch}
             onChange={e => setIpSearch(e.target.value)}
             className={`bg-black border rounded px-3 py-1.5 text-xs text-gray-300 placeholder-gray-500 focus:outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20 w-full sm:w-40 ${ipSearch.startsWith('!') ? 'border-amber-400/60' : 'border-gray-700'}`}

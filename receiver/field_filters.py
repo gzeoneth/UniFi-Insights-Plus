@@ -70,7 +70,7 @@ def parse_rules(value):
     return value
 
 
-def compile_filters(value):
+def compile_filters(value, *, null_safe=False):
     """Rules AND together; comma-separated values OR within each rule.
 
     Excluding a value retains missing fields. Use present/missing explicitly
@@ -114,8 +114,12 @@ def compile_filters(value):
                         network = ipaddress.ip_network(term, strict=False)
                     except ValueError:
                         _invalid('IP fields require valid addresses or CIDRs')
-                    matches.append(f'{column} <<= %s::inet')
-                    params.append(str(network))
+                    if '/' not in term:
+                        matches.append(f'{column} = %s::inet')
+                        params.append(str(network.network_address))
+                    else:
+                        matches.append(f'{column} <<= %s::inet')
+                        params.append(str(network))
                 elif kind in ('port', 'score', 'severity'):
                     upper = {'port': 65535, 'score': 100, 'severity': 10}[kind]
                     match = re.fullmatch(r'(\d+)(?:-(\d+))?', term)
@@ -130,17 +134,24 @@ def compile_filters(value):
                     matches.append(f'{column} = %s')
                     params.append(term)
                 elif kind == 'enum':
-                    matches.append(f'LOWER({column}) = LOWER(%s)')
+                    # Numeric identifiers have no case variants; avoid wrapping
+                    # an indexed column in LOWER for these exact predicates.
+                    if re.fullmatch(r'[0-9]+', term):
+                        matches.append(f'{column} = %s')
+                    else:
+                        matches.append(f'LOWER({column}) = LOWER(%s)')
                     params.append(term)
                 else:
                     escaped = term.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
                     matches.append(f"{column} ILIKE %s ESCAPE '\\'")
                     params.append(f'%{escaped}%')
         predicate = '(' + ' OR '.join(matches) + ')'
-        # COALESCE makes include/exclude exact complements even for NULLs.
-        predicate = f'COALESCE({predicate}, FALSE)'
+        # Plain positive predicates expose indexed columns to the planner.
+        # Negation and exclusion groups still need NULL-safe complements.
         if operator == 'exclude':
-            predicate = f'NOT ({predicate})'
+            predicate = f'NOT (COALESCE({predicate}, FALSE))'
+        elif null_safe:
+            predicate = f'COALESCE({predicate}, FALSE)'
         conditions.append(predicate)
     return conditions, params
 
@@ -210,7 +221,7 @@ def compile_exclusions(value):
         return [], []
     matches, params = [], []
     for group in groups:
-        conditions, group_params = compile_filters(group['conditions'])
+        conditions, group_params = compile_filters(group['conditions'], null_safe=True)
         matches.append('(' + ' AND '.join(conditions) + ')')
         params.extend(group_params)
     predicate = '(' + ' OR '.join(matches) + ')'

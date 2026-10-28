@@ -2,6 +2,21 @@
 
 The changes were tested against the upstream v3.7.2 base using synthetic events and disposable local databases. No live collector, gateway or production database was modified for these checks.
 
+## Performance release: 3.7.2-gzeon.3
+
+- 1,179 backend tests passed with all disposable PostgreSQL checks enabled. 218 UI tests and the production UI build passed. A local ARM64 container build passed; its application source hashes matched the tested checkout.
+- A disposable container received 2,000 synthetic UDP firewall events at about 400 packets/second. All 2,000 reached PostgreSQL, with zero reported drops and an empty queue/spool afterwards. Cursor traversal returned 2,000 unique row IDs. Exact IP, CIDR, partial-text and negative filters returned the expected counts.
+- Browser checks against that container confirmed unknown totals, explicit counting with automatic updates paused, Next/Previous cursor navigation, and the new collection metrics/timing details. Unit tests cover hidden tabs, slow requests, rapid filter changes and stale-response handling.
+- PostgreSQL tests cover both timestamp orders, ties, late-arriving rows, frozen recounts, cursor/filter mismatches, NULL complements and unchanged legacy API defaults. Query timings separate page retrieval from exact counts.
+- Ingestion tests cover a blocked database while the producer continues durable staging, concurrent spool stage/acknowledgement, SQLite-full rollback, ambiguous commits, failed acknowledgements, malformed results and bounded shutdown with volatile work reported.
+- Health tests verify unknown metrics from older snapshots, stale rates, separate worker stalls, recently started work after idle, parser losses and public-field sanitization. Independent review found two incorrect stall classifications; regression tests cover both fixes.
+
+On a 200,000-row synthetic PostgreSQL 16 fixture, median exact IP lookup was 1.34 ms versus 38.65 ms for the previous substring query. These queries intentionally have different matching semantics. A deep offset query took 33.41 ms versus 0.040 ms for a cursor query. An exact raw-text count took 360.86 ms; the corresponding first page without counting took 0.196 ms. Existing indexes were retained: extra composites increased index storage without enough evidence to justify their ongoing write cost.
+
+A separate 4,000-event ingestion microbenchmark used real parsing, SQLite FULL durability and synchronous PostgreSQL commits, with network enrichment disabled. Batches of 200 reduced database transactions from 80 to 20 compared with batches of 50. Across two runs each, throughput was approximately 12,700–12,900 versus 8,200–9,200 rows/second. With an injected 25 ms database delay, it was approximately 3,200–3,800 versus 1,300–1,400. All runs retained exactly 4,000 unique events without reported drops.
+
+These small local benchmarks compare code paths; they do not establish production throughput, peak memory or performance over long retention. No production memory settings, retention, indexes or gateway logging policies were changed. See [performance guidance](performance.md) for deployment checks and limits.
+
 ## View-exclusion release: 3.7.2-gzeon.2
 
 - 1,097 backend tests passed, including disposable PostgreSQL queries, upgrade/restore, replay, retention and TLS checks.

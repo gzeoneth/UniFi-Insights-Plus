@@ -54,6 +54,16 @@ describe('explicit view exclusion propagation', () => {
 
 
 describe('fetchLogs (indirectly tests buildQS)', () => {
+  it('passes cancellation to fetch without serializing it into query parameters', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ total: null }) }))
+    const controller = new AbortController()
+    await fetchLogs({ count_mode: 'none', pagination: 'cursor', cursor: 'opaque-token' }, { signal: controller.signal })
+    expect(fetch.mock.calls[0][1].signal).toBe(controller.signal)
+    const params = new URL(fetch.mock.calls[0][0], 'https://example.test').searchParams
+    expect(params.get('count_mode')).toBe('none')
+    expect(params.get('cursor')).toBe('opaque-token')
+    expect(params.has('signal')).toBe(false)
+  })
   it('calls /api/logs with query params', async () => {
     const mockData = { logs: [], total: 0 }
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({

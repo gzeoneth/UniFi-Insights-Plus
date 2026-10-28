@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { render, screen, within } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import CollectionHealth from '../components/CollectionHealth'
 import { apiFetch } from '../api'
 
@@ -15,6 +15,10 @@ const ingestion = {
 }
 
 beforeEach(() => vi.clearAllMocks())
+afterEach(() => {
+  cleanup(); vi.useRealTimers()
+  Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+})
 
 describe('CollectionHealth', () => {
   it('shows cumulative collection loss alongside a ready receiver and separates retries from delivery attempts', async () => {
@@ -40,6 +44,7 @@ describe('CollectionHealth', () => {
     expect(screen.queryByText(/Known collection loss/)).toBeNull()
     expect(within(screen.getByText('Retry batch sends').parentElement).getByText('Unknown')).toBeTruthy()
     expect(screen.getByText(/does not report a separate retry count/)).toBeTruthy()
+    expect(screen.getByText(/Results may be incomplete/)).toHaveTextContent('Some packets could not be parsed')
   })
 
   it('retains ingestion evidence when the database health request fails', async () => {
@@ -73,5 +78,71 @@ describe('CollectionHealth', () => {
     unmount()
     expect(signals).toHaveLength(2)
     expect(signals.every(signal => signal.aborted)).toBe(true)
+  })
+
+  it('distinguishes current rates, backlog and historical loss without implying a complete record', async () => {
+    apiFetch.mockImplementation(url => Promise.resolve(url.endsWith('/ingest') ? {
+      ...ingestion, rates: { window_seconds: 60, received_per_second: 120.5, inserted_per_second: 80.5, dropped_per_second: 0 },
+      spool: { ...ingestion.spool, oldest_age_seconds: 125 },
+      collection: { incomplete: true, reasons: ['historical_loss', 'backlog'] },
+      workers: { producer: { alive: true }, delivery: { alive: false, failed: true } },
+    } : { total_logs: 100 }))
+    render(<CollectionHealth />)
+    await screen.findByText('120.5/s')
+    expect(within(screen.getByText('Write rate').parentElement).getByText('80.5/s')).toBeTruthy()
+    expect(within(screen.getByText('Current loss rate').parentElement).getByText('0.0/s')).toBeTruthy()
+    expect(screen.getByText(/Results may be incomplete/)).toHaveTextContent('events are waiting to be written')
+    expect(screen.getByText(/Results may be incomplete/)).toHaveTextContent('empty result does not prove')
+    expect(screen.getByText(/oldest row 2m ago/)).toBeTruthy()
+    expect(within(screen.getByText('Database delivery worker').parentElement).getByText('Error')).toBeTruthy()
+  })
+
+  it('keeps missing and stale rates unknown instead of showing zero throughput', async () => {
+    apiFetch.mockImplementation(url => Promise.resolve(url.endsWith('/ingest') ? {
+      ...ingestion, status: 'stale', rates: { received_per_second: 100, inserted_per_second: 100, dropped_per_second: 0 },
+    } : { total_logs: 100 }))
+    render(<CollectionHealth />)
+    await screen.findByText(/snapshot is stale/)
+    for (const label of ['Incoming rate', 'Write rate', 'Current loss rate']) {
+      expect(within(screen.getByText(label).parentElement).getByText('Unknown')).toBeTruthy()
+    }
+    expect(screen.queryByText('100.0/s')).toBeNull()
+    expect(screen.queryByText('0.0/s')).toBeNull()
+  })
+
+  it('shows batch and stage diagnostics on demand with missing timings left unknown', async () => {
+    apiFetch.mockImplementation(url => Promise.resolve(url.endsWith('/ingest') ? {
+      ...ingestion, rates: { staged_per_second: 75.5 },
+      batch: { size: 50, flush_interval_seconds: 1, pending: 3, inflight: 2 },
+      timings: { db_insert: { count: 4, mean_ms: 12.5, last_ms: 10, max_ms: 20 } },
+    } : {}))
+    render(<CollectionHealth />)
+    const summary = await screen.findByText('Collection performance details')
+    expect(summary.parentElement).not.toHaveAttribute('open')
+    fireEvent.click(summary)
+    expect(summary.parentElement).toHaveAttribute('open')
+    expect(screen.getByText('75.5/s')).toBeTruthy()
+    expect(within(screen.getByText('Batch size').parentElement).getByText('50')).toBeTruthy()
+    expect(within(screen.getByText('In-flight rows').parentElement).getByText('2')).toBeTruthy()
+    const commit = screen.getByRole('row', { name: /Commit database batch/ })
+    expect(commit).toHaveTextContent('12.5 ms')
+    expect(commit).toHaveTextContent('10.0 ms')
+    expect(commit).toHaveTextContent('20.0 ms')
+    expect(screen.getByRole('row', { name: /Parse packet/ })).toHaveTextContent('Unknown')
+  })
+
+  it('serializes a requested refresh behind slow health calls and stops polling while hidden', async () => {
+    vi.useFakeTimers()
+    const completions = []
+    apiFetch.mockImplementation(url => new Promise(resolve => completions.push(() => resolve(url.endsWith('/ingest') ? ingestion : {}))))
+    render(<CollectionHealth />)
+    await act(async () => { await vi.advanceTimersByTimeAsync(30000) })
+    expect(apiFetch).toHaveBeenCalledTimes(2)
+    expect(screen.getByText('Refresh health')).toBeDisabled()
+    await act(async () => completions.forEach(done => done()))
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' })
+    fireEvent(document, new Event('visibilitychange'))
+    await act(async () => { await vi.advanceTimersByTimeAsync(30000) })
+    expect(apiFetch).toHaveBeenCalledTimes(2)
   })
 })

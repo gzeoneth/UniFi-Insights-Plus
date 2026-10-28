@@ -154,3 +154,17 @@ def test_worker_http_error_still_becomes_tool_error(mcp, monkeypatch):
     body = json.loads(response.body)
     assert body['result']['isError'] is True
     assert body['result']['content'][0]['text'] == 'Invalid field filter'
+
+
+def test_search_pagination_count_contract_and_legacy_defaults(mcp):
+    mcp._tool_search_logs({})
+    defaults = mcp.logs_routes.get_logs.call_args.kwargs
+    assert defaults['count_mode'] == 'exact'
+    assert defaults['pagination'] == 'offset' and defaults['cursor'] is None
+    mcp._tool_search_logs({'count_mode': 'none', 'pagination': 'cursor', 'cursor': 'opaque'})
+    current = mcp.logs_routes.get_logs.call_args.kwargs
+    assert current['count_mode'] == 'none' and current['cursor'] == 'opaque'
+    assert current['pagination'] == 'cursor'
+    schema = next(t for t in mcp._tools_catalog() if t['name'] == 'search_logs')['inputSchema']['properties']
+    assert schema['count_mode']['enum'] == ['exact', 'none']
+    assert schema['pagination']['enum'] == ['offset', 'cursor']

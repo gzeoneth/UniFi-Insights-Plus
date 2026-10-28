@@ -3,6 +3,9 @@ Query building helpers shared by log and export endpoints.
 """
 
 import logging
+import ipaddress
+
+from fastapi import HTTPException
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -112,6 +115,45 @@ def build_time_conditions(
     return conditions, params
 
 
+def build_ip_condition(value: str, columns: tuple[str, ...]) -> tuple[str, list]:
+    """Use native INET operators for complete addresses and CIDRs.
+
+    Legacy partial inputs still search literal text. ``contains:`` forces that
+    behavior even for a complete address; ``!`` negates either mode and keeps
+    missing addresses. Column identifiers are internal, never user input.
+    """
+    negated, term = _parse_negation(value.strip())
+    partial = term.startswith('contains:')
+    if partial:
+        term = term[len('contains:'):]
+    if not term or len(term) > 256:
+        raise HTTPException(400, detail='IP filter must contain 1-256 characters')
+    predicate = None
+    parameter = None
+    if not partial:
+        try:
+            if '%' in term:
+                raise ValueError('scoped IP addresses are not supported')
+            if '/' in term:
+                network = ipaddress.ip_network(term, strict=False)
+                predicate, parameter = '<<= %s::inet', str(network)
+            else:
+                address = ipaddress.ip_address(term)
+                predicate, parameter = '= %s::inet', str(address)
+        except ValueError as error:
+            if '/' in term or '%' in term:
+                raise HTTPException(400, detail='Invalid IP/CIDR; use contains: for literal text') from error
+    if predicate:
+        parts = [f'{column} {predicate}' for column in columns]
+    else:
+        parts = [f"{column}::text LIKE %s ESCAPE '\\'" for column in columns]
+        parameter = f'%{_escape_like(term)}%'
+    combined = '(' + ' OR '.join(parts) + ')'
+    if negated:
+        combined = f'({combined}) IS NOT TRUE'
+    return combined, [parameter] * len(columns)
+
+
 def build_log_query(
     log_type: Optional[str],
     time_range: Optional[str],
@@ -150,35 +192,12 @@ def build_log_query(
     conditions.extend(time_conds)
     params.extend(time_params)
 
-    if src_ip:
-        negated, val = _parse_negation(src_ip)
-        op = "NOT LIKE" if negated else "LIKE"
-        if negated:
-            conditions.append(f"(src_ip::text {op} %s ESCAPE '\\' OR src_ip IS NULL)")
-        else:
-            conditions.append(f"src_ip::text {op} %s ESCAPE '\\'") 
-        params.append(f"%{_escape_like(val)}%")
-
-    if dst_ip:
-        negated, val = _parse_negation(dst_ip)
-        op = "NOT LIKE" if negated else "LIKE"
-        if negated:
-            conditions.append(f"(dst_ip::text {op} %s ESCAPE '\\' OR dst_ip IS NULL)")
-        else:
-            conditions.append(f"dst_ip::text {op} %s ESCAPE '\\'") 
-        params.append(f"%{_escape_like(val)}%")
-
-    if ip:
-        negated, val = _parse_negation(ip)
-        escaped_ip = _escape_like(val)
-        if negated:
-            conditions.append(
-                "((src_ip::text NOT LIKE %s ESCAPE '\\' OR src_ip IS NULL)"
-                " AND (dst_ip::text NOT LIKE %s ESCAPE '\\' OR dst_ip IS NULL))"
-            )
-        else:
-            conditions.append("(src_ip::text LIKE %s ESCAPE '\\' OR dst_ip::text LIKE %s ESCAPE '\\')")
-        params.extend([f"%{escaped_ip}%", f"%{escaped_ip}%"])
+    for value, columns in ((src_ip, ('src_ip',)), (dst_ip, ('dst_ip',)),
+                           (ip, ('src_ip', 'dst_ip'))):
+        if value:
+            condition, ip_params = build_ip_condition(value, columns)
+            conditions.append(condition)
+            params.extend(ip_params)
 
     if direction:
         directions = [d.strip() for d in direction.split(',')]

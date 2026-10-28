@@ -15,6 +15,8 @@ This fork publishes source code and synthetic test fixtures only. Keep deploymen
 - Save previewed exclusion profiles for routine events. Apply them to traffic views, charts and exports while retaining raw logs and keeping Security independent. See [view exclusions](docs/view-exclusions.md).
 - Browse observed rule usage, collector health, per-type retention and older-event summaries in Operations.
 - Optionally archive records to gzip JSONL before retention deletion. Archive failure or capacity exhaustion prevents affected raw-data deletion.
+- Browse logs without counting all matches on every refresh. Timestamp cursors, exact IP/CIDR filters and serialized polling reduce repeated database work. See [performance and collection health](docs/performance.md).
+- Stage received logs independently of database delivery, with bounded configurable batches and separate worker/rate/backlog metrics.
 
 ## Build and test
 
@@ -42,7 +44,7 @@ Before merging, use a local build for staging or explicitly dispatch the workflo
 
 `compose.gzeon.yml` starts a separate instance with its own database and persistent ingestion/archive volumes. It defaults to loopback ports 8091 and 1514, so it does not replace or compete with the existing collector. A four-GiB container limit is a resource ceiling, not a throughput guarantee.
 
-1. After a merged-PR or manual image workflow succeeds, pull the versioned GHCR image used by `compose.gzeon.yml`. For local staging, build locally, copy its archive privately to the Docker host, and load it with `docker image load -i <archive>`. Set `INSIGHTS_IMAGE=unifi-insights-plus:3.7.2-gzeon.2` and `INSIGHTS_PULL_POLICY=never` in the private `.env` for that local image.
+1. After a merged-PR or manual image workflow succeeds, pull the versioned GHCR image used by `compose.gzeon.yml`. For local staging, build locally, copy its archive privately to the Docker host, and load it with `docker image load -i <archive>`. Set `INSIGHTS_IMAGE=unifi-insights-plus:3.7.2-gzeon.3` and `INSIGHTS_PULL_POLICY=never` in the private `.env` for that local image.
 2. Create a private `.env` from the upstream `.env.example`. Set a new database password for staging. When restoring production data, preserve the existing database password and encryption `SECRET_KEY`; changing the encryption key prevents saved credentials from decrypting.
 3. Take a PostgreSQL custom-format backup of the existing database using `pg_dump -Fc`. Keep its configuration, image version, secret file, and MaxMind mounts together in private storage. The app's JSON configuration export is not a database backup.
 4. Restore into the separate database volume, then start the custom image. Verify schema migration, counts, raw messages, credentials and CEF backfill there first. Never attach two running PostgreSQL processes to the same data directory.

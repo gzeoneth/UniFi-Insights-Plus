@@ -15,6 +15,9 @@ import Login from './components/Login'
 import { fetchHealth, fetchConfig, fetchLatestRelease, dismissUpgradeModal, dismissVpnToast, fetchInterfaces, fetchUiSettings, updateUiSettings, fetchUniFiSettings, fetchAuthStatus, fetchAuthMe, authLogout, setAuthExpiredHandler } from './api'
 import { loadInterfaceLabels } from './utils'
 import { isVpnInterface } from './vpnUtils'
+import useSerializedPoll from './hooks/useSerializedPoll'
+
+const fetchStatusHealth = (_params, options) => fetchHealth(options)
 
 function LoadingSplash() {
   return (
@@ -119,7 +122,8 @@ export default function App() {
     const valid = TABS.map(t => t.id)
     return valid.includes(hash) ? hash : 'logs'
   })
-  const [health, setHealth] = useState(null)
+  const healthPoll = useSerializedPoll({ params: {}, fetcher: fetchStatusHealth, intervalMs: 15000 })
+  const health = healthPoll.data
   const [latestRelease, setLatestRelease] = useState(null)
   const [showWizard, setShowWizard] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
@@ -337,13 +341,6 @@ export default function App() {
       })
     return () => { mounted = false }
   }, [authState]) // eslint-disable-line react-hooks/exhaustive-deps
-
-  useEffect(() => {
-    const checkHealth = () => fetchHealth().then(setHealth).catch(() => {})
-    checkHealth()
-    const interval = setInterval(checkHealth, 15000)
-    return () => clearInterval(interval)
-  }, [])
 
   // Auto-dismiss once HTTPS is verified or the proxy trust header is configured.
   useEffect(() => {
@@ -803,6 +800,12 @@ export default function App() {
                 title="The receiver snapshot reports cumulative collection loss in its session. Open Collection health for current status and details.">
                 Collection loss: {health.ingestion.stats.dropped.toLocaleString()}
               </button>}
+              {health.ingestion?.collection?.incomplete && !(health.ingestion?.stats?.dropped > 0) && <button type="button"
+                onClick={() => setActiveTab('operations')}
+                className="text-xs text-amber-300 hover:text-amber-200"
+                title="Receiver backlog, errors or a stale snapshot mean recent results may be incomplete. Open Collection health.">
+                Collection incomplete
+              </button>}
               <div className="relative" ref={statusRef}>
                 <button
                   type="button"
@@ -812,7 +815,7 @@ export default function App() {
                   title={health.status !== 'ok' ? 'API/database health is not OK.' : health.ingestion?.stats?.dropped > 0 ? 'API/database reachable. Known collection loss was reported during this receiver session; this does not establish a current outage.' : 'API/database reachable. This does not confirm complete log collection.'}
                 >
                   <span className={`w-1.5 h-1.5 rounded-full ${
-                    health.status !== 'ok' ? 'bg-red-400' : health.ingestion?.stats?.dropped > 0 ? 'bg-amber-400' : 'bg-emerald-400'
+                    health.status !== 'ok' ? 'bg-red-400' : health.ingestion?.stats?.dropped > 0 || health.ingestion?.collection?.incomplete ? 'bg-amber-400' : 'bg-emerald-400'
                   }`} />
                 </button>
                 {showStatusTooltip && (

@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import ExclusionProfiles, { EXCLUSION_DEFAULT_KEY, ExclusionProfileProvider, ruleExclusionGroup, useExclusionProfile, validExclusionGroups } from '../components/ExclusionProfiles'
+import ExclusionProfiles, { EXCLUSION_DEFAULT_KEY, ExclusionCounts, ExclusionProfileProvider, ruleExclusionGroup, useExclusionProfile, validExclusionGroups } from '../components/ExclusionProfiles'
 import RuleUsage from '../components/RuleUsage'
 import SecuritySummary from '../components/SecuritySummary'
 import { apiFetch, createSavedView, deleteSavedView, fetchExclusionPreview, fetchSavedViews, fetchSecuritySummary } from '../api'
@@ -29,6 +29,15 @@ beforeEach(() => {
 })
 
 describe('exclusion profiles', () => {
+  it('does not display omitted profile counts as zero', () => {
+    const { rerender } = render(<ExclusionCounts counts={null} unknown />)
+    expect(screen.getByLabelText('View event counts')).toHaveTextContent('visible and hidden totals not counted')
+    expect(screen.queryByText(/0 hidden/)).toBeNull()
+    rerender(<ExclusionCounts counts={{ total: null, visible: null, hidden: null }} />)
+    expect(screen.getByLabelText('View event counts')).toHaveTextContent('Not counted hidden by profile')
+    rerender(<ExclusionCounts counts={{ total: 0, visible: 0, hidden: 0 }} />)
+    expect(screen.getByLabelText('View event counts')).toHaveTextContent('0 hidden by profile')
+  })
   it('requires preview before applying an exact scoped rule and invalidates it after edits', async () => {
     render(<Harness />)
     await screen.findByRole('option', { name: 'Routine events' })
