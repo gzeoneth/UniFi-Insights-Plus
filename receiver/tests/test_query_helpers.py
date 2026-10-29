@@ -153,12 +153,13 @@ class TestBuildLogQuery:
         assert 'dns' in params
 
     def test_negated_ip(self):
-        where, params = self._build(ip='!1.2.3.4')
-        assert 'NOT LIKE' in where
+        where, params = self._build(ip='!192.0.2.4')
+        assert 'IS NOT TRUE' in where
+        assert 'src_ip = %s::inet' in where
 
     def test_src_ip_filter(self):
-        where, params = self._build(src_ip='10.0.0.1')
-        assert 'src_ip::text LIKE' in where
+        where, params = self._build(src_ip='192.0.2.1')
+        assert 'src_ip = %s::inet' in where
 
     def test_negated_rule_action(self):
         where, params = self._build(rule_action='!block')
@@ -198,11 +199,23 @@ class TestBuildLogQuery:
         assert 'dst_port = %s' in where
         assert 443 in params
 
-    def test_dst_port_invalid_ignored(self):
-        where, params = self._build(dst_port='abc')
-        # Invalid port ignored; only the 24h time fallback remains
-        assert 'dst_port' not in where
-        assert 'timestamp >= %s' in where
+    @pytest.mark.parametrize('value', ['abc', '70000', '65536', '80,', '!','90-80','80 OR TRUE'])
+    def test_invalid_port_rejected(self, value):
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as error:
+            self._build(dst_port=value)
+        assert error.value.status_code == 400
+
+    def test_port_list_and_range(self):
+        where, params = self._build(dst_port='1900,5353-5354')
+        assert 'dst_port BETWEEN %s AND %s' in where
+        assert params[-4:] == [1900, 1900, 5353, 5354]
+
+    def test_negated_source_port_list_keeps_nulls(self):
+        where, params = self._build(src_port='!1900,5353')
+        assert 'NOT (COALESCE(' in where
+        assert params[-4:] == [1900, 1900, 5353, 5353]
+
 
     def test_negated_protocol(self):
         where, params = self._build(protocol='!tcp')

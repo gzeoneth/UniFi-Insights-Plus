@@ -1,4 +1,6 @@
 import { useState, useEffect } from 'react'
+import usePreference from '../hooks/usePreference'
+import { isBooleanRecord } from '../lib/viewPreferences'
 import { fetchLogsBatch } from '../api'
 import { FlagIcon, decodeThreatCategories, getInterfaceName, formatServiceName, normalizeRuleDesc } from '../utils'
 import { getThreatLevel } from '../lib/threatPresentation'
@@ -77,7 +79,11 @@ function LogEntry({ log, onSelect }) {
 }
 
 function LogDetailPanel({ log }) {
-  const [openSections, setOpenSections] = useState({ source: true, dest: true, threat: true, traffic: false })
+  const [openSections, setOpenSections] = usePreference(
+    'unifi-log-insight:threat-detail-sections',
+    { source: true, dest: true, threat: true, traffic: false },
+    value => isBooleanRecord(value, ['source', 'dest', 'threat', 'traffic']),
+  )
   const toggle = (key) => setOpenSections(prev => ({ ...prev, [key]: !prev[key] }))
 
   const categories = decodeThreatCategories(log.threat_categories)

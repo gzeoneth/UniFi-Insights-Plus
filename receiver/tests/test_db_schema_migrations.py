@@ -193,8 +193,8 @@ def test_ensure_post_boot_indexes_skips_if_exists(monkeypatch):
 
     database.ensure_post_boot_indexes()
 
-    # Should query pg_indexes but NOT run CREATE INDEX
-    assert any('pg_indexes' in str(c) for c in mock_cursor.execute.call_args_list)
+    # Should inspect index validity but NOT run CREATE INDEX
+    assert any('pg_index' in str(c) for c in mock_cursor.execute.call_args_list)
     executed_sql = ' '.join(str(c) for c in mock_cursor.execute.call_args_list)
     assert 'CREATE INDEX' not in executed_sql
 
@@ -203,7 +203,7 @@ def test_ensure_post_boot_indexes_creates_when_missing(monkeypatch):
     """ensure_post_boot_indexes() creates all indexes when they don't exist."""
     mock_conn = MagicMock()
     mock_cursor = MagicMock()
-    mock_cursor.fetchone.return_value = None  # all indexes missing
+    mock_cursor.fetchone.side_effect = [(True,)] + [None] * len(Database._POST_BOOT_INDEXES)
     mock_cursor.__enter__ = lambda s: s
     mock_cursor.__exit__ = MagicMock(return_value=False)
     mock_conn.cursor.return_value = mock_cursor
@@ -244,14 +244,14 @@ def test_ensure_post_boot_indexes_continues_after_single_failure(monkeypatch):
     def execute_side_effect(sql, params=None):
         nonlocal call_count
         call_count[0] += 1
-        if isinstance(sql, str) and 'pg_indexes' in sql:
+        if isinstance(sql, str) and 'pg_index' in sql:
             return  # fetchone returns None (index missing)
         if isinstance(sql, str) and 'idx_logs_type_id' in sql:
             raise Exception("simulated CREATE INDEX failure")
 
     mock_cursor = MagicMock()
     mock_cursor.execute = MagicMock(side_effect=execute_side_effect)
-    mock_cursor.fetchone.return_value = None  # all indexes missing
+    mock_cursor.fetchone.side_effect = [(True,)] + [None] * len(Database._POST_BOOT_INDEXES)
     mock_cursor.__enter__ = lambda s: s
     mock_cursor.__exit__ = MagicMock(return_value=False)
     mock_conn.cursor.return_value = mock_cursor
@@ -675,6 +675,7 @@ class FakeRetentionCursor:
 def test_run_retention_cleanup_structured_result(monkeypatch):
     """run_retention_cleanup returns structured result with correct counts."""
     database = Database(conn_params={'user': 'unifi'})
+    monkeypatch.setattr(database, 'get_config', lambda key, default=None: default)
 
     remaining = {'dns': 100, 'non_dns': 200}
 
@@ -702,6 +703,7 @@ def test_run_retention_cleanup_structured_result(monkeypatch):
 def test_run_retention_cleanup_no_data(monkeypatch):
     """run_retention_cleanup with no expired data returns zero counts."""
     database = Database(conn_params={'user': 'unifi'})
+    monkeypatch.setattr(database, 'get_config', lambda key, default=None: default)
 
     remaining = {'dns': 0, 'non_dns': 0}
 
@@ -733,6 +735,7 @@ def test_run_retention_cleanup_invalid_days():
 def test_run_retention_cleanup_progress_callback(monkeypatch):
     """progress_cb is called during cleanup."""
     database = Database(conn_params={'user': 'unifi'})
+    monkeypatch.setattr(database, 'get_config', lambda key, default=None: default)
 
     from contextlib import contextmanager as cm
 
@@ -758,3 +761,53 @@ def test_run_retention_cleanup_progress_callback(monkeypatch):
     assert result['status'] == 'complete'
     assert len(progress_calls) >= 1
     assert progress_calls[0]['phase'] == 'dns'
+
+
+def test_index_maintenance_recovers_invalid_build_before_retry(monkeypatch):
+    conn = MagicMock()
+    cursor = conn.cursor.return_value.__enter__.return_value
+    # Maintenance lock acquired, then an unusable partial index from a crash.
+    cursor.fetchone.side_effect = [(True,), (False, 'example_schema')]
+    database = Database(conn_params={'user': 'unifi'})
+    database._POST_BOOT_INDEXES = [Database._POST_BOOT_INDEXES[0]]
+    database._POST_BOOT_DROPS = []
+    monkeypatch.setattr(db_module.psycopg2, 'connect', lambda **kwargs: conn)
+    database.ensure_post_boot_indexes()
+    statements = [call.args[0] for call in cursor.execute.call_args_list]
+    drop = next(i for i, sql in enumerate(statements) if 'DROP INDEX' in str(sql))
+    create = next(i for i, sql in enumerate(statements) if str(sql).startswith('CREATE INDEX'))
+    assert drop < create
+    assert 'CONCURRENTLY' in str(statements[drop])
+    assert 'example_schema' in str(statements[drop])
+    assert 'indisvalid' in ' '.join(map(str, statements))
+    conn.close.assert_called_once()
+
+
+def test_index_maintenance_other_receiver_holds_lock(monkeypatch):
+    conn = MagicMock()
+    cursor = conn.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = (False,)
+    database = Database(conn_params={'user': 'unifi'})
+    monkeypatch.setattr(db_module.psycopg2, 'connect', lambda **kwargs: conn)
+    database.ensure_post_boot_indexes()
+    statements = [call.args[0] for call in cursor.execute.call_args_list]
+    assert len(statements) == 1 and 'pg_try_advisory_lock' in statements[0]
+    conn.close.assert_called_once()
+
+
+def test_index_maintenance_cancellation_stops_following_ddl(monkeypatch):
+    conn = MagicMock()
+    cursor = conn.cursor.return_value.__enter__.return_value
+    cursor.fetchone.side_effect = [(True,), None]
+    database = Database(conn_params={'user': 'unifi'})
+    def execute(sql, params=None):
+        if sql.startswith('CREATE INDEX'):
+            database.cancel_index_maintenance()
+    cursor.execute.side_effect = execute
+    monkeypatch.setattr(db_module.psycopg2, 'connect', lambda **kwargs: conn)
+    database.ensure_post_boot_indexes()
+    statements = [call.args[0] for call in cursor.execute.call_args_list]
+    assert len([sql for sql in statements if sql.startswith('CREATE INDEX')]) == 1
+    conn.cancel.assert_called_once()
+    conn.close.assert_called_once()
+    assert database._index_maintenance_connection is None

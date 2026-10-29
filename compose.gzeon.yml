@@ -1,0 +1,44 @@
+name: unifi-insights-gzeon
+services:
+  insights:
+    image: ${INSIGHTS_IMAGE:-ghcr.io/gzeoneth/unifi-insights-plus:3.7.2-gzeon.9}
+    pull_policy: ${INSIGHTS_PULL_POLICY:-missing}
+    restart: unless-stopped
+    stop_grace_period: 90s
+    mem_limit: 4g
+    shm_size: 256mb
+    env_file:
+      - .env
+    environment:
+      TZ: '${TZ:-UTC}'
+      INGEST_SPOOL_PATH: /var/lib/unifi-log-insight/ingest/retry.sqlite3
+      INGEST_STATUS_PATH: /dev/shm/unifi-log-insight/receiver-health.json
+      INGEST_QUEUE_CAPACITY: '${INGEST_QUEUE_CAPACITY:-16384}'
+      INGEST_BATCH_SIZE: '${INGEST_BATCH_SIZE:-200}'
+      INGEST_FLUSH_INTERVAL_SECONDS: '${INGEST_FLUSH_INTERVAL_SECONDS:-1.0}'
+      ENRICHMENT_QUEUE_CAPACITY: '256'
+    ports:
+      - '${WEB_BIND_IP:-127.0.0.1}:${WEB_PORT:-8091}:8000'
+      - '${SYSLOG_BIND_IP:-127.0.0.1}:${SYSLOG_PORT:-1514}:514/udp'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ingest:/var/lib/unifi-log-insight/ingest
+      - archives:/data/archives
+      - tls:/var/lib/unifi-log-insight/tls
+      - ./maxmind:/app/maxmind
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+    healthcheck:
+      test: ['CMD', '/app/venv/bin/python', '/app/healthcheck.py']
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 90s
+volumes:
+  pgdata:
+  ingest:
+  archives:
+  tls:

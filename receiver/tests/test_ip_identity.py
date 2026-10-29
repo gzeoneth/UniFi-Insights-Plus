@@ -44,10 +44,10 @@ class TestAnnotateIpPrecedence:
         assert name == 'ISP WAN'
         assert vlan is None
 
-    def test_wan_skipped_if_existing_name(self):
+    def test_current_wan_binding_replaces_saved_name(self):
         cfg = _cfg(wan_ip_names={'203.0.113.5': 'ISP WAN'})
         name, vlan, badge = annotate_ip(cfg, '203.0.113.5', existing_name='CustomDevice')
-        assert name == 'CustomDevice'
+        assert name == 'ISP WAN'
 
     def test_gateway_wins_over_wan(self):
         cfg = _cfg(
@@ -157,12 +157,26 @@ class TestAnnotateRecord:
         annotate_record(cfg, record)
         assert 'src_device_name' not in record
 
-    def test_preserves_existing_device_name(self):
+    def test_replaces_saved_wan_device_name(self):
         cfg = _cfg(wan_ip_names={'1.2.3.4': 'WAN'})
         record = {'src_ip': '1.2.3.4', 'src_device_name': 'CustomDevice'}
         annotate_record(cfg, record)
-        # existing name wins, WAN name NOT applied
-        assert record['src_device_name'] == 'CustomDevice'
+        assert record['src_device_name'] == 'WAN'
+        assert record['src_identity_source'] == 'wan_configuration'
+
+    def test_unknown_inventory_name_is_not_claimed_verified(self):
+        record = {'src_ip': '192.0.2.10', 'src_device_name': 'Speaker'}
+        annotate_record(_cfg(), record)
+        assert record['src_device_name'] == 'Speaker'
+        assert record['src_identity_source'] == 'inventory_or_log'
+
+    def test_gateway_address_does_not_verify_an_existing_inventory_name(self):
+        record = {'src_ip': '192.0.2.1', 'src_device_name': 'Saved label'}
+        cfg = _cfg(gateway_vlans={'192.0.2.1': {'vlan': 2}})
+        annotate_record(cfg, record)
+        assert record['src_device_name'] == 'Saved label'
+        assert record['src_identity_source'] == 'inventory_or_log'
+        assert record['src_device_vlan'] == 2
 
     def test_vpn_gateway_sets_network_badge(self):
         net = ipaddress.ip_network('10.13.13.0/24')
@@ -193,27 +207,28 @@ class TestAnnotateRecord:
 
 class TestLoadIdentityConfig:
     @patch('ip_identity.build_vpn_cidr_map')
-    @patch('ip_identity.get_config')
-    def test_loads_all_configs(self, mock_get_config, mock_build_vpn):
-        mock_get_config.side_effect = lambda db, key: {
-            'gateway_ip_vlans': {'192.168.1.1': {'vlan': 10}},
+    def test_loads_all_configs(self, mock_build_vpn):
+        db = MagicMock()
+        db.get_display_config.return_value = {
+            'gateway_ip_vlans': {'192.0.2.1': {'vlan': 20}},
             'wan_ip_names': {'203.0.113.5': 'ISP WAN'},
-            'vpn_networks': {'wg0': {'cidr': '10.13.13.0/24'}},
-        }.get(key)
+            'vpn_networks': {'wg0': {'cidr': '198.51.100.0/24'}},
+        }
         mock_build_vpn.return_value = [('fake_cidr_tuple',)]
 
-        cfg = load_identity_config(MagicMock())
+        cfg = load_identity_config(db)
 
-        assert '192.168.1.1' in cfg.gateway_vlans
+        assert '192.0.2.1' in cfg.gateway_vlans
         assert '203.0.113.5' in cfg.wan_ip_names
         assert len(cfg.vpn_cidrs) == 1
-        assert cfg.exclude_ips == {'192.168.1.1', '203.0.113.5'}
+        assert cfg.exclude_ips == {'192.0.2.1', '203.0.113.5'}
+        db.get_display_config.assert_called_once_with()
 
     @patch('ip_identity.build_vpn_cidr_map')
-    @patch('ip_identity.get_config')
-    def test_empty_configs(self, mock_get_config, mock_build_vpn):
-        mock_get_config.return_value = None
-        cfg = load_identity_config(MagicMock())
+    def test_empty_configs(self, mock_build_vpn):
+        db = MagicMock()
+        db.get_display_config.return_value = {}
+        cfg = load_identity_config(db)
 
         assert cfg.gateway_vlans == {}
         assert cfg.wan_ip_names == {}

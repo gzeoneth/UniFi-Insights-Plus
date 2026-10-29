@@ -1,11 +1,10 @@
 import { useState, useEffect, useRef } from 'react'
 import { fetchHostDetail } from '../api'
+import useFlowQuery from '../hooks/useFlowQuery'
 import { formatNumber, formatServiceName, ACTION_STYLES } from '../utils'
 
-export default function HostSlidePanel({ ip, filters, onClose, onPeerClick, onBack, canGoBack }) {
-  const [data, setData] = useState(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(null)
+export default function HostSlidePanel({ ip, filters, onClose, onPeerClick, onBack, canGoBack, refreshKey }) {
+  const { data, loading, error } = useFlowQuery('host-detail', { ...filters, ip }, fetchHostDetail, refreshKey, !!ip)
   const [visible, setVisible] = useState(false)
   const closeTimeoutRef = useRef(null)
 
@@ -20,17 +19,6 @@ export default function HostSlidePanel({ ip, filters, onClose, onPeerClick, onBa
     return () => { if (closeTimeoutRef.current) clearTimeout(closeTimeoutRef.current) }
   }, [])
 
-  useEffect(() => {
-    if (!ip) return
-    let cancelled = false
-    setLoading(true)
-    setError(null)
-    fetchHostDetail({ ip, ...filters })
-      .then(d => { if (!cancelled) setData(d) })
-      .catch(err => { if (!cancelled) setError(err.message) })
-      .finally(() => { if (!cancelled) setLoading(false) })
-    return () => { cancelled = true }
-  }, [ip, filters.time_range, filters.rule_action, filters.direction])
 
   const handleClose = () => {
     setVisible(false)
@@ -60,7 +48,7 @@ export default function HostSlidePanel({ ip, filters, onClose, onPeerClick, onBa
           {loading ? (
             <span className="text-xs text-gray-500">Loading...</span>
           ) : error ? (
-            <span className="text-xs text-red-400">{error}</span>
+            <span className="text-xs text-red-400">{error?.message || String(error)}</span>
           ) : data ? (
             <>
               <span className="text-sm font-semibold text-gray-100 font-mono truncate">{data.device_name || data.ip}</span>

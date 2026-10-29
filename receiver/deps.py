@@ -5,11 +5,9 @@ Singletons (database pools, enrichers, UniFi client) are initialized here
 at import time and imported by route modules via `from deps import ...`.
 """
 
-import functools
 import logging
 import os
 import subprocess
-import threading
 import time
 
 from psycopg2 import extensions, pool
@@ -18,6 +16,7 @@ from db import Database, build_conn_params, wait_for_postgres
 from enrichment import AbuseIPDBEnricher
 from unifi_api import UniFiAPI
 from pihole_api import PiHolePoller
+from read_cache import ttl_cache
 
 logger = logging.getLogger('api')
 
@@ -105,31 +104,6 @@ unifi_api = UniFiAPI(db=enricher_db)
 # ── Pi-hole Poller ─────────────────────────────────────────────────────────
 
 pihole_poller = PiHolePoller(db=enricher_db, enricher=None)
-
-# ── Caching ──────────────────────────────────────────────────────────────────
-
-def ttl_cache(seconds=30):
-    """Thread-safe TTL cache for expensive endpoint results."""
-    def decorator(fn):
-        lock = threading.Lock()
-        cached = {'result': None, 'expires': 0}
-
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            now = time.monotonic()
-            if cached['result'] is not None and now < cached['expires']:
-                return cached['result']
-            with lock:
-                # Double-check after acquiring lock
-                if cached['result'] is not None and now < cached['expires']:
-                    return cached['result']
-                result = fn(*args, **kwargs)
-                cached['result'] = result
-                cached['expires'] = time.monotonic() + seconds
-                return result
-        return wrapper
-    return decorator
-
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 

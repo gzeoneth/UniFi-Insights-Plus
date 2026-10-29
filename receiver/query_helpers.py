@@ -3,6 +3,9 @@ Query building helpers shared by log and export endpoints.
 """
 
 import logging
+import ipaddress
+
+from fastapi import HTTPException
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -112,6 +115,45 @@ def build_time_conditions(
     return conditions, params
 
 
+def build_ip_condition(value: str, columns: tuple[str, ...]) -> tuple[str, list]:
+    """Use native INET operators for complete addresses and CIDRs.
+
+    Legacy partial inputs still search literal text. ``contains:`` forces that
+    behavior even for a complete address; ``!`` negates either mode and keeps
+    missing addresses. Column identifiers are internal, never user input.
+    """
+    negated, term = _parse_negation(value.strip())
+    partial = term.startswith('contains:')
+    if partial:
+        term = term[len('contains:'):]
+    if not term or len(term) > 256:
+        raise HTTPException(400, detail='IP filter must contain 1-256 characters')
+    predicate = None
+    parameter = None
+    if not partial:
+        try:
+            if '%' in term:
+                raise ValueError('scoped IP addresses are not supported')
+            if '/' in term:
+                network = ipaddress.ip_network(term, strict=False)
+                predicate, parameter = '<<= %s::inet', str(network)
+            else:
+                address = ipaddress.ip_address(term)
+                predicate, parameter = '= %s::inet', str(address)
+        except ValueError as error:
+            if '/' in term or '%' in term:
+                raise HTTPException(400, detail='Invalid IP/CIDR; use contains: for literal text') from error
+    if predicate:
+        parts = [f'{column} {predicate}' for column in columns]
+    else:
+        parts = [f"{column}::text LIKE %s ESCAPE '\\'" for column in columns]
+        parameter = f'%{_escape_like(term)}%'
+    combined = '(' + ' OR '.join(parts) + ')'
+    if negated:
+        combined = f'({combined}) IS NOT TRUE'
+    return combined, [parameter] * len(columns)
+
+
 def build_log_query(
     log_type: Optional[str],
     time_range: Optional[str],
@@ -133,6 +175,8 @@ def build_log_query(
     dst_port: Optional[str] = None,
     src_port: Optional[str] = None,
     protocol: Optional[str] = None,
+    filter_rules: Optional[str] = None,
+    exclude_groups: Optional[str] = None,
 ) -> tuple[str, list]:
     """Build WHERE clause and params from filters."""
     conditions = []
@@ -148,35 +192,12 @@ def build_log_query(
     conditions.extend(time_conds)
     params.extend(time_params)
 
-    if src_ip:
-        negated, val = _parse_negation(src_ip)
-        op = "NOT LIKE" if negated else "LIKE"
-        if negated:
-            conditions.append(f"(src_ip::text {op} %s ESCAPE '\\' OR src_ip IS NULL)")
-        else:
-            conditions.append(f"src_ip::text {op} %s ESCAPE '\\'") 
-        params.append(f"%{_escape_like(val)}%")
-
-    if dst_ip:
-        negated, val = _parse_negation(dst_ip)
-        op = "NOT LIKE" if negated else "LIKE"
-        if negated:
-            conditions.append(f"(dst_ip::text {op} %s ESCAPE '\\' OR dst_ip IS NULL)")
-        else:
-            conditions.append(f"dst_ip::text {op} %s ESCAPE '\\'") 
-        params.append(f"%{_escape_like(val)}%")
-
-    if ip:
-        negated, val = _parse_negation(ip)
-        escaped_ip = _escape_like(val)
-        if negated:
-            conditions.append(
-                "((src_ip::text NOT LIKE %s ESCAPE '\\' OR src_ip IS NULL)"
-                " AND (dst_ip::text NOT LIKE %s ESCAPE '\\' OR dst_ip IS NULL))"
-            )
-        else:
-            conditions.append("(src_ip::text LIKE %s ESCAPE '\\' OR dst_ip::text LIKE %s ESCAPE '\\')")
-        params.extend([f"%{escaped_ip}%", f"%{escaped_ip}%"])
+    for value, columns in ((src_ip, ('src_ip',)), (dst_ip, ('dst_ip',)),
+                           (ip, ('src_ip', 'dst_ip'))):
+        if value:
+            condition, ip_params = build_ip_condition(value, columns)
+            conditions.append(condition)
+            params.extend(ip_params)
 
     if direction:
         directions = [d.strip() for d in direction.split(',')]
@@ -284,23 +305,20 @@ def build_log_query(
             conditions.append(f"asn_name {op} %s ESCAPE '\\'") 
         params.append(f"%{escaped_asn}%")
 
-    if dst_port:
-        negated, port_val = _parse_port(dst_port)
-        if port_val is not None:
-            if negated:
-                conditions.append("(dst_port != %s OR dst_port IS NULL)")
+    for column, value in (('dst_port', dst_port), ('src_port', src_port)):
+        if value:
+            from field_filters import compile_filters
+            negated, clean = _parse_negation(value.strip())
+            port_conditions, port_params = compile_filters([{
+                'field': column, 'operator': 'exclude' if negated else 'include', 'value': clean,
+            }])
+            # Preserve the simple indexed equality path for a single port.
+            if clean.isascii() and clean.isdecimal():
+                conditions.append(f'({column} != %s OR {column} IS NULL)' if negated else f'{column} = %s')
+                params.append(int(clean))
             else:
-                conditions.append("dst_port = %s")
-            params.append(port_val)
-
-    if src_port:
-        negated, port_val = _parse_port(src_port)
-        if port_val is not None:
-            if negated:
-                conditions.append("(src_port != %s OR src_port IS NULL)")
-            else:
-                conditions.append("src_port = %s")
-            params.append(port_val)
+                conditions.extend(port_conditions)
+                params.extend(port_params)
 
     if protocol:
         negated, val = _parse_negation(protocol)
@@ -322,8 +340,12 @@ def build_log_query(
             params.extend([f"{pfx}%", f"{pfx}%"])
         conditions.append(f"({' OR '.join(vpn_parts)})")
 
+    from field_filters import append_exclusions, compile_filters
+    extra_conditions, extra_params = compile_filters(filter_rules)
+    conditions.extend(extra_conditions)
+    params.extend(extra_params)
     where = " AND ".join(conditions) if conditions else "1=1"
-    return where, params
+    return append_exclusions(where, params, exclude_groups)
 
 
 def _escape_like(value: str) -> str:
@@ -405,6 +427,66 @@ def validate_view_filters(filters: dict) -> str | None:
     """
     if not isinstance(filters, dict):
         return "filters must be a JSON object"
+
+    if filters.get('view_type') == 'exclusions':
+        from field_filters import compile_exclusions
+        from fastapi import HTTPException
+        if set(filters) - {'view_type', 'exclude_groups'} or 'exclude_groups' not in filters:
+            return 'Exclusion profiles require only view_type and exclude_groups'
+        if not isinstance(filters['exclude_groups'], list):
+            return 'exclude_groups must be an array'
+        try:
+            compile_exclusions(filters['exclude_groups'])
+        except HTTPException as exc:
+            return str(exc.detail)
+        return None
+
+    if filters.get('view_type') == 'logs':
+        from field_filters import compile_filters, compile_exclusions
+        from fastapi import HTTPException
+        try:
+            compile_filters(filters.get('filter_rules'))
+            compile_exclusions(filters.get('exclude_groups'))
+        except HTTPException as exc:
+            return str(exc.detail)
+        if filters.get('time_range') is not None and (not isinstance(filters['time_range'], str) or filters['time_range'] not in VALID_TIME_RANGES):
+            return 'Invalid log-view time range'
+        if set(filters) - {'view_type', 'filter_rules', 'exclude_groups', 'time_range', 'time_from', 'time_to', 'log_type', 'rule_action', 'direction', 'ip', 'src_ip', 'dst_ip', 'rule_name', 'search', 'service', 'country', 'asn', 'dst_port', 'src_port', 'protocol', 'interface', 'vpn_only', 'threat_min'}:
+            return 'Unknown log-view option'
+        if filters.get('rule_name') is not None and (not isinstance(filters['rule_name'], str) or len(filters['rule_name']) > 255):
+            return 'Invalid rule name'
+        for key, value in filters.items():
+            if key in ('view_type', 'filter_rules', 'exclude_groups') or value is None:
+                continue
+            if key == 'vpn_only':
+                if type(value) is not bool:
+                    return 'vpn_only must be a boolean'
+            elif key == 'threat_min':
+                if type(value) is not int or not 0 <= value <= 100:
+                    return 'threat_min must be an integer within 0..100'
+            elif not isinstance(value, str) or len(value) > 2048:
+                return f'{key} must be text up to 2048 characters'
+        for key in ('time_from', 'time_to'):
+            if filters.get(key):
+                try:
+                    datetime.fromisoformat(filters[key].replace('Z', '+00:00'))
+                except ValueError:
+                    return f'{key} must be an ISO timestamp'
+        return None
+
+    # Flow views persist the same advanced conditions sent to graph, matrix,
+    # pair lists, drill-down and export. Reject malformed saved conditions now
+    # instead of storing a preset that fails only when it is opened later.
+    from field_filters import compile_filters, compile_exclusions
+    from fastapi import HTTPException
+    for key in ('filter_rules', 'exclude_groups'):
+        if filters.get(key) is not None and not isinstance(filters[key], list):
+            return f'{key} must be an array'
+    try:
+        compile_filters(filters.get('filter_rules'))
+        compile_exclusions(filters.get('exclude_groups'))
+    except HTTPException as exc:
+        return str(exc.detail)
 
     dims = filters.get('dims')
     if not isinstance(dims, list) or len(dims) != 3:

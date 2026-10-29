@@ -16,6 +16,7 @@ import ipaddress
 import logging
 import time
 import threading
+import queue
 from collections import OrderedDict
 from typing import Optional
 
@@ -221,83 +222,226 @@ class TTLCache:
 
 # ── GeoIP Enrichment ─────────────────────────────────────────────────────────
 
+class _GeoIPGeneration:
+    """Reader leases and retirement state, guarded by the enricher condition."""
+
+    def __init__(self):
+        self.active = 0
+        self.readers = ()
+        self.closed = threading.Event()
+
+
 class GeoIPEnricher:
-    """MaxMind GeoLite2 lookups for City and ASN."""
+    """MaxMind lookups with a bounded cache of scalar result fields."""
+
+    CACHE_MAX_ENTRIES = 8192
+    CACHE_TTL_SECONDS = 3600
 
     def __init__(self, db_dir: str = '/app/maxmind'):
         self.city_reader = None
         self.asn_reader = None
         self.db_dir = db_dir
+        self._reader_lock = threading.Lock()
+        self._reader_condition = threading.Condition(self._reader_lock)
+        self._reload_lock = threading.Lock()
+        self._reader_generation = _GeoIPGeneration()
+        self._retired_generations = []
+        self._close_worker = None
+        self._closed = False
+        self._cache = self._new_cache()
         self._load_databases(db_dir)
 
+    def _new_cache(self):
+        return TTLCache(ttl_seconds=self.CACHE_TTL_SECONDS,
+                        max_entries=self.CACHE_MAX_ENTRIES,
+                        prune_trigger_ratio=1.0)
+
+    @staticmethod
+    def _close_readers(*readers):
+        for reader in readers:
+            if reader is not None:
+                try:
+                    reader.close()
+                except Exception:
+                    logger.debug("Failed to close MaxMind reader", exc_info=True)
+
+    def _retire_current_locked(self):
+        generation = self._reader_generation
+        generation.readers = (self.city_reader, self.asn_reader)
+        if any(reader is not None for reader in generation.readers):
+            self._retired_generations.append(generation)
+            if self._close_worker is None:
+                self._close_worker = threading.Thread(
+                    target=self._finish_close, name='geoip-close', daemon=True)
+                self._close_worker.start()
+            self._reader_condition.notify_all()
+        else:
+            generation.closed.set()
+        return generation
+
     def _load_databases(self, db_dir: str):
+        # Serialize opening as well as retirement. A stuck old reader retains
+        # at most its generation and the working replacement, even if further
+        # reload requests arrive. Lookups do not take this lock.
+        with self._reload_lock:
+            return self._replace_databases(db_dir)
+
+    def _replace_databases(self, db_dir: str):
+        # File opening may wait on storage. Keep the working readers and cache
+        # available while replacement files are opened in the reload worker.
+        if self._closed:
+            return False
+        city_was_loaded = self.city_reader is not None
+        asn_was_loaded = self.asn_reader is not None
+        city_reader = asn_reader = None
         try:
             import geoip2.database
             city_path = os.path.join(db_dir, 'GeoLite2-City.mmdb')
             asn_path = os.path.join(db_dir, 'GeoLite2-ASN.mmdb')
 
             if os.path.exists(city_path):
-                self.city_reader = geoip2.database.Reader(city_path)
+                city_reader = geoip2.database.Reader(city_path)
                 logger.info("Loaded GeoLite2-City database")
             else:
                 logger.warning("GeoLite2-City.mmdb not found at %s", city_path)
+                if city_was_loaded:
+                    raise FileNotFoundError("Replacement GeoLite2-City database is missing")
 
             if os.path.exists(asn_path):
-                self.asn_reader = geoip2.database.Reader(asn_path)
+                asn_reader = geoip2.database.Reader(asn_path)
                 logger.info("Loaded GeoLite2-ASN database")
             else:
                 logger.warning("GeoLite2-ASN.mmdb not found at %s", asn_path)
-
+                if asn_was_loaded:
+                    raise FileNotFoundError("Replacement GeoLite2-ASN database is missing")
         except ImportError:
+            self._close_readers(city_reader, asn_reader)
             logger.error("geoip2 package not installed")
+            return False
         except Exception as e:
+            self._close_readers(city_reader, asn_reader)
             logger.error("Failed to load MaxMind databases: %s", e)
+            return False
+
+        with self._reader_condition:
+            if self._closed:
+                old_generation = None
+            else:
+                old_generation = self._retire_current_locked()
+                self.city_reader, self.asn_reader = city_reader, asn_reader
+                self._reader_generation = _GeoIPGeneration()
+                self._cache = self._new_cache()
+        if old_generation is None:
+            self._close_readers(city_reader, asn_reader)
+            return False
+        # New lookups already use the replacement. Only the reload worker waits
+        # for old leases and close(), bounding retained mappings and workers.
+        old_generation.closed.wait()
+        return True
 
     def reload(self):
-        """Reload databases from disk (called after geoipupdate)."""
+        """Replace readers and invalidate cached results after a successful load."""
         logger.info("Reloading MaxMind databases...")
-        old_city = self.city_reader
-        old_asn = self.asn_reader
-        self._load_databases(self.db_dir)
-        # Close old readers after loading new ones
-        if old_city:
-            try: old_city.close()
-            except: pass
-        if old_asn:
-            try: old_asn.close()
-            except: pass
-        logger.info("MaxMind databases reloaded")
+        loaded = self._load_databases(self.db_dir)
+        if loaded:
+            logger.info("MaxMind databases reloaded")
+        return loaded
 
     def lookup(self, ip_str: str) -> dict:
-        """Look up GeoIP and ASN data for an IP. Returns dict of fields."""
-        result = {}
+        """Return GeoIP/ASN fields without repeating MMDB work for hot IPs."""
+        if self._closed:
+            return {}
+        cached = self._cache.get(ip_str)
+        if cached is not None:
+            return dict(cached)
+        with self._reader_condition:
+            if self._closed:
+                return {}
+            # Capture one reader pair and cache generation. MaxMind permits
+            # concurrent reads; only reader retirement must wait for leases.
+            cache = self._cache
+            cached = cache.get(ip_str)
+            if cached is not None:
+                return dict(cached)
+            generation = self._reader_generation
+            generation.active += 1
+            city_reader, asn_reader = self.city_reader, self.asn_reader
+        try:
+            result, complete = self._lookup_readers(ip_str, city_reader, asn_reader)
+            with self._reader_condition:
+                current = generation is self._reader_generation and not self._closed
+            if complete and current:
+                # Always write the captured cache. A concurrent reload cannot
+                # let this old result populate its replacement cache.
+                cache.set(ip_str, dict(result))
+            return result
+        finally:
+            with self._reader_condition:
+                generation.active -= 1
+                self._reader_condition.notify_all()
 
-        if self.city_reader:
+    def _lookup_readers(self, ip_str, city_reader, asn_reader):
+        try:
+            from geoip2.errors import AddressNotFoundError
+        except ImportError:
+            return {}, False
+
+        result = {}
+        complete = True
+        if city_reader:
             try:
-                resp = self.city_reader.city(ip_str)
+                resp = city_reader.city(ip_str)
                 result['geo_country'] = resp.country.iso_code
                 result['geo_city'] = resp.city.name
                 if resp.location:
-                    result['geo_lat'] = float(resp.location.latitude) if resp.location.latitude else None
-                    result['geo_lon'] = float(resp.location.longitude) if resp.location.longitude else None
+                    result['geo_lat'] = float(resp.location.latitude) if resp.location.latitude is not None else None
+                    result['geo_lon'] = float(resp.location.longitude) if resp.location.longitude is not None else None
+            except AddressNotFoundError:
+                pass  # A real database miss can be cached until TTL/reload.
             except Exception:
-                pass
+                complete = False  # A transient failure must not poison the cache.
 
-        if self.asn_reader:
+        if asn_reader:
             try:
-                resp = self.asn_reader.asn(ip_str)
+                resp = asn_reader.asn(ip_str)
                 result['asn_number'] = resp.autonomous_system_number
                 result['asn_name'] = resp.autonomous_system_organization
-            except Exception:
+            except AddressNotFoundError:
                 pass
+            except Exception:
+                complete = False
+        return result, complete
 
-        return result
+    def _finish_close(self):
+        # One worker owns all reader closes. Keep closing generations in the
+        # list until finished, so a slow close cannot spawn another worker.
+        while True:
+            with self._reader_condition:
+                while True:
+                    generation = next((item for item in self._retired_generations
+                                       if item.active == 0), None)
+                    if generation is not None:
+                        break
+                    if not self._retired_generations:
+                        self._close_worker = None
+                        return
+                    self._reader_condition.wait()
+            self._close_readers(*generation.readers)
+            with self._reader_condition:
+                self._retired_generations.remove(generation)
+                generation.closed.set()
+                self._reader_condition.notify_all()
 
     def close(self):
-        if self.city_reader:
-            self.city_reader.close()
-        if self.asn_reader:
-            self.asn_reader.close()
+        # Neither a cold lookup nor closing an mmap may hold up shutdown.
+        # Retire through the same bounded worker used by database reloads.
+        with self._reader_condition:
+            if self._closed:
+                return
+            self._closed = True
+            self._cache = self._new_cache()
+            self._retire_current_locked()
+            self.city_reader = self.asn_reader = None
 
 
 # ── AbuseIPDB Enrichment ─────────────────────────────────────────────────────
@@ -315,6 +459,11 @@ class AbuseIPDBEnricher:
             ttl_seconds=DEFAULT_TTL_SECONDS,
             max_entries=self.MEMORY_CACHE_MAX_ENTRIES,
         )  # 24h in-memory hot cache
+        # Repeated blocked packets must not read the same absent DB entry on
+        # every event while the external provider has no budget. This stores
+        # only a short retry delay, never a fabricated reputation result.
+        self._quota_misses = TTLCache(ttl_seconds=15, max_entries=1024,
+                                     prune_trigger_ratio=1.0)
         self.db = db  # Database instance for persistent threat cache
         self.enabled = bool(self.api_key)
         self._lock = threading.Lock()
@@ -499,7 +648,34 @@ class AbuseIPDBEnricher:
             except Exception:
                 pass
 
-    def lookup(self, ip_str: str) -> dict:
+    def quota_miss_active(self, ip_str: str) -> bool:
+        """Memory-only retry check, safe on the ingestion worker.
+
+        A renewed/unknown budget bypasses the delay immediately. Do not call
+        _check_rate_limit here: quota reset persistence can perform file/DB I/O.
+        """
+        if self._quota_misses.get(ip_str) is None:
+            return False
+        now = time.time()
+        # The provider can hold this lock while persisting a quota reset. Skip
+        # this optional optimization rather than make intake wait for that I/O.
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            if now < self._paused_until:
+                return True
+            if self._rate_limit_reset is not None:
+                try:
+                    if now > float(self._rate_limit_reset):
+                        return False
+                except (TypeError, ValueError):
+                    pass
+            return (self._rate_limit_remaining is not None
+                    and self._rate_limit_remaining <= self.SAFETY_BUFFER)
+        finally:
+            self._lock.release()
+
+    def lookup(self, ip_str: str, *, bypass_cooldown: bool = False) -> dict:
         """Check an IP against AbuseIPDB. Returns threat_score and categories.
         
         Lookup order:
@@ -518,19 +694,25 @@ class AbuseIPDBEnricher:
         cached = self.cache.get(ip_str)
         if cached is not None:
             return cached
+        if not bypass_cooldown and self.quota_miss_active(ip_str):
+            return {}
 
         # 2. Check persistent DB cache
+        db_missed = self.db is None
         if self.db:
             try:
                 db_result = self.db.get_threat_cache(ip_str, max_age_days=self.STALE_DAYS)
                 if db_result:
                     self.cache.set(ip_str, db_result)  # Promote to memory cache
                     return db_result
+                db_missed = True
             except Exception as e:
                 logger.debug("DB threat cache lookup failed for %s: %s", ip_str, e)
 
         # 3. Check rate limit before API call
         if not self._check_rate_limit():
+            if db_missed:
+                self._quota_misses.set(ip_str, {})
             return {}
 
         try:
@@ -563,6 +745,8 @@ class AbuseIPDBEnricher:
                 logger.warning("AbuseIPDB 429 — paused until %s",
                              time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self._paused_until)))
                 self._write_stats()
+                if db_missed:
+                    self._quota_misses.set(ip_str, {})
                 return {}
 
             resp.raise_for_status()
@@ -788,11 +972,21 @@ class Enricher:
         self._known_wan_ip = None
         self._excluded_ips = set()  # WAN IPs, gateway IPs — not enrichable
         self._pihole_enrichment = 'both'  # none|geoip|threat|both
-        # @coderabbit Accessed only from the single-threaded UDP receive/enrich
-        # loop today, so this coalescing map intentionally does not use a lock.
-        # If enrich() is ever called concurrently, revisit Enricher shared-state
-        # locking.
-        self._recently_touched = {}  # {ip: monotonic_time} — coalescing set for DB writes
+        self._recently_touched = {}
+        self._touch_lock = threading.Lock()
+        self._vpn_networks = []
+        # One bounded daemon warms network caches. A stalled libc DNS lookup
+        # consumes this worker only; it cannot stall UDP intake or DB delivery.
+        from ingest_queue import positive_env
+        self._network_queue = queue.Queue(maxsize=positive_env('ENRICHMENT_QUEUE_CAPACITY', 256, 4096))
+        self._network_pending = set()
+        self._network_lock = threading.Lock()
+        self._network_stop = threading.Event()
+        self._network_thread = None
+        self._network_dropped = 0
+        self._network_completed = 0
+        self._provider_last_success = {}
+        self._provider_last_error = {}
 
         # Pre-load WAN/gateway exclusions and pihole config from DB so
         # background threads (backfill) have exclusions before the first
@@ -808,6 +1002,7 @@ class Enricher:
 
         # rDNS opt-out toggle: env > system_config > default(True)
         self._rdns_enabled = _resolve_rdns_enabled(db)
+        self._load_vpn_networks()
 
     def _load_identity_exclusions(self):
         """Add persisted WAN and gateway IPs to the exclusion sets (additive).
@@ -840,33 +1035,139 @@ class Enricher:
             return False
         return True
 
-    def _is_recently_touched(self, ip: str) -> bool:
-        """Check if an IP was touched/enqueued within the coalescing TTL.
+    def _load_vpn_networks(self):
+        if self._db:
+            try:
+                from db import get_config, parse_vpn_config
+                self._vpn_networks = parse_vpn_config(get_config(self._db, 'vpn_networks'))
+            except Exception:
+                logger.debug("Failed to reload VPN networks", exc_info=True)
 
-        Also prunes expired entries to prevent unbounded growth.
-        """
+    def _is_recently_touched(self, ip: str) -> bool:
         now = time.monotonic()
-        ts = self._recently_touched.get(ip)
-        if ts is not None and (now - ts) < self._COALESCE_TTL:
-            return True
-        # Lazy prune: when map exceeds threshold, remove expired entries
-        if len(self._recently_touched) > self._COALESCE_MAP_MAX_SIZE:
-            cutoff = now - self._COALESCE_TTL
-            self._recently_touched = {
-                k: v for k, v in self._recently_touched.items() if v > cutoff
-            }
-        return False
+        with self._touch_lock:
+            ts = self._recently_touched.get(ip)
+            return ts is not None and now - ts < self._COALESCE_TTL
+
+    def _mark_touched(self, ip):
+        with self._touch_lock:
+            if len(self._recently_touched) >= self._COALESCE_MAP_MAX_SIZE:
+                self._recently_touched.pop(next(iter(self._recently_touched)))
+            self._recently_touched[ip] = time.monotonic()
 
     def _touch_threat_coalesced(self, ip: str):
-        """Touch threat last_seen_at, coalesced to avoid per-packet DB writes."""
         if self._db and not self._is_recently_touched(ip):
             try:
                 self._db.touch_threat_last_seen(ip)
             except Exception:
                 logger.debug("touch_threat_last_seen failed for %s", ip, exc_info=True)
-            self._recently_touched[ip] = time.monotonic()
+            self._mark_touched(ip)
 
-    def enrich(self, parsed: dict) -> dict:
+    def _defer_network(self, ip, rdns, threat, policy=False):
+        if not (rdns or threat or policy) or self._network_stop.is_set():
+            return
+        key = (ip, rdns, threat, policy)
+        with self._network_lock:
+            if key in self._network_pending:
+                return
+            try:
+                self._network_queue.put_nowait(key)
+            except queue.Full:
+                self._network_dropped += 1
+                return
+            self._network_pending.add(key)
+            if self._network_thread is None:
+                self._network_thread = threading.Thread(
+                    target=self._network_loop, name='network-enrichment', daemon=True)
+                self._network_thread.start()
+
+    def _network_loop(self):
+        while not self._network_stop.is_set():
+            try:
+                key = self._network_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            ip, rdns, threat, policy = key
+            try:
+                if policy:
+                    from firewall_policy_matcher import _get_snapshot
+                    _get_snapshot(self.unifi, vpn_networks=self._vpn_networks)
+                    continue
+                if not self._is_remote_ip(ip):
+                    continue
+                if rdns and self._rdns_enabled:
+                    self.rdns.lookup(ip)
+                    entry = self.rdns.cache.get(ip)
+                    if entry and entry.get('status') == 'transient':
+                        self._provider_last_error['rdns'] = time.time()
+                    else:
+                        self._provider_last_success['rdns'] = time.time()
+                if threat:
+                    data = self.abuseipdb.lookup(ip)
+                    if data:
+                        self._provider_last_success['abuseipdb'] = time.time()
+                        self._touch_threat_coalesced(ip)
+                    elif self.abuseipdb.enabled and self.abuseipdb.remaining_budget > 0:
+                        self._provider_last_error['abuseipdb'] = time.time()
+                    # Existing backfill patches cold first events from the
+                    # persistent threat cache, even when this lookup succeeded.
+                    if self.abuseipdb.enabled and self._db and not self._is_recently_touched('queue:' + ip):
+                        self._db.enqueue_threat_backfill(ip, source='live_miss')
+                        self._mark_touched('queue:' + ip)
+            except Exception:
+                provider = 'unifi' if policy else ('rdns' if rdns else 'abuseipdb')
+                self._provider_last_error[provider] = time.time()
+                logger.debug("Deferred network enrichment failed", exc_info=True)
+            finally:
+                with self._network_lock:
+                    self._network_pending.discard(key)
+                    self._network_completed += 1
+                self._network_queue.task_done()
+
+    def network_stats(self):
+        with self._network_lock:
+            return {'depth': self._network_queue.qsize(), 'capacity': self._network_queue.maxsize,
+                    'pending': len(self._network_pending), 'dropped': self._network_dropped,
+                    'completed': self._network_completed,
+                    'worker_alive': bool(self._network_thread and self._network_thread.is_alive())}
+
+    def provider_stats(self):
+        """Local process observations only; never probe a provider for health."""
+        with self._network_lock:
+            pending = {'rdns': any(key[1] for key in self._network_pending),
+                       'abuseipdb': any(key[2] for key in self._network_pending)}
+        def network(name, configured):
+            success = self._provider_last_success.get(name)
+            error = self._provider_last_error.get(name)
+            if not configured:
+                status = 'not_configured'
+            elif error and (not success or error > success):
+                status = 'error'
+            elif pending.get(name):
+                status = 'pending'
+            else:
+                status = 'ready'
+            return {'status': status, 'last_success_at': success, 'last_error_at': error}
+        result = {
+            'geoip': {'status': 'ready' if self.geoip.city_reader is not None else 'missing'},
+            'asn': {'status': 'ready' if self.geoip.asn_reader is not None else 'missing'},
+            'rdns': network('rdns', self._rdns_enabled),
+            'abuseipdb': network('abuseipdb', self.abuseipdb.enabled),
+        }
+        if self.abuseipdb.enabled and (self.abuseipdb._paused_until > time.time()
+                                     or self.abuseipdb._rate_limit_remaining == 0):
+            result['abuseipdb']['status'] = 'pending'
+        if not self.unifi or not self.unifi.enabled:
+            result['unifi'] = {'status': 'not_configured'}
+        elif getattr(self.unifi, '_last_poll_error', None):
+            result['unifi'] = {'status': 'error'}
+        elif getattr(self.unifi, '_last_poll', None) is None:
+            result['unifi'] = {'status': 'pending'}
+        else:
+            result['unifi'] = {'status': 'ready'}
+        return result
+
+    def enrich(self, parsed: dict, defer_network: bool = False) -> dict:
         """Enrich a parsed log entry with GeoIP, ASN, threat, and rDNS data.
 
         Strategy:
@@ -883,8 +1184,13 @@ class Enricher:
             self._known_wan_ip = wan_ip
             self._excluded_ips.add(wan_ip)
             self.abuseipdb.exclude_ip(wan_ip)
-            # Refresh full wan_ips + gateway_ips from DB
-            self._load_identity_exclusions()
+            # The ingestion worker only reads cached parser identity. Scheduled
+            # refresh/reload keeps persisted gateway and WAN exclusions current.
+            if not defer_network:
+                self._load_identity_exclusions()
+        if defer_network:
+            from parsers import WAN_IPS
+            self._excluded_ips.update(WAN_IPS)
 
         # Determine which IP to enrich — the remote party, not our infrastructure
         ip_to_enrich = None
@@ -915,6 +1221,7 @@ class Enricher:
         # (e.g. 'block' from "Block Unauthorized Traffic"). The policy metadata
         # is authoritative and should override the desc_hint when available.
         if (parsed.get('log_type') == 'firewall'
+                and parsed.get('event_source') != 'unifi_ips'
                 and self.unifi and self.unifi.enabled):
             try:
                 from firewall_policy_matcher import parse_firewall_rule, resolve_rule_action
@@ -923,14 +1230,16 @@ class Enricher:
                     rule_desc=parsed.get('rule_desc'),
                 )
                 if parsed_rule and parsed_rule['format'] == 'zone_index':
-                    from db import get_config, parse_vpn_config
-                    vpn_networks = parse_vpn_config(get_config(self._db, 'vpn_networks'))
                     action = resolve_rule_action(
                         parsed_rule, self.unifi,
                         interface_in=parsed.get('interface_in', ''),
                         interface_out=parsed.get('interface_out', ''),
-                        vpn_networks=vpn_networks,
+                        vpn_networks=self._vpn_networks,
+                        cached_only=defer_network,
                     )
+                    if defer_network and not self._is_recently_touched('policy'):
+                        self._defer_network(None, False, False, policy=True)
+                        self._mark_touched('policy')
                     if action:
                         parsed['rule_action'] = action
             except Exception:
@@ -959,6 +1268,22 @@ class Enricher:
             geo_data = self.geoip.lookup(ip_to_enrich)
             parsed.update(geo_data)
 
+        if defer_network:
+            wants_rdns = not is_pihole and self._rdns_enabled
+            wants_threat = ((is_pihole and self._pihole_enrichment in ('threat', 'both'))
+                            or (parsed.get('log_type') == 'firewall' and parsed.get('rule_action') == 'block'))
+            rdns_cached = self.rdns.cache.get(ip_to_enrich) if wants_rdns else None
+            rdns_fresh = rdns_cached is not None and time.time() < rdns_cached.get('expires_at', 0)
+            if rdns_fresh and rdns_cached.get('rdns'):
+                parsed['rdns'] = rdns_cached['rdns']
+            threat_cached = self.abuseipdb.cache.get(ip_to_enrich) if wants_threat else None
+            if threat_cached:
+                parsed.update(threat_cached)
+            self._defer_network(ip_to_enrich, wants_rdns and not rdns_fresh,
+                                wants_threat and self.abuseipdb.enabled and not threat_cached
+                                and not self.abuseipdb.quota_miss_active(ip_to_enrich))
+            return parsed
+
         # rDNS (skip for pihole — domain already in dns_query, or operator opt-out)
         if not is_pihole and self._rdns_enabled:
             rdns_data = self.rdns.lookup(ip_to_enrich)
@@ -984,7 +1309,7 @@ class Enricher:
                         self._db.enqueue_threat_backfill(ip_to_enrich, source='live_miss')
                     except Exception:
                         logger.debug("enqueue_threat_backfill failed for %s", ip_to_enrich, exc_info=True)
-                    self._recently_touched[ip_to_enrich] = time.monotonic()
+                    self._mark_touched(ip_to_enrich)
 
         return parsed
 
@@ -1000,6 +1325,9 @@ class Enricher:
         }
 
     def close(self):
+        self._network_stop.set()
+        if self._network_thread:
+            self._network_thread.join(timeout=0.5)
         self.geoip.close()
 
     def reload_config(self):
@@ -1013,9 +1341,10 @@ class Enricher:
                 logger.debug("Failed to reload pihole_enrichment config", exc_info=True)
         # rDNS toggle reload — env stays authoritative on reload as well.
         self._rdns_enabled = _resolve_rdns_enabled(self._db)
+        self._load_vpn_networks()
         # Pick up WAN/gateway identity learned since start (detection or UniFi)
         self._load_identity_exclusions()
 
     def reload_geoip(self):
         """Reload GeoIP databases (called via SIGUSR1)."""
-        self.geoip.reload()
+        return self.geoip.reload()

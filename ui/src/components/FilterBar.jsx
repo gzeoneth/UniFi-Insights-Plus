@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { fetchServices, fetchInterfaces, fetchProtocols } from '../api'
 import { getInterfaceName, DIRECTION_ICONS, DIRECTION_COLORS, LOG_TYPE_STYLES, ACTION_STYLES, timeRangeToDays, filterVisibleRanges } from '../utils'
 import DateRangePicker from './DateRangePicker'
+import { readPreference, writePreference } from '../lib/preferences'
 
 const LOG_TYPES = ['firewall', 'dns', 'dhcp', 'wifi', 'system']
 const TIME_RANGES = [
@@ -202,7 +203,8 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
   const activeActions = filters.rule_action ? filters.rule_action.split(',') : ACTIONS
   const activeDirections = filters.direction ? filters.direction.split(',') : DIRECTIONS
 
-  const [filtersExpanded, setFiltersExpanded] = useState(false)
+  const [filtersExpanded, setFiltersExpanded] = useState(() => readPreference('unifi-log-insight:log-filter-panel-open', false, value => typeof value === 'boolean'))
+  useEffect(() => { writePreference('unifi-log-insight:log-filter-panel-open', filtersExpanded) }, [filtersExpanded])
 
   const visibleRanges = filterVisibleRanges(TIME_RANGES, maxFilterDays, tr => tr.value)
 
@@ -388,8 +390,8 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
         <div className="relative">
           <input
             type="text"
-            placeholder="IP address..."
-            title="Prefix with ! to exclude matching IPs"
+            placeholder="IP address or subnet..."
+            title="Full IP addresses match exactly; CIDRs match the subnet. Partial text still matches text. Prefix with contains: to force a text search, or ! to exclude."
             value={ipSearch}
             onChange={e => setIpSearch(e.target.value)}
             className={`bg-black border rounded px-3 py-1.5 text-xs text-gray-300 placeholder-gray-500 focus:outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20 w-full sm:w-40 ${ipSearch.startsWith('!') ? 'border-amber-400/60' : 'border-gray-700'}`}
@@ -672,7 +674,7 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
               setSrcPortSearch('')
               setProtocolSearch('')
               setSelectedProtocols([])
-              wrappedOnChange(RESET_FILTERS)
+              wrappedOnChange({ ...RESET_FILTERS, per_page: filters.per_page || RESET_FILTERS.per_page })
             }}
             className="text-xs text-gray-400 hover:text-gray-200 transition-colors"
           >

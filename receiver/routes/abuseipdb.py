@@ -96,7 +96,7 @@ def enrich_ip(ip: str):
         logger.debug("Could not backdate ip_threats for %s (may not exist yet)", ip, exc_info=True)
 
     # Call lookup — hits the API, writes back to ip_threats + memory cache
-    result = abuseipdb.lookup(ip)
+    result = abuseipdb.lookup(ip, bypass_cooldown=True)
     if not result or 'threat_score' not in result:
         raise HTTPException(status_code=502, detail="AbuseIPDB lookup failed")
 

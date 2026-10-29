@@ -1,12 +1,19 @@
+import { useExclusionProfile, ExclusionCounts } from './ExclusionProfiles'
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { fetchLogs, fetchLog, getExportUrl, fetchLogCountsByType } from '../api'
-import { TR_KEY } from '../utils'
+import { readPreference, writePreference, readTimeRange, writeTimeRange } from '../lib/preferences'
 import FilterBar from './FilterBar'
+import FieldFilters, { isValidFilterRules } from './FieldFilters'
 import LogTable from './LogTable'
 import Pagination from './Pagination'
+import { LOG_PRESETS, buildLogPresetFilters } from '../lib/logPresets'
+import useSerializedPoll from '../hooks/useSerializedPoll'
+import { LOG_PAGE_SIZE_KEY, logPageSize } from '../lib/pageSizes'
+import { flowDrillScope } from '../lib/flowDrillScope'
 
 const DEFAULT_FILTERS = {
   time_range: '24h',
+  filter_rules: null,
   log_type: null,
   rule_action: null,
   direction: null,
@@ -21,6 +28,9 @@ const DEFAULT_FILTERS = {
   dst_port: null,
   src_port: null,
   protocol: null,
+  interface: null,
+  vpn_only: null,
+  threat_min: null,
   time_from: null,
   time_to: null,
   page: 1,
@@ -33,6 +43,9 @@ const STORAGE_KEY = 'unifi-log-insight:log-types'
 const ACTION_STORAGE_KEY = 'unifi-log-insight:rule-action'
 const DIRECTION_STORAGE_KEY = 'unifi-log-insight:direction'
 const COLUMNS_STORAGE_KEY = 'unifi-log-insight:hidden-columns'
+const FILTERS_STORAGE_KEY = 'unifi-log-insight:log-filters:v1'
+const REFRESH_STORAGE_KEY = 'unifi-log-insight:log-auto-refresh'
+const DNS_VIEW_CONTROLS = new Set(['log_type', 'time_range', 'time_from', 'time_to', 'page', 'per_page', 'sort', 'order'])
 
 const TOGGLEABLE_COLUMNS = [
   { key: 'country', label: 'Country' },
@@ -43,28 +56,67 @@ const TOGGLEABLE_COLUMNS = [
   { key: 'categories', label: 'Categories' },
 ]
 
+const isRecord = value => value !== null && typeof value === 'object' && !Array.isArray(value)
+const isText = value => typeof value === 'string' && value.length <= 4096
+const SORT_FIELDS = new Set(['timestamp', 'log_type', 'src_ip', 'dst_ip', 'src_port', 'dst_port',
+  'protocol', 'service_name', 'direction', 'rule_action', 'rule_name', 'geo_country',
+  'threat_score', 'hostname', 'created_at'])
+const TEXT_FILTERS = ['log_type', 'rule_action', 'direction', 'ip', 'src_ip', 'dst_ip',
+  'rule_name', 'search', 'service', 'country', 'asn', 'dst_port', 'src_port', 'protocol', 'interface']
+
+// Only applied query preferences belong here. Response data and frozen cursors
+// must never survive a reload and masquerade as current results.
+function filterSnapshot(value) {
+  const result = {}
+  for (const key of TEXT_FILTERS) {
+    if (value[key] == null || isText(value[key])) result[key] = value[key] ?? null
+    else if (['dst_port', 'src_port'].includes(key) && Number.isInteger(value[key])) result[key] = String(value[key])
+  }
+  if (value.vpn_only == null || typeof value.vpn_only === 'boolean') result.vpn_only = value.vpn_only ?? null
+  if (value.threat_min == null || (Number.isInteger(value.threat_min) && value.threat_min >= 0 && value.threat_min <= 100)) result.threat_min = value.threat_min ?? null
+  if (SORT_FIELDS.has(value.sort)) result.sort = value.sort
+  if (['asc', 'desc'].includes(value.order)) result.order = value.order
+  result.per_page = logPageSize(value.per_page)
+  for (const key of ['time_from', 'time_to']) {
+    if (typeof value[key] === 'string' && value[key].length <= 64 && Number.isFinite(Date.parse(value[key]))) result[key] = value[key]
+  }
+  if (result.time_from && result.time_to && Date.parse(result.time_from) > Date.parse(result.time_to)) {
+    delete result.time_from; delete result.time_to
+  }
+  // The API gives explicit dates priority, including legacy saved views that
+  // also contain a relative range. Preserve that scope when restoring them.
+  if (result.time_from || result.time_to) result.time_range = null
+  try {
+    const rules = typeof value.filter_rules === 'string' ? JSON.parse(value.filter_rules) : value.filter_rules
+    if (isValidFilterRules(rules)) {
+      result.filter_rules = rules.length ? JSON.stringify(rules.map(({ field, operator, value }) => ({ field, operator, ...(value == null ? {} : { value }) }))) : null
+    }
+  } catch { /* Invalid stored filters do not prevent the page from opening. */ }
+  return result
+}
+
+function restoreFilters() {
+  const restored = { ...DEFAULT_FILTERS, time_range: readTimeRange() }
+  const saved = readPreference(FILTERS_STORAGE_KEY, null, isRecord)
+  if (saved) return { ...restored, ...filterSnapshot(saved) }
+  restored.per_page = logPageSize(readPreference(LOG_PAGE_SIZE_KEY, 50, value => typeof value === 'number' || typeof value === 'string'))
+  for (const [field, key] of [['log_type', STORAGE_KEY], ['rule_action', ACTION_STORAGE_KEY], ['direction', DIRECTION_STORAGE_KEY]]) {
+    restored[field] = readPreference(key, null, value => value === null || isText(value))
+  }
+  return restored
+}
+
 export default function LogStream({ version, latestRelease, maxFilterDays, drillFilters, onDrillConsumed, interfaces: prefetchedInterfaces, onPauseChange, uiSettings }) {
+  const { excludeGroups, openDraft, setShowAll } = useExclusionProfile()
   const [filters, setFilters] = useState(() => {
-    const restored = { ...DEFAULT_FILTERS }
-    try {
-      restored.time_range = sessionStorage.getItem(TR_KEY) || '24h'
-      const savedTypes = localStorage.getItem(STORAGE_KEY)
-      if (savedTypes) restored.log_type = savedTypes
-      const savedAction = localStorage.getItem(ACTION_STORAGE_KEY)
-      if (savedAction) restored.rule_action = savedAction
-      const savedDirection = localStorage.getItem(DIRECTION_STORAGE_KEY)
-      if (savedDirection) restored.direction = savedDirection
-    } catch (e) { /* private browsing */ }
+    const restored = restoreFilters()
     if (drillFilters) {
       return {
         ...DEFAULT_FILTERS,
-        time_range: drillFilters.time_range || restored.time_range,
-        ip: null,
-        src_ip: drillFilters.src_ip || null,
-        dst_ip: drillFilters.dst_ip || null,
-        dst_port: drillFilters.dst_port?.toString() || null,
-        service: drillFilters.service || null,
-        log_type: 'firewall',
+        ...flowDrillScope(drillFilters),
+        time_range: (drillFilters.time_from || drillFilters.time_to) ? null : (drillFilters.time_range || restored.time_range || readTimeRange()),
+        time_from: drillFilters.time_from || null,
+        time_to: drillFilters.time_to || null,
         page: 1,
         per_page: restored.per_page,
         sort: restored.sort,
@@ -73,25 +125,13 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
     }
     return restored
   })
-  const [data, setData] = useState({ data: [], total: 0, page: 1, pages: 0 })
-  const [loading, setLoading] = useState(true)
-  const [autoRefresh, setAutoRefresh] = useState(true)
-  const [lastUpdate, setLastUpdate] = useState(null)
+  const [autoRefresh, setAutoRefresh] = useState(() => readPreference(REFRESH_STORAGE_KEY, true, value => typeof value === 'boolean'))
   const [expandedId, setExpandedId] = useState(null)
   const [detailedLog, setDetailedLog] = useState(null)
-  const [pendingCount, setPendingCount] = useState(0)
-  const [hiddenColumns, setHiddenColumns] = useState(() => {
-    try {
-      const saved = localStorage.getItem(COLUMNS_STORAGE_KEY)
-      if (saved) return new Set(JSON.parse(saved))
-    } catch (e) { /* private browsing */ }
-    return new Set()
-  })
+  const [hiddenColumns, setHiddenColumns] = useState(() => new Set(readPreference(COLUMNS_STORAGE_KEY, [], value => Array.isArray(value)
+    && value.every(key => TOGGLEABLE_COLUMNS.some(column => column.key === key)))))
   const [showColumnsMenu, setShowColumnsMenu] = useState(false)
   const columnsMenuRef = useRef(null)
-  const filtersRef = useRef(filters)
-  filtersRef.current = filters
-  const pendingRef = useRef(null)
   const scrollRef = useRef(null)
   const [showScrollTop, setShowScrollTop] = useState(false)
   const [drillContext, setDrillContext] = useState(null)
@@ -118,13 +158,10 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
     if (!drillFilters) return
     setFilters(prev => ({
       ...DEFAULT_FILTERS,
-      time_range: drillFilters.time_range || prev.time_range,
-      ip: null,
-      src_ip: drillFilters.src_ip || null,
-      dst_ip: drillFilters.dst_ip || null,
-      dst_port: drillFilters.dst_port?.toString() || null,
-      service: drillFilters.service || null,
-      log_type: 'firewall',
+      ...flowDrillScope(drillFilters),
+      time_range: (drillFilters.time_from || drillFilters.time_to) ? null : (drillFilters.time_range || prev.time_range || readTimeRange()),
+      time_from: drillFilters.time_from || null,
+      time_to: drillFilters.time_to || null,
       page: 1,
       per_page: prev.per_page,
       sort: prev.sort,
@@ -150,27 +187,12 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
   }, [])
 
 
-  // Persist filter toggles to localStorage
   useEffect(() => {
-    try {
-      if (filters.log_type) localStorage.setItem(STORAGE_KEY, filters.log_type)
-      else localStorage.removeItem(STORAGE_KEY)
-    } catch (e) { /* private browsing */ }
-  }, [filters.log_type])
-
-  useEffect(() => {
-    try {
-      if (filters.rule_action) localStorage.setItem(ACTION_STORAGE_KEY, filters.rule_action)
-      else localStorage.removeItem(ACTION_STORAGE_KEY)
-    } catch (e) { /* private browsing */ }
-  }, [filters.rule_action])
-
-  useEffect(() => {
-    try {
-      if (filters.direction) localStorage.setItem(DIRECTION_STORAGE_KEY, filters.direction)
-      else localStorage.removeItem(DIRECTION_STORAGE_KEY)
-    } catch (e) { /* private browsing */ }
-  }, [filters.direction])
+    writePreference(FILTERS_STORAGE_KEY, filterSnapshot(filters))
+    writePreference(LOG_PAGE_SIZE_KEY, filters.per_page)
+    if (filters.time_range) writeTimeRange(filters.time_range)
+  }, [filters])
+  useEffect(() => { writePreference(REFRESH_STORAGE_KEY, autoRefresh) }, [autoRefresh])
 
   // Persist hidden columns to localStorage
   const toggleColumn = (key) => {
@@ -178,7 +200,7 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
       const next = new Set(prev)
       if (next.has(key)) next.delete(key)
       else next.add(key)
-      try { localStorage.setItem(COLUMNS_STORAGE_KEY, JSON.stringify([...next])) } catch (e) { /* private browsing */ }
+      writePreference(COLUMNS_STORAGE_KEY, [...next])
       return next
     })
   }
@@ -195,31 +217,41 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
     return () => document.removeEventListener('mousedown', handler)
   }, [showColumnsMenu])
 
-  // Effective auto-refresh: paused when a row is expanded
-  const isRefreshing = autoRefresh && expandedId === null
+  const scopeKey = JSON.stringify({ ...filters, page: undefined, exclude_groups: excludeGroups })
+  const [navigation, setNavigation] = useState(null)
+  const page = navigation?.scopeKey === scopeKey ? navigation.page : 1
+  const cursor = navigation?.scopeKey === scopeKey ? navigation.cursor : null
+  const cursorHistory = useRef({ scopeKey: null, pages: [] })
+  const cursorMode = !filters.sort || filters.sort === 'timestamp'
+  const isRefreshing = autoRefresh && expandedId === null && page === 1 && !cursor
+  const params = { ...filters, page, sort: filters.sort || 'timestamp', order: filters.order || 'desc', exclude_groups: excludeGroups, count_mode: 'none',
+    pagination: cursorMode ? 'cursor' : 'offset', cursor: cursorMode ? cursor : null }
+  const poll = useSerializedPoll({ params, fetcher: fetchLogs, enabled: isRefreshing })
+  const data = poll.data || { data: [], total: null, pages: null, view_counts: null }
+  const loading = poll.loading
+  const lastUpdate = poll.loadedAt
+  const loadError = poll.error
+    ? (poll.error.status === 400 ? poll.error.message : 'Could not load events for the current filters. Refresh to try again.') : ''
+  const showDnsHelp = Boolean(poll.data) && !loading && !loadError && page === 1 && data.data.length === 0
+    && filters.log_type === 'dns' && !excludeGroups
+    && !Object.entries(filters).some(([key, value]) => !DNS_VIEW_CONTROLS.has(key) && value != null && value !== '' && value !== false)
 
-  // Notify parent of pause state changes
-  useEffect(() => { onPauseChange?.(!isRefreshing) }, [isRefreshing, onPauseChange])
-
-  // When paused (manually or by expanding a row), silently check for new logs count
   useEffect(() => {
-    if (pendingRef.current) clearInterval(pendingRef.current)
-    if (!isRefreshing && filters.page === 1) {
-      pendingRef.current = setInterval(async () => {
-        try {
-          const qs = new URLSearchParams()
-          for (const [k, v] of Object.entries(filters)) {
-            if (v !== null && v !== undefined && v !== '') qs.set(k, v)
-          }
-          qs.set('per_page', '1')
-          const result = await fetchLogs(Object.fromEntries(qs))
-          const diff = result.total - data.total
-          if (diff > 0) setPendingCount(diff)
-        } catch {}
-      }, 5000)
+    if (!poll.data) return
+    if (cursorHistory.current.scopeKey !== scopeKey || (page === 1 && !cursor)) {
+      cursorHistory.current = { scopeKey, pages: [] }
     }
-    return () => { if (pendingRef.current) clearInterval(pendingRef.current) }
-  }, [isRefreshing, filters, data.total])
+    cursorHistory.current.pages[page] = poll.data.page_cursor || cursor
+    cursorHistory.current.pages[page + 1] = poll.data.next_cursor
+  }, [poll.data, scopeKey, page, cursor])
+
+  useEffect(() => { onPauseChange?.(!isRefreshing || !poll.visible) }, [isRefreshing, poll.visible, onPauseChange])
+
+  const refreshLatest = () => {
+    setExpandedId(null)
+    if (page !== 1 || cursor) setNavigation(null)
+    else poll.refresh()
+  }
 
   // Fetch detail data when a row is expanded
   useEffect(() => {
@@ -231,16 +263,12 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
     return () => { cancelled = true }
   }, [expandedId])
 
-  // Auto-resume: when row is collapsed, refresh immediately
+  // Collapsing resumes the regular polling delay without adding a second request.
   const handleToggleExpand = (id) => {
     if (expandedId === id) {
       setExpandedId(null)
-      setPendingCount(0)
-      // Refresh silently on collapse — no skeleton so the user keeps their place
-      load(filters, { background: true })
     } else {
       setExpandedId(id)
-      setPendingCount(0)
     }
   }
 
@@ -253,47 +281,33 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
     return () => el.removeEventListener('scroll', handleScroll)
   }, [])
 
-  // Stable load function — reads filters from ref to avoid effect cascades
-  const load = useCallback(async (f, { background } = {}) => {
-    try {
-      if (!background) setLoading(true)
-      const result = await fetchLogs(f || filtersRef.current)
-      setData(result)
-      setLastUpdate(new Date())
-    } catch (err) {
-      console.error('Failed to fetch logs:', err)
-    } finally {
-      if (!background) setLoading(false)
-    }
-  }, [])
-
-  // Load on filter change
-  useEffect(() => {
-    load(filters)
-  }, [filters, load])
-
-  // Auto-refresh every 5s when on page 1 and no row expanded
-  useEffect(() => {
-    if (!isRefreshing || filters.page !== 1) return
-    const id = setInterval(() => load(null, { background: true }), 5000)
-    return () => clearInterval(id)
-  }, [isRefreshing, filters.page, load])
+  useEffect(() => { setExpandedId(null) }, [excludeGroups])
 
   const handleFilterChange = (newFilters) => {
     setExpandedId(null)
-    setPendingCount(0)
     setFilters({ ...newFilters, page: 1 })
-    // Persist time range within this session (shared across views via sessionStorage)
-    try {
-      if (newFilters.time_range) sessionStorage.setItem(TR_KEY, newFilters.time_range)
-      else sessionStorage.removeItem(TR_KEY)
-    } catch (e) { /* private browsing */ }
   }
 
   const handlePageChange = (page) => {
     setExpandedId(null)
-    setPendingCount(0)
-    setFilters(f => ({ ...f, page }))
+    const nextCursor = cursorHistory.current.scopeKey === scopeKey ? cursorHistory.current.pages[page] : null
+    if (cursorMode && !nextCursor) return
+    setNavigation({ scopeKey, page, cursor: nextCursor })
+  }
+
+  const handlePerPageChange = (size) => {
+    setExpandedId(null)
+    setNavigation(null)
+    setFilters(prev => ({ ...prev, per_page: logPageSize(size), page: 1 }))
+    scrollRef.current?.scrollTo?.({ top: 0 })
+  }
+
+  const handlePresetSelect = preset => {
+    const next = buildLogPresetFilters(preset, filters, DEFAULT_FILTERS)
+    if (preset.bypassProfile) setShowAll?.(true)
+    setDrillContext(null)
+    handleFilterChange(next)
+    return next
   }
 
   return (
@@ -308,33 +322,35 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
       {/* Filters */}
       <div className="px-4 py-2.5 border-b border-gray-800 bg-gray-950 relative z-20">
         <FilterBar filters={filters} onChange={handleFilterChange} maxFilterDays={maxFilterDays} prefetchedInterfaces={prefetchedInterfaces} hiddenLogTypes={hiddenLogTypes} />
+        <FieldFilters filters={filters} onChange={handleFilterChange} presets={LOG_PRESETS} onPresetSelect={handlePresetSelect} profileApplied={!!excludeGroups} />
+        {!loading && <ExclusionCounts counts={data.view_counts} unknown={Boolean(excludeGroups)} />}
+        {loadError && <p role="alert" className="text-sm text-red-400">{loadError}</p>}
       </div>
 
       {/* Toolbar */}
       <div className="flex items-center justify-between px-4 py-1.5 border-b border-gray-800/50 bg-gray-950">
         <div className="flex items-center gap-3">
           <button
-            onClick={() => { setAutoRefresh(!autoRefresh); setPendingCount(0) }}
+            onClick={() => {
+              if (cursor || page > 1) { setNavigation(null); setAutoRefresh(true) }
+              else setAutoRefresh(value => !value)
+            }}
             className={`flex items-center gap-1.5 text-[11px] transition-colors ${
               isRefreshing ? 'text-emerald-400' : 'text-amber-400'
             }`}
           >
-            <span className={`w-1.5 h-1.5 rounded-full ${isRefreshing ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
-            {isRefreshing ? 'Live' : 'Paused'}
+            <span className={`w-1.5 h-1.5 rounded-full ${isRefreshing && poll.visible ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
+            {isRefreshing && poll.visible ? 'Live' : 'Paused'}
           </button>
-          {pendingCount > 0 && (
-            <button
-              onClick={() => { setExpandedId(null); setPendingCount(0); load(filters) }}
-              className="text-[11px] text-amber-400 hover:text-amber-300 transition-colors"
-            >
-              {pendingCount} new log{pendingCount !== 1 ? 's' : ''} ↻
-            </button>
-          )}
+          {(!isRefreshing || !poll.visible) && <span className="text-[10px] text-gray-500">Automatic requests stopped</span>}
           {lastUpdate && (
             <span className="text-[10px] text-gray-500">
               Updated {lastUpdate.toLocaleTimeString('en-GB')}
             </span>
           )}
+          {data.timings?.query_ms != null && <span className="text-[10px] text-gray-500">
+            Page {Math.round(data.timings.query_ms)} ms{data.timings.count_ms != null ? ` · count ${Math.round(data.timings.count_ms)} ms` : ''}
+          </span>}
         </div>
         <div className="flex items-center gap-2">
           <div className="relative inline-flex items-center" ref={columnsMenuRef}>
@@ -380,13 +396,22 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
             })()}
           </div>
           <button
-            onClick={() => load(filters)}
+            onClick={refreshLatest}
             className="text-[11px] text-gray-400 hover:text-gray-200 transition-colors"
           >
             ↻ Refresh
           </button>
+          <button type="button" disabled={loading}
+            onClick={() => {
+              setAutoRefresh(false)
+              poll.refresh({ count_mode: 'exact', cursor: data.page_cursor || cursor })
+            }}
+            className="text-[11px] text-gray-400 hover:text-gray-200 disabled:opacity-40"
+            title="Pause updates and count all matching events in this time window. This can take longer than loading a page.">
+            Count matching events
+          </button>
           <a
-            href={getExportUrl(filters)}
+            href={getExportUrl({ ...filters, exclude_groups: excludeGroups })}
             className="text-[11px] text-gray-400 hover:text-gray-200 transition-colors"
           >
             ↓ Export CSV
@@ -394,10 +419,17 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
         </div>
       </div>
 
+      {showDnsHelp && <aside aria-label="DNS logging help" className="mx-4 my-3 rounded border border-gray-700 px-3 py-2 text-xs text-gray-400">
+        <p>No parsed DNS query records match this time window. Firewall flows on port 53 do not contain the queried domain names.</p>
+        <p className="mt-1">Gateway DNS flow logging alone does not confirm DNS query logging or export. Check the time range and the resolver's query-log settings; a resolver query-log integration may be needed.{' '}
+          <a className="text-teal-400 underline hover:text-teal-300" href="https://github.com/gzeoneth/UniFi-Insights-Plus/blob/gzeon/insights-improvements/docs/dns-logging.md" target="_blank" rel="noreferrer">DNS logging guide</a>
+        </p>
+      </aside>}
+
       {/* Log table */}
       <div className="flex-1 relative overflow-hidden">
         <div className="h-full overflow-auto" ref={scrollRef}>
-          <LogTable logs={data.data} loading={loading} expandedId={expandedId} detailedLog={detailedLog} onToggleExpand={handleToggleExpand} hiddenColumns={hiddenColumns} uiSettings={uiSettings} />
+          <LogTable onHideAllow={row => openDraft(row, filters)} logs={data.data} loading={loading} expandedId={expandedId} detailedLog={detailedLog} onToggleExpand={handleToggleExpand} hiddenColumns={hiddenColumns} uiSettings={uiSettings} />
         </div>
         {showScrollTop && (
           <button
@@ -414,10 +446,15 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
 
       {/* Pagination */}
       <Pagination
-        page={data.page}
+        page={page}
         pages={data.pages}
         total={data.total}
+        rowCount={data.data.length}
+        hasMore={data.has_more ?? (data.pages != null && page < data.pages)}
+        cursorMode={cursorMode}
+        loading={loading}
         perPage={filters.per_page}
+        onPerPageChange={handlePerPageChange}
         onChange={handlePageChange}
         version={version}
         latestRelease={latestRelease}

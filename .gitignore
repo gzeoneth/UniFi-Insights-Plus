@@ -67,3 +67,21 @@ receiver/pentest_cleanup.py
 receiver/tests/test_uli_pentest_helpers.py
 receiver/tests/test_config_import_types.py
 docs/pentest-agent-harness.md
+
+# Local fork secrets and generated artifacts
+.secrets/
+.env.*
+!.env.example
+*.dump
+*.tar
+*.tar.gz
+.local/
+
+# Runtime TLS material is private and must never enter source or images.
+certs/
+tls/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx

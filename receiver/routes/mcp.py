@@ -6,11 +6,15 @@ import logging
 from typing import Any
 from urllib.parse import urlencode
 
+from starlette.concurrency import run_in_threadpool
+
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from psycopg2.extras import RealDictCursor
 
 from db import get_config, set_config
+from field_filters import (FIELDS, compile_filters, parse_rules, compile_exclusions,
+                           parse_exclusion_groups, MAX_EXCLUSION_GROUPS, MAX_GROUP_CONDITIONS)
 from deps import APP_VERSION, get_conn, put_conn, enricher_db, unifi_api
 from routes import logs as logs_routes
 from routes import stats as stats_routes
@@ -199,7 +203,7 @@ def _tool_error(message: str) -> dict:
 
 
 def _tools_catalog() -> list[dict]:
-    return [
+    catalog = [
         {
             "name": "search_logs",
             "description": "Search logs with filters (log type, time range, IPs, ports, protocol, actions, services, ASN, etc.). Most text filters support ! prefix for negation.",
@@ -210,9 +214,9 @@ def _tools_catalog() -> list[dict]:
                     "time_range": {"type": "string", "description": "1h,6h,24h,7d,30d,60d"},
                     "time_from": {"type": "string", "description": "ISO datetime"},
                     "time_to": {"type": "string", "description": "ISO datetime"},
-                    "src_ip": {"type": "string", "description": "Source IP (prefix with ! to negate)"},
-                    "dst_ip": {"type": "string", "description": "Dest IP (prefix with ! to negate)"},
-                    "ip": {"type": "string", "description": "Search both src and dst (prefix with ! to negate)"},
+                    "src_ip": {"type": "string", "description": "Source IP/CIDR; contains: forces substring; ! negates"},
+                    "dst_ip": {"type": "string", "description": "Destination IP/CIDR; contains: forces substring; ! negates"},
+                    "ip": {"type": "string", "description": "Both endpoint IPs/CIDRs; contains: forces substring; ! negates"},
                     "direction": {"type": "string", "description": "Comma-separated: inbound,outbound,inter_vlan,nat"},
                     "rule_action": {"type": "string", "description": "Comma-separated: allow,block,redirect (prefix with ! to negate)"},
                     "rule_name": {"type": "string", "description": "Rule name search (prefix with ! to negate)"},
@@ -223,13 +227,16 @@ def _tools_catalog() -> list[dict]:
                     "interface": {"type": "string", "description": "Comma-separated interface names"},
                     "vpn_only": {"type": "boolean"},
                     "asn": {"type": "string", "description": "ASN name search (prefix with ! to negate)"},
-                    "dst_port": {"type": "string", "description": "Destination port (prefix with ! to negate)"},
-                    "src_port": {"type": "string", "description": "Source port (prefix with ! to negate)"},
+                    "dst_port": {"type": "string", "description": "Destination ports or inclusive ranges, comma-separated (prefix with ! to negate); invalid values are rejected"},
+                    "src_port": {"type": "string", "description": "Source ports or inclusive ranges, comma-separated (prefix with ! to negate); invalid values are rejected"},
                     "protocol": {"type": "string", "description": "Comma-separated: TCP,UDP,ICMP (prefix with ! to negate)"},
                     "sort": {"type": "string"},
                     "order": {"type": "string", "description": "asc or desc"},
-                    "page": {"type": "integer"},
-                    "per_page": {"type": "integer", "description": "1-200"},
+                    "count_mode": {"type": "string", "enum": ["exact", "none"], "description": "none skips full counts for fast browsing"},
+                    "pagination": {"type": "string", "enum": ["offset", "cursor"]},
+                    "cursor": {"type": "string", "description": "Opaque next_cursor from an unchanged timestamp-sorted query"},
+                    "page": {"type": "integer", "minimum": 1},
+                    "per_page": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Rows per page, 1-1000; default 50"},
                 },
             },
         },
@@ -407,6 +414,31 @@ def _tools_catalog() -> list[dict]:
             "inputSchema": {"type": "object", "properties": {}},
         },
     ]
+    filter_schema = {
+        'type': 'array', 'maxItems': 24,
+        'description': 'Rules AND together; comma values OR. IPs match exact addresses or CIDRs; ports accept inclusive ranges. Exclude retains missing fields. Text matches literal substrings.',
+        'items': {'type': 'object', 'properties': {
+            'field': {'type': 'string', 'enum': sorted(FIELDS)},
+            'operator': {'enum': ['include', 'exclude', 'present', 'missing']},
+            'value': {'type': 'string', 'maxLength': 1024,
+                      'description': 'security_event accepts ips and/or unparsed_cef (comma-separated); other fields use their documented values.'},
+        }, 'required': ['field', 'operator'], 'additionalProperties': False},
+    }
+    exclusion_schema = {
+        'type': 'array', 'maxItems': MAX_EXCLUSION_GROUPS,
+        'description': 'Query-only view exclusions: AND within a group, OR between groups. Raw records are retained. IPS and unparsed CEF threat events stay visible. Exact fields match whole case-sensitive values, including commas.',
+        'items': {'type': 'object', 'properties': {
+            'name': {'type': 'string', 'maxLength': 100},
+            'conditions': {**filter_schema, 'minItems': 1, 'maxItems': MAX_GROUP_CONDITIONS},
+        }, 'required': ['conditions'], 'additionalProperties': False},
+    }
+    for tool in catalog:
+        if tool['name'] in ('search_logs', 'aggregate_logs', 'export_logs_csv_url'):
+            tool['inputSchema']['properties']['filter_rules'] = filter_schema
+            tool['inputSchema']['properties']['exclude_groups'] = exclusion_schema
+        elif tool['name'] == 'get_log_stats':
+            tool['inputSchema']['properties']['exclude_groups'] = exclusion_schema
+    return catalog
 
 
 _TOOL_SCOPES = {
@@ -429,11 +461,27 @@ _TOOL_SCOPES = {
 }
 
 
+def _encoded_filter_rules(value):
+    if value is None:
+        return None
+    rules = parse_rules(value)
+    compile_filters(rules)
+    return json.dumps(rules)
+
+
+def _encoded_exclusion_groups(value):
+    if value is None:
+        return None
+    groups = parse_exclusion_groups(value)
+    compile_exclusions(groups)
+    return json.dumps(groups)
+
+
 def _tool_search_logs(args: dict) -> dict:
     page = _as_int(args.get('page'), 1)
     per_page = _as_int(args.get('per_page'), 50)
-    if per_page is not None and (per_page < 1 or per_page > 200):
-        raise ValueError("per_page must be between 1 and 200")
+    if per_page is not None and (per_page < 1 or per_page > 1000):
+        raise ValueError("per_page must be between 1 and 1000")
     return logs_routes.get_logs(
         log_type=args.get('log_type'),
         time_range=args.get('time_range'),
@@ -455,10 +503,15 @@ def _tool_search_logs(args: dict) -> dict:
         dst_port=args.get('dst_port'),
         src_port=args.get('src_port'),
         protocol=args.get('protocol'),
+        filter_rules=_encoded_filter_rules(args.get('filter_rules')),
+        exclude_groups=_encoded_exclusion_groups(args.get('exclude_groups')),
         sort=args.get('sort', 'timestamp'),
         order=args.get('order', 'desc'),
         page=page,
         per_page=per_page,
+        count_mode=args.get("count_mode", "exact"),
+        pagination=args.get("pagination", "offset"),
+        cursor=args.get("cursor"),
     )
 
 
@@ -518,6 +571,8 @@ def _tool_aggregate_logs(args: dict) -> dict:
         dst_port=args.get('dst_port'),
         src_port=args.get('src_port'),
         protocol=args.get('protocol'),
+        filter_rules=_encoded_filter_rules(args.get('filter_rules')),
+        exclude_groups=_encoded_exclusion_groups(args.get('exclude_groups')),
     )
 
 
@@ -526,6 +581,10 @@ def _tool_export_logs_csv_url(args: dict) -> dict:
     if limit is not None and (limit < 1 or limit > 100000):
         raise ValueError("limit must be between 1 and 100000")
     params = {k: v for k, v in args.items() if v is not None}
+    if 'filter_rules' in params:
+        params['filter_rules'] = _encoded_filter_rules(params['filter_rules'])
+    if 'exclude_groups' in params:
+        params['exclude_groups'] = _encoded_exclusion_groups(params['exclude_groups'])
     qs = urlencode(params)
     return {'download_url': f"/api/export?{qs}" if qs else "/api/export"}
 
@@ -576,7 +635,7 @@ def _tool_list_unifi_clients(args: dict) -> dict:
 _TOOL_HANDLERS = {
     'search_logs':            _tool_search_logs,
     'get_log':                _tool_get_log,
-    'get_log_stats':          lambda args: stats_routes.get_stats(time_range=args.get('time_range', '24h')),
+    'get_log_stats':          lambda args: stats_routes.get_stats(time_range=args.get('time_range', '24h'), exclude_groups=_encoded_exclusion_groups(args.get('exclude_groups'))),
     'get_top_threat_ips':     _tool_get_top_threat_ips,
     'list_threat_ips':        _tool_list_threat_ips,
     'list_services':          lambda _: logs_routes.get_services(),
@@ -708,7 +767,7 @@ async def _handle_jsonrpc(body: Any, token_info: dict | None) -> Response:
 
     if not isinstance(body, dict):
         return JSONResponse(_jsonrpc_error(-32600, "Invalid request", None))
-    resp = _handle_request(body, token_info)
+    resp = await run_in_threadpool(_handle_request, body, token_info)
     if resp is None:
         return Response(status_code=202)
     return JSONResponse(resp)
@@ -721,12 +780,12 @@ def _require_mcp_enabled():
 
 @router.get("/api/mcp")
 async def mcp_get(request: Request):
-    _require_mcp_enabled()
-    _validate_origin(request)
+    await run_in_threadpool(_require_mcp_enabled)
+    await run_in_threadpool(_validate_origin, request)
     _validate_protocol_version(request)
 
     token = _get_bearer_token(request)
-    token_info = _lookup_token(token)
+    token_info = await run_in_threadpool(_lookup_token, token)
     if not token_info:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -741,12 +800,12 @@ async def mcp_get(request: Request):
 
 @router.post("/api/mcp")
 async def mcp_post(request: Request):
-    _require_mcp_enabled()
-    _validate_origin(request)
+    await run_in_threadpool(_require_mcp_enabled)
+    await run_in_threadpool(_validate_origin, request)
     _validate_protocol_version(request)
 
     token = _get_bearer_token(request)
-    token_info = _lookup_token(token)
+    token_info = await run_in_threadpool(_lookup_token, token)
     if not token_info:
         raise HTTPException(status_code=401, detail="Unauthorized")
 

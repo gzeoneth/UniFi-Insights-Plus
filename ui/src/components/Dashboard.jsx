@@ -1,10 +1,12 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { DashboardSkeleton } from './PanelSkeletons'
+import { useExclusionProfile, ExclusionCounts } from './ExclusionProfiles'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 import { fetchStatsOverview, fetchStatsCharts, fetchStatsTables } from '../api'
 import { formatNumber, FlagIcon, countryName, decodeThreatCategories, LOG_TYPE_STYLES, ACTION_STYLES, formatServiceName, DIRECTION_ICONS, DIRECTION_COLORS } from '../utils'
 import { getThreatLevel } from '../lib/threatPresentation'
-import { readCache, writeCache, CACHE_TTL_MS } from '../lib/sessionCache'
+import useDashboardTier from '../hooks/useDashboardTier'
 import NetworkBadge from './NetworkBadge'
+import SecuritySummary from './SecuritySummary'
 import useTimeRange from '../hooks/useTimeRange'
 
 function SkeletonRows({ count = 5, withBar = false }) {
@@ -28,57 +30,6 @@ function CardSkeleton({ title, children }) {
     <div className="border border-gray-800 rounded-lg p-4">
       <div className="text-xs text-gray-400 uppercase tracking-wider mb-3">{title}</div>
       <div className="animate-pulse">{children}</div>
-    </div>
-  )
-}
-
-export function DashboardSkeleton() {
-  return (
-    <div className="p-4 space-y-4 overflow-auto max-h-full animate-pulse">
-      {/* Time range selector */}
-      <div className="flex gap-1">
-        {[...Array(6)].map((_, i) => (
-          <div key={i} className="h-7 w-10 bg-gray-800 rounded" />
-        ))}
-      </div>
-      {/* Summary cards */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-        <div className="border border-gray-800 rounded-lg p-4 space-y-3">
-          <div className="h-2.5 w-24 bg-gray-800 rounded" />
-          <div className="h-7 w-16 bg-gray-800 rounded" />
-          <div className="flex gap-2">
-            {[...Array(3)].map((_, i) => <div key={i} className="h-6 w-20 bg-gray-800 rounded" />)}
-          </div>
-          <div className="flex gap-2 pt-3 border-t border-gray-800/50">
-            {[...Array(4)].map((_, i) => <div key={i} className="h-6 w-24 bg-gray-800 rounded" />)}
-          </div>
-        </div>
-        <div className="border border-gray-800 rounded-lg p-4 space-y-3">
-          <div className="h-2.5 w-16 bg-gray-800 rounded" />
-          <div className="flex flex-wrap gap-2">
-            {[...Array(4)].map((_, i) => <div key={i} className="h-6 w-24 bg-gray-800 rounded" />)}
-          </div>
-        </div>
-      </div>
-      {/* Charts */}
-      <div className="border border-gray-800 rounded-lg p-4 h-40" />
-      <div className="border border-gray-800 rounded-lg p-4 h-52" />
-      {/* Section header */}
-      <div className="h-3 w-24 bg-gray-800 rounded mt-2" />
-      {/* Panel grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-        {[...Array(6)].map((_, i) => (
-          <div key={i} className="border border-gray-800 rounded-lg p-4 h-48" />
-        ))}
-      </div>
-      {/* Section header */}
-      <div className="h-3 w-24 bg-gray-800 rounded mt-2" />
-      {/* Allowed panel grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-        {[...Array(4)].map((_, i) => (
-          <div key={i} className="border border-gray-800 rounded-lg p-4 h-48" />
-        ))}
-      </div>
     </div>
   )
 }
@@ -259,79 +210,14 @@ function TopList({ title, items, renderItem }) {
   )
 }
 
-// Cache prefix — readCache/writeCache imported from lib/sessionCache
-const CACHE_PREFIX = 'dashboard'
-
 export default function Dashboard({ maxFilterDays }) {
+  const { excludeGroups } = useExclusionProfile()
   const [timeRange, setTimeRange, visibleRanges] = useTimeRange(maxFilterDays)
-  const [stats, setStats] = useState({})
-  const [tierStatus, setTierStatus] = useState({ overview: 'loading', charts: 'loading', tables: 'loading' })
-  const requestEpochRef = useRef(0)
-
-  const loadTiers = useCallback((tr, isRefresh = false) => {
-    const epoch = ++requestEpochRef.current
-
-    // Read cache first — render immediately if fresh
-    const cachedOverview = readCache(CACHE_PREFIX, `overview:${tr}`)
-    const cachedCharts = readCache(CACHE_PREFIX, `charts:${tr}`)
-    const cachedTables = readCache(CACHE_PREFIX, `tables:${tr}`)
-
-    if (!isRefresh) {
-      // Build initial stats from cache — no null reset, so cached data renders instantly
-      const initial = { ...(cachedOverview || {}), ...(cachedCharts || {}), ...(cachedTables || {}) }
-      setStats(Object.keys(initial).length > 0 ? initial : {})
-
-      setTierStatus({
-        overview: cachedOverview ? 'fromCache' : 'loading',
-        charts: cachedCharts ? 'fromCache' : 'loading',
-        tables: cachedTables ? 'fromCache' : 'loading',
-      })
-    }
-
-    const mergeTier = (tier, data) => {
-      if (requestEpochRef.current !== epoch) return // stale response guard
-      writeCache(CACHE_PREFIX, `${tier}:${tr}`, data)
-      setStats(prev => ({ ...prev, ...data }))
-      setTierStatus(prev => ({ ...prev, [tier]: 'loaded' }))
-    }
-
-    const failTier = (tier) => {
-      if (requestEpochRef.current !== epoch) return
-      setTierStatus(prev => {
-        if (prev[tier] === 'loaded' || prev[tier] === 'fromCache') {
-          // Data exists but refresh failed — mark stale so UI can warn
-          return isRefresh ? { ...prev, [tier]: 'stale' } : prev
-        }
-        return { ...prev, [tier]: 'error' }
-      })
-    }
-
-    // Fire all three tiers in parallel
-    if (!cachedOverview || isRefresh) {
-      fetchStatsOverview(tr).then(d => mergeTier('overview', d)).catch(() => failTier('overview'))
-    }
-    if (!cachedCharts || isRefresh) {
-      fetchStatsCharts(tr).then(d => mergeTier('charts', d)).catch(() => failTier('charts'))
-    }
-    if (!cachedTables || isRefresh) {
-      fetchStatsTables(tr).then(d => mergeTier('tables', d)).catch(() => failTier('tables'))
-    }
-  }, [])
-
-  // Primary load on mount / time-range change
-  useEffect(() => {
-    loadTiers(timeRange)
-  }, [timeRange, loadTiers])
-
-  // Auto-refresh every 10 minutes (only when visible)
-  useEffect(() => {
-    const interval = setInterval(() => {
-      if (document.visibilityState === 'visible') {
-        loadTiers(timeRange, true)
-      }
-    }, CACHE_TTL_MS)
-    return () => clearInterval(interval)
-  }, [timeRange, loadTiers])
+  const overview = useDashboardTier('overview', timeRange, excludeGroups, fetchStatsOverview)
+  const charts = useDashboardTier('charts', timeRange, excludeGroups, fetchStatsCharts)
+  const tables = useDashboardTier('tables', timeRange, excludeGroups, fetchStatsTables)
+  const stats = { ...overview.data, ...charts.data, ...tables.data }
+  const tierStatus = { overview: overview.status, charts: charts.status, tables: tables.status }
 
   const loading = tierStatus.overview === 'loading' || tierStatus.charts === 'loading' || tierStatus.tables === 'loading'
   const hasSomeData = Object.keys(stats).length > 0
@@ -358,6 +244,7 @@ export default function Dashboard({ maxFilterDays }) {
 
   return (
     <div className="pt-2.5 px-4 pb-4 space-y-4 overflow-auto max-h-full">
+      <ExclusionCounts counts={stats.view_counts} />
       {/* All tiers failed — show error instead of infinite skeleton */}
       {allFailed && !hasSomeData && (
         <div className="border border-red-800/50 rounded-lg p-6 text-center">
@@ -406,7 +293,7 @@ export default function Dashboard({ maxFilterDays }) {
                 Blocked {formatNumber(stats.blocked || 0)}
               </span>
               <span className="inline-flex items-center gap-1 px-2 py-1 rounded text-xs font-semibold uppercase border bg-orange-500/15 text-orange-400 border-orange-500/30">
-                Threats {formatNumber(stats.threats || 0)}
+                IP reputation {formatNumber(stats.threats || 0)}
               </span>
             </div>
             {stats.by_direction && Object.keys(stats.by_direction).length > 0 && (
@@ -468,6 +355,9 @@ export default function Dashboard({ maxFilterDays }) {
         </div>
       )}
 
+      {excludeGroups && <p className="text-xs text-gray-400">Security below includes all detections, independent of the view exclusion profile.</p>}
+      <SecuritySummary timeRange={timeRange} />
+
       {/* Logs over time chart */}
       {stats.logs_over_time || stats.logs_per_hour ? (
         <div className="border border-gray-800 rounded-lg p-4 min-h-[10rem] animate-[fadeIn_0.3s_ease-out]">
@@ -510,7 +400,7 @@ export default function Dashboard({ maxFilterDays }) {
       {/* Top lists grid */}
       {tierStatus.tables === 'loading' && !stats.top_threat_ips ? (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <CardSkeleton title="Top Threat IPs"><SkeletonRows count={5} /></CardSkeleton>
+          <CardSkeleton title="Top IP Reputation Alerts"><SkeletonRows count={5} /></CardSkeleton>
           <CardSkeleton title="Top Blocked External IPs"><SkeletonRows count={5} withBar /></CardSkeleton>
           <CardSkeleton title="Top Blocked Internal IPs"><SkeletonRows count={5} withBar /></CardSkeleton>
           <CardSkeleton title="Top Active Internal IPs"><SkeletonRows count={5} withBar /></CardSkeleton>
@@ -536,7 +426,7 @@ export default function Dashboard({ maxFilterDays }) {
       ) : (
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3 animate-[fadeIn_0.3s_ease-out]">
         <TopList
-          title="Top Threat IPs"
+          title="Top IP Reputation Alerts"
           items={stats.top_threat_ips || []}
           renderItem={(item, i) => (
             <div key={i} className="space-y-1">

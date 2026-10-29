@@ -35,6 +35,7 @@ const mockInterfaces = [
 let configOverride = {}
 
 vi.mock('../api', () => ({
+  fetchSavedViews: vi.fn(() => Promise.resolve({ views: [] })),
   fetchConfig: vi.fn(() => Promise.resolve({ ...baseConfig, ...configOverride })),
   fetchHealth: vi.fn(() => Promise.resolve({ status: 'ok', version: '3.3.0' })),
   fetchLatestRelease: vi.fn(() => Promise.resolve(null)),
@@ -50,7 +51,8 @@ vi.mock('../api', () => ({
   setAuthExpiredHandler: vi.fn(),
 }))
 
-vi.mock('../utils', () => ({
+vi.mock('../utils', async importOriginal => ({
+  ...await importOriginal(),
   loadInterfaceLabels: vi.fn(() => ({})),
 }))
 
@@ -76,11 +78,92 @@ vi.mock('../components/Login', () => ({ default: () => <div /> }))
 
 // Import after mocks are declared
 import App from '../App'
-import { dismissVpnToast, fetchConfig, fetchInterfaces } from '../api'
+import { dismissVpnToast, fetchAuthMe, fetchAuthStatus, fetchConfig, fetchHealth, fetchInterfaces } from '../api'
 
 beforeEach(() => {
   vi.clearAllMocks()
+  localStorage.clear(); sessionStorage.clear()
+  window.history.replaceState(null, '', '/')
   configOverride = {}
+  fetchAuthStatus.mockResolvedValue({ auth_enabled: false })
+  fetchAuthMe.mockResolvedValue(null)
+  fetchHealth.mockResolvedValue({ status: 'ok', version: '3.3.0' })
+})
+
+describe('remembered navigation', () => {
+  it('restores the last tab and allows an explicit URL to override it', async () => {
+    localStorage.setItem('unifi-log-insight:active-tab', JSON.stringify('dashboard'))
+    const first = render(<App />)
+    await screen.findByRole('button', { name: 'System status' })
+    expect(screen.queryByTestId('logstream')).toBeNull()
+    first.unmount()
+    window.history.replaceState(null, '', '/#logs')
+    render(<App />)
+    await screen.findByTestId('logstream')
+    expect(JSON.parse(localStorage.getItem('unifi-log-insight:active-tab'))).toBe('logs')
+  })
+})
+
+describe('collection status indicator', () => {
+  it('keeps normal pending processing neutral despite incomplete metadata', async () => {
+    fetchHealth.mockResolvedValue({ status: 'ok', version: '3.3.0', ingestion: {
+      status: 'fresh', state: 'pending', stats: { dropped: 0 }, batch: { pending: 12, inflight: 3 },
+      collection: { incomplete: true, reasons: ['processing'], attention_required: false, attention_reasons: [], state: 'processing' },
+    } })
+    render(<App />)
+    await screen.findByRole('button', { name: 'Processing recent events' })
+    expect(screen.queryByRole('button', { name: 'Collection needs attention' })).toBeNull()
+    expect(screen.queryByText('Collection incomplete')).toBeNull()
+    expect(screen.getByRole('button', { name: 'System status' }).querySelector('span')).toHaveClass('bg-emerald-400')
+  })
+
+  it.each(['backlog_lag', 'queue_pressure', 'worker_stalled', 'delivery_retry', 'stale_snapshot', 'unavailable_snapshot'])(
+    'shows an attention indicator for %s', async reason => {
+      fetchHealth.mockResolvedValue({ status: 'ok', version: '3.3.0', ingestion: {
+        stats: { dropped: 0 }, collection: { incomplete: true, attention_required: true, attention_reasons: [reason], state: 'delayed' },
+      } })
+      render(<App />)
+      await screen.findByRole('button', { name: 'Collection needs attention' })
+      expect(screen.queryByRole('button', { name: 'Processing recent events' })).toBeNull()
+      expect(screen.getByRole('button', { name: 'System status' }).querySelector('span')).toHaveClass('bg-amber-400')
+    })
+
+  it('shows an amber loss indicator even when the API and database are reachable', async () => {
+    fetchHealth.mockResolvedValue({ status: 'ok', version: '3.3.0', ingestion: { stats: { dropped: 4 } } })
+    render(<App />)
+    await screen.findByRole('button', { name: 'Collection loss: 4' })
+    const status = screen.getByRole('button', { name: 'System status' })
+    expect(status).toHaveAttribute('title', expect.stringContaining('does not establish a current outage'))
+    expect(status.querySelector('span')).toHaveClass('bg-amber-400')
+  })
+
+  it('does not turn enrichment-only skips into a collection-loss warning', async () => {
+    fetchHealth.mockResolvedValue({ status: 'ok', version: '3.3.0', ingestion: { stats: { dropped: 0 }, enrichment: { dropped: 4 } } })
+    render(<App />)
+    await screen.findByRole('button', { name: 'System status' })
+    expect(screen.queryByRole('button', { name: /Collection loss:/ })).toBeNull()
+    expect(screen.getByRole('button', { name: 'System status' })).toHaveAttribute('title', expect.stringContaining('does not confirm complete log collection'))
+  })
+})
+
+describe('HTTPS connection warning', () => {
+  it.each([
+    { is_https: true, proxy_trusted: false },
+    { is_https: true, proxy_trusted: true },
+  ])('does not require a proxy header once HTTPS is verified: %o', async (connection) => {
+    fetchAuthStatus.mockResolvedValue({ ...connection, setup_complete: true, auth_enabled_effective: true })
+    fetchAuthMe.mockResolvedValue({ authenticated: true })
+    render(<App />)
+    await screen.findByTestId('logstream')
+    expect(screen.queryByText(/Reverse proxy trust is not configured/)).not.toBeInTheDocument()
+  })
+
+  it('warns when authenticated access has no verified HTTPS or proxy', async () => {
+    fetchAuthStatus.mockResolvedValue({ is_https: false, proxy_trusted: false, setup_complete: true, auth_enabled_effective: true })
+    fetchAuthMe.mockResolvedValue({ authenticated: true })
+    render(<App />)
+    expect(await screen.findByText(/Reverse proxy trust is not configured/)).toBeInTheDocument()
+  })
 })
 
 

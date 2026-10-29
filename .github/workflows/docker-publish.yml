@@ -1,117 +1,63 @@
-name: Build and Push Docker Image
+name: Publish fork image
 
 on:
-  push:
-    tags:
-      - 'v*'
+  pull_request:
+    branches: [main]
+    types: [closed]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Version tag to build (e.g. v3.4.0)'
-        required: true
-
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: jmasarweh/unifi-log-insight
 
 permissions:
   contents: read
-  packages: write
+
+concurrency:
+  group: publish-fork-image
+  cancel-in-progress: false
 
 jobs:
-  build-and-push:
+  publish:
+    if: >-
+      github.repository == 'gzeoneth/UniFi-Insights-Plus' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request' &&
+        github.event.pull_request.merged == true &&
+        github.event.pull_request.base.ref == 'main'))
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      BUILD_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.pull_request.merge_commit_sha }}
     steps:
-      - name: Set tag name
-        id: tag
-        env:
-          TAG: ${{ inputs.tag || github.ref_name }}
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.BUILD_SHA }}
+          persist-credentials: false
+      - name: Validate custom version
+        id: version
+        shell: bash
         run: |
-          if ! printf '%s\n' "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$'; then
-            echo "::error::Invalid tag format '$TAG'. Expected vX.Y.Z or vX.Y.Z-beta.N"
+          version=$(tr -d '\n' < VERSION)
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-gzeon\.[0-9]+$ ]]; then
+            echo 'VERSION must use X.Y.Z-gzeon.N' >&2
             exit 1
           fi
-          echo "name=$TAG" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout
-        uses: actions/checkout@v5
+          printf 'value=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
         with:
-          ref: ${{ steps.tag.outputs.name }}
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Fetch release notes
-        id: release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ steps.tag.outputs.name }}
-        run: |
-          if NOTES=$(gh release view "$TAG_NAME" --json body -q .body 2>&1); then
-            if [ -z "$NOTES" ]; then
-              echo "::warning::Release $TAG_NAME exists but has no notes"
-            fi
-          else
-            if echo "$NOTES" | grep -qi "not found\|no release"; then
-              echo "::warning::No release found for $TAG_NAME"
-              NOTES=""
-            else
-              echo "::error::Failed to fetch release notes: $NOTES"
-              exit 1
-            fi
-          fi
-          echo "notes<<EOFNOTES" >> "$GITHUB_OUTPUT"
-          echo "$NOTES" >> "$GITHUB_OUTPUT"
-          echo "EOFNOTES" >> "$GITHUB_OUTPUT"
-
-      - name: Extract metadata (tags, labels)
-        id: meta
-        uses: docker/metadata-action@v5
-        env:
-          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}},value=${{ steps.tag.outputs.name }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ steps.tag.outputs.name }},enable=${{ !contains(steps.tag.outputs.name, '-') }}
-            type=semver,pattern={{major}},value=${{ steps.tag.outputs.name }},enable=${{ !contains(steps.tag.outputs.name, '-') }}
-            type=raw,value=latest,enable=${{ !contains(steps.tag.outputs.name, '-') }}
-            type=raw,value=beta,enable=${{ contains(steps.tag.outputs.name, '-beta') }}
-          labels: |
-            org.opencontainers.image.description=${{ steps.release.outputs.notes }}
-
-      - name: Write version file from git tag
-        env:
-          TAG_NAME: ${{ steps.tag.outputs.name }}
-        run: echo "${TAG_NAME#v}" > VERSION
-
-      - name: Build and push
+      - name: Build and publish image
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          annotations: ${{ steps.meta.outputs.annotations }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Update GHCR package description
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_NOTES: ${{ steps.release.outputs.notes }}
-        run: |
-          gh api --method PATCH /user/packages/container/unifi-log-insight \
-            -f description="$(printf '%s' "$RELEASE_NOTES" | head -c 512)" \
-            2>/dev/null || true
+          tags: |
+            ghcr.io/gzeoneth/unifi-insights-plus:${{ steps.version.outputs.value }}
+            ghcr.io/gzeoneth/unifi-insights-plus:gzeon
+            ghcr.io/gzeoneth/unifi-insights-plus:sha-${{ env.BUILD_SHA }}
+          labels: |
+            org.opencontainers.image.revision=${{ env.BUILD_SHA }}

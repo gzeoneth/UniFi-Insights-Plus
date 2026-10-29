@@ -1,3 +1,5 @@
+> **Custom fork based on v3.7.2:** adds UniFi IPS/CEF classification, include/exclude filters and saved log views, observed rule usage, ingestion health and retry storage, and optional retention archives and summaries. See [fork deployment and maintenance](LOCAL-FORK.md). Build this fork locally; the upstream images linked below do not contain these changes.
+
 <p align="center">
   <img src="ui/public/image.png" alt="UniFi Insights Plus" />
 </p>

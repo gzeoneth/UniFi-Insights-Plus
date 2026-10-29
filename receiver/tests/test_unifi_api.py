@@ -436,3 +436,30 @@ class TestGetFirewallDataIdless:
 
         assert data['totalCount'] == 1
         assert not [r for r in caplog.records if 'without an id' in r.getMessage()]
+
+
+class TestDeviceNameIdentity:
+    def test_ip_name_wins_over_a_gateway_mac(self, api):
+        api._ip_to_name = {'10.20.0.20': 'Laptop'}
+        api._mac_to_name = {'aa:bb:cc:dd:ee:ff': 'Gateway'}
+        assert api.resolve_name('10.20.0.20', 'aa:bb:cc:dd:ee:ff') == 'Laptop'
+
+    def test_unknown_remote_ip_never_inherits_gateway_mac_name(self, api):
+        api._ip_to_name = {'10.20.0.1': 'Gateway'}
+        api._mac_to_name = {'aa:bb:cc:dd:ee:ff': 'Gateway'}
+        assert api.resolve_name('203.0.113.50', 'aa:bb:cc:dd:ee:ff') is None
+
+    def test_unknown_internal_ip_also_does_not_inherit_next_hop(self, api):
+        api._mac_to_name = {'aa:bb:cc:dd:ee:ff': 'VLAN Router'}
+        assert api.resolve_name('10.30.0.20', 'aa:bb:cc:dd:ee:ff') is None
+
+    def test_mac_only_name_remains_available(self, api):
+        api._mac_to_name = {'aa:bb:cc:dd:ee:ff': 'Printer'}
+        assert api.resolve_name(mac='AA:BB:CC:DD:EE:FF') == 'Printer'
+
+    def test_disabled_name_feature_uses_neither_map(self, api):
+        api.features['client_names'] = False
+        api._ip_to_name = {'10.20.0.20': 'Laptop'}
+        api._mac_to_name = {'aa:bb:cc:dd:ee:ff': 'Printer'}
+        assert api.resolve_name('10.20.0.20') is None
+        assert api.resolve_name(mac='aa:bb:cc:dd:ee:ff') is None

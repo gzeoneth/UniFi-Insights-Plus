@@ -15,7 +15,12 @@ import socket
 import signal
 import logging
 import threading
+import json
+import queue
+import tempfile
+import uuid
 from collections import deque
+from contextlib import contextmanager
 
 import schedule
 
@@ -25,6 +30,10 @@ from log_utils import flush_suppressed, rate_limited_warning
 from db import (Database, get_config, set_config, build_conn_params, is_external_db,
                 wait_for_postgres, parse_positive_int, has_logs)
 from enrichment import Enricher
+from ingest_queue import RetrySpool, positive_env
+from ingest_metrics import IngestMetrics, bounded_seconds_env
+from ingest_health import collection_state
+from ingest_runtime import DEFAULT_QUEUE_CAPACITY, status_path
 from backfill import BackfillTask
 from blacklist import BlacklistFetcher
 from unifi_api import UniFiAPI
@@ -60,8 +69,8 @@ _loaded_identity = None
 
 SYSLOG_PORT = 514
 SYSLOG_BUFFER_SIZE = 8192      # Max UDP packet size
-BATCH_SIZE = 50                 # Insert logs in batches
-BATCH_TIMEOUT = 2.0             # Flush batch after N seconds even if not full
+BATCH_SIZE = 200                # Bounded batches amortize durable transaction cost
+BATCH_TIMEOUT = 1.0             # Maximum partial-batch staging delay
 STATS_INTERVAL_MINUTES = 15     # Log stats every N minutes (DEBUG only)
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -103,36 +112,87 @@ WAN_REFRESH_INTERVAL_MINUTES = _wan_refresh_interval_from_env()
 # ── Syslog Receiver ───────────────────────────────────────────────────────────
 
 class SyslogReceiver:
-    """UDP syslog receiver with batched database writes."""
+    """Socket intake, local parsing and durable DB delivery use separate threads."""
 
-    HEARTBEAT_INTERVAL = 60  # Log heartbeat every 60 seconds
+    HEARTBEAT_INTERVAL = 60
 
     def __init__(self, db: Database, enricher: Enricher):
         self.db = db
         self.enricher = enricher
         self.sock = None
         self.running = False
+        self._shutdown_requested = False
         self.batch: list[dict] = []
+        self._batch_started_at = None
+        self._processing_rows = 0
+        self._staging_rows = 0
         self.batch_lock = threading.Lock()
-        self.last_flush = time.time()
+        self.batch_size = positive_env('INGEST_BATCH_SIZE', BATCH_SIZE, 1000)
+        self.batch_timeout = bounded_seconds_env('INGEST_FLUSH_INTERVAL_SECONDS', BATCH_TIMEOUT)
+        self._metrics = IngestMetrics()
+        self.last_flush = time.monotonic()
         self.last_heartbeat = time.time()
-        self.last_receive_time = 0.0  # Track when we last received any packet
+        self.last_receive_time = 0.0
+        self.last_progress_at = time.time()
         self.consecutive_flush_errors = 0
-        self.stats = {
-            'received': 0,
-            'parsed': 0,
-            'filtered': 0,
-            'failed': 0,
-            'inserted': 0,
-            'flush_errors': 0,
-            'dropped': 0,
-            'parse_exceptions': 0,   # unexpected exception anywhere in _handle_message
-            'enrich_exceptions': 0,  # enrich() raised; row stored un-enriched
+        self._db_retry_at = 0.0
+        self._ack_retry_at = 0.0
+        self._stats_lock = threading.Lock()
+        self.stats = dict.fromkeys((
+            'received', 'parsed', 'filtered', 'failed', 'staged', 'inserted', 'duplicates',
+            'flush_errors', 'dropped', 'parse_exceptions', 'enrich_exceptions',
+            'queue_dropped', 'spool_dropped', 'spool_errors', 'delivery_attempts', 'retry_attempts',
+            'shutdown_dropped',
+        ), 0)
+        self.queue = queue.Queue(maxsize=positive_env('INGEST_QUEUE_CAPACITY', DEFAULT_QUEUE_CAPACITY, 65536))
+        self._worker = None
+        self._delivery_worker = None
+        self._maintenance_worker = None
+        self._workers = {name: {'failed': False, 'last_progress_at': time.time(), 'busy_since': None,
+                                'phase': 'idle', 'phase_started_at': None}
+                         for name in ('producer', 'delivery')}
+        self._health_worker = None
+        self._stop_event = threading.Event()
+        self._delivery_wake = threading.Event()
+        self._health_stop = threading.Event()
+        self._shutdown_deadline = None
+        self.config_reload_callback = None
+        self.started_callback = None
+        self.config_reload_requested = False
+        self.geoip_reload_requested = False
+        self._spool = None
+        self._spool_init_lock = threading.Lock()
+        self._spool_failed = False
+        self._spool_path = os.environ.get('INGEST_SPOOL_PATH',
+                                         '/var/lib/unifi-log-insight/ingest/retry.sqlite3')
+        self._spool_state = {
+            'rows': 0, 'bytes': 0,
+            'max_rows': positive_env('INGEST_SPOOL_MAX_ROWS', 100000, 1000000),
+            'max_bytes': positive_env('INGEST_SPOOL_MAX_BYTES', 64 * 1024 * 1024, 512 * 1024 * 1024),
         }
+        self._status_path = status_path()
         self._load_disabled_types()
 
+    def _count(self, key, count=1):
+        with self._stats_lock:
+            self.stats[key] += count
+
+    @contextmanager
+    def _worker_phase(self, worker, phase):
+        """Publish lock-free phase snapshots, including stage/read/ack waits."""
+        previous = self._workers[worker]
+        now = time.time()
+        self._workers[worker] = dict(previous, phase=phase, phase_started_at=now,
+                                     busy_since=previous['busy_since'] or now)
+        try:
+            yield
+        finally:
+            current = self._workers[worker]
+            self._workers[worker] = dict(current, phase=previous['phase'],
+                                         phase_started_at=previous['phase_started_at'],
+                                         busy_since=previous['busy_since'], last_progress_at=time.time())
+
     def _load_disabled_types(self):
-        """Load set of log types that should be silently discarded."""
         disabled = set()
         if not get_config(self.db, 'wifi_processing_enabled', True):
             disabled.add('wifi')
@@ -142,150 +202,428 @@ class SyslogReceiver:
         if disabled:
             logger.info("Log type filtering active: discarding %s", disabled)
 
+    def _accept_datagram(self, data, addr):
+        """The entire socket hot path: bounded nonblocking memory enqueue."""
+        self.last_receive_time = time.time()
+        self._count('received')
+        try:
+            self.queue.put_nowait((data, addr, self.last_receive_time))
+        except queue.Full:
+            self._count('queue_dropped')
+            self._count('dropped')
+
     def start(self):
-        """Start the UDP listener."""
+        if self._shutdown_requested:
+            return
         self.sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)  # dual-stack: accept IPv4 + IPv6
+        self.sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-        # Set receive buffer to 1MB to handle bursts
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
-        actual_rcvbuf = self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
-        logger.info("UDP socket SO_RCVBUF: requested=1048576, actual=%d", actual_rcvbuf)
-
+        logger.info("UDP socket SO_RCVBUF: requested=1048576, actual=%d",
+                    self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF))
         self.sock.bind(('::', SYSLOG_PORT))
-        self.sock.settimeout(1.0)  # Allow periodic batch flushing
+        self.sock.settimeout(1.0)
         self.running = True
+        self._start_workers()
+        self._health_worker = threading.Thread(target=self._health_loop, name='ingest-health', daemon=True)
+        self._health_worker.start()
+        logger.info("Syslog receiver listening on UDP port %d (queue capacity=%d)",
+                    SYSLOG_PORT, self.queue.maxsize)
+        try:
+            if self.started_callback:
+                self.started_callback()
+            while self.running and not self._shutdown_requested:
+                try:
+                    data, addr = self.sock.recvfrom(SYSLOG_BUFFER_SIZE)
+                    self._accept_datagram(data, addr)
+                except socket.timeout:
+                    pass
+                except OSError as exc:
+                    if self.running:
+                        logger.error("Socket error (will retry): %s", exc)
+                        time.sleep(0.1)
+        finally:
+            self.stop()
 
-        logger.info("Syslog receiver listening on UDP port %d", SYSLOG_PORT)
+    def request_stop(self):
+        """Signal-safe request: never acquire a queue lock inside a handler."""
+        self._shutdown_requested = True
+        self.running = False
 
-        while self.running:
-            try:
-                data, addr = self.sock.recvfrom(SYSLOG_BUFFER_SIZE)
-                self.last_receive_time = time.time()
-                self._handle_message(data, addr)
-            except socket.timeout:
-                pass
-            except OSError as e:
-                if self.running:
-                    logger.error("Socket error (will retry): %s", e)
-                    time.sleep(0.1)  # Brief pause to avoid tight error loop
-            finally:
-                # Check if batch needs flushing by timeout
+    def _ensure_spool(self):
+        with self._spool_init_lock:
+            if self._spool is None:
+                self._spool = RetrySpool(self._spool_path,
+                                        self._spool_state['max_rows'], self._spool_state['max_bytes'])
+                self._spool_state = self._spool.snapshot()
+
+    def _start_workers(self):
+        self._worker = threading.Thread(target=self._process_queue, name='ingest-stage', daemon=True)
+        self._delivery_worker = threading.Thread(target=self._deliver_spool, name='ingest-delivery', daemon=True)
+        self._maintenance_worker = threading.Thread(target=self._maintenance_loop,
+                                                    name='ingest-maintenance', daemon=True)
+        self._worker.start()
+        self._delivery_worker.start()
+        self._maintenance_worker.start()
+
+    def _maintenance_loop(self):
+        """Open replacement GeoIP files outside staging and database delivery.
+
+        A boolean request coalesces signals; a request received during a reload
+        is handled on the next pass. Only this one worker performs reloads.
+        """
+        while not self._stop_event.wait(0.2):
+            if self.geoip_reload_requested:
+                self.geoip_reload_requested = False
+                try:
+                    self.enricher.reload_geoip()
+                except Exception:
+                    logger.exception("GeoIP reload failed; ingestion continues")
+
+    def _process_queue(self):
+        try:
+            with self._worker_phase('producer', 'spool_open'):
+                self._ensure_spool()
+        except Exception:
+            self._spool_failed = True
+            self._count('spool_errors')
+            logger.error("Cannot open durable ingest spool; incoming rows will be explicitly dropped", exc_info=True)
+        try:
+            while not self._stop_event.is_set() or not self.queue.empty():
+                if self._shutdown_deadline is not None and time.monotonic() >= self._shutdown_deadline:
+                    break
+                try:
+                    data, addr, _received_at = self.queue.get(timeout=0.1)
+                except queue.Empty:
+                    pass
+                else:
+                    try:
+                        self._processing_rows = 1
+                        with self._worker_phase('producer', 'parse_enrich'):
+                            self._handle_message(data, addr, count_received=False)
+                    finally:
+                        self._processing_rows = 0
+                        self.queue.task_done()
                 self._maybe_flush_batch()
-                self._maybe_log_heartbeat()
+                self.last_progress_at = time.time()
+                self._workers['producer']['last_progress_at'] = self.last_progress_at
+        except Exception:
+            self._workers['producer']['failed'] = True
+            logger.exception("Ingestion worker stopped unexpectedly")
+        finally:
+            # Shutdown or a worker error must still stage its parsed rows.
+            self._flush_batch()
+
+    def _deliver_spool(self):
+        """PostgreSQL latency never holds the producer or SQLite transaction."""
+        try:
+            while not self._stop_event.is_set():
+                self._delivery_wake.clear()
+                # One bounded batch per pass; errors retain backoff in SQLite.
+                delivered = self._retry_spool()
+                self._flush_acknowledgements()
+                # Configuration reads can wait for PostgreSQL. Keep them off
+                # the staging worker just like ordinary database delivery.
+                if self.config_reload_requested and self.config_reload_callback:
+                    self.config_reload_requested = False
+                    self.config_reload_callback()
+                if not delivered:
+                    self._delivery_wake.wait(0.1)
+        except Exception:
+            self._workers['delivery']['failed'] = True
+            logger.exception("Delivery worker stopped unexpectedly; durable rows retained")
+        finally:
+            # This remains on the daemon thread: stop() only waits up to its
+            # existing deadline if storage is stalled. PG-committed rows left
+            # in the spool are safe to replay after an interrupted cleanup.
+            self._flush_acknowledgements(force=True)
+
+    def _flush_acknowledgements(self, force=False):
+        if self._spool is None or (not force and time.monotonic() < self._ack_retry_at):
+            return
+        started = time.monotonic()
+        try:
+            with self._worker_phase('delivery', 'spool_ack'):
+                flushed = self._spool.flush_acknowledgements(force=force)
+            if flushed:
+                self._spool_state = self._spool.snapshot()
+                self._spool_failed = False
+                self._ack_retry_at = 0.0
+                self._metrics.observe('spool_ack', started)
+        except Exception:
+            self._spool_failed = True
+            self._count('spool_errors')
+            self._ack_retry_at = time.monotonic() + 5
+            self._metrics.observe('spool_ack', started)
+            rate_limited_warning(logger, 'receiver.spool_ack_flush',
+                                 "Committed rows await spool cleanup; replay remains safe", exc_info=True)
 
     def stop(self):
-        """Stop the receiver and flush remaining logs."""
+        """Bounded drain; committed spool rows survive forced/slow DB shutdown."""
         logger.info("Stopping syslog receiver...")
         self.running = False
-        self._flush_batch()
+        if self._shutdown_deadline is None:
+            self._shutdown_deadline = time.monotonic() + 5.0
+        self._stop_event.set()
+        self._delivery_wake.set()
         if self.sock:
             self.sock.close()
+        if self._worker and self._worker is not threading.current_thread():
+            self._worker.join(timeout=max(0, self._shutdown_deadline - time.monotonic()))
+        elif self._worker is None:
+            self._flush_batch()
+        if self._delivery_worker and self._delivery_worker is not threading.current_thread():
+            self._delivery_worker.join(timeout=max(0, self._shutdown_deadline - time.monotonic()))
+        if self._maintenance_worker and self._maintenance_worker is not threading.current_thread():
+            self._maintenance_worker.join(timeout=max(0, self._shutdown_deadline - time.monotonic()))
+        # UDP memory backlog cannot survive process exit: count its loss explicitly.
+        while True:
+            try:
+                self.queue.get_nowait()
+                self.queue.task_done()
+                self._count('shutdown_dropped')
+                self._count('dropped')
+            except queue.Empty:
+                break
+        if self._worker and self._worker.is_alive():
+            logger.warning("Ingest worker still finishing; durable rows will replay on restart")
+        if self._delivery_worker and self._delivery_worker.is_alive():
+            logger.warning("Database delivery still finishing; unacknowledged rows will replay on restart")
+        self._health_stop.set()
+        if self._health_worker:
+            self._health_worker.join(timeout=1.0)
+        self._write_status()
         logger.info("Syslog receiver stopped. Stats: %s", self.stats)
 
-    def _handle_message(self, data: bytes, addr: tuple):
-        """Process a single syslog message."""
-        self.stats['received'] += 1
-
-        try:
-            raw_log = data.decode('utf-8', errors='replace').strip()
-        except Exception as e:
-            logger.warning("Failed to decode message from %s: %s", addr, e)
-            self.stats['failed'] += 1
-            return
-
+    def _handle_message(self, data: bytes, addr: tuple, count_received=True):
+        """Parse and apply local/cached enrichment on the ingestion worker."""
+        if count_received:
+            self._count('received')
+        raw_log = data.decode('utf-8', errors='replace').strip()
         if not raw_log:
             return
-
         try:
-            parsed = parse_log(raw_log)
-            if parsed is None:
-                self.stats['failed'] += 1
-                logger.debug("Unparseable log from %s: %.100s...", addr, raw_log)
-                return
-
-            self.stats['parsed'] += 1
-
-            # Filter disabled log types before enrichment
-            log_type = parsed.get('log_type')
-            if log_type in self._disabled_log_types:
-                self.stats['filtered'] += 1
-                return
-
-            # Enrich with GeoIP, ASN, AbuseIPDB, rDNS. enrich() mutates its
-            # argument, so hand it a copy: if it raises, the original parsed
-            # row is stored un-enriched instead of being dropped.
+            started = time.monotonic()
             try:
-                parsed = self.enricher.enrich(dict(parsed))
+                parsed = parse_log(raw_log)
+            finally:
+                self._metrics.observe('parse', started)
+            if parsed is None:
+                self._count('failed')
+                return
+            self._count('parsed')
+            if parsed.get('log_type') in self._disabled_log_types:
+                self._count('filtered')
+                return
+            try:
+                started = time.monotonic()
+                parsed = self.enricher.enrich(dict(parsed), defer_network=True)
             except Exception:
-                self.stats['enrich_exceptions'] += 1
+                self._count('enrich_exceptions')
                 self._warn_rate_limited('enrich_exceptions', addr, raw_log)
-
-            with self.batch_lock:
-                self.batch.append(parsed)
-                if len(self.batch) >= BATCH_SIZE:
-                    self._flush_batch()
+            finally:
+                self._metrics.observe('enrich', started)
+            parsed['ingest_id'] = str(uuid.uuid4())
+            if not self.batch:
+                self._batch_started_at = time.monotonic()
+            self.batch.append(parsed)
+            if len(self.batch) >= self.batch_size:
+                self._flush_batch()
         except Exception:
-            # Last-resort guard: UDP/514 accepts packets from any LAN host, so an
-            # unexpected exception must never kill the receiver thread (that
-            # forces a supervisord restart and loses the unflushed batch).
-            self.stats['parse_exceptions'] += 1
+            self._count('parse_exceptions')
             self._warn_rate_limited('parse_exceptions', addr, raw_log)
 
     def _warn_rate_limited(self, counter: str, addr: tuple, raw_log: str):
-        """Log at most one WARNING (with traceback) per counter per interval.
-
-        Delegates to ``log_utils.rate_limited_warning``, so log volume stays
-        at one line per minute per counter whatever the packet rate; the
-        line carries the running total and the suppressed count. Must be
-        called from inside an ``except`` block.
-        """
         rate_limited_warning(logger, f'receiver.{counter}',
                              "%s (total %d) while handling packet from %s: %.200r",
                              counter, self.stats[counter], addr, raw_log, exc_info=True)
 
     def _maybe_flush_batch(self):
-        """Flush batch if timeout elapsed."""
-        if time.time() - self.last_flush >= BATCH_TIMEOUT:
-            with self.batch_lock:
-                if self.batch:
-                    self._flush_batch()
+        if time.monotonic() - self.last_flush >= self.batch_timeout and self.batch:
+            self._flush_batch()
 
     def _flush_batch(self):
-        """Write current batch to database."""
+        """Commit parsed events locally, then wake independent delivery."""
         if not self.batch:
-            self.last_flush = time.time()
+            self._batch_started_at = None
+            self.last_flush = time.monotonic()
             return
-
-        to_insert = self.batch[:]
-        self.batch = []
-        self.last_flush = time.time()
-        batch_len = len(to_insert)
-
-        flush_start = time.time()
+        rows, self.batch = self.batch, []
+        self._staging_rows = len(rows)
+        self.last_flush = time.monotonic()
+        started = time.monotonic()
         try:
-            self.db.insert_logs_batch(to_insert)
-            flush_elapsed = time.time() - flush_start
-            self.stats['inserted'] += batch_len
-            if self.consecutive_flush_errors > 0:
-                logger.info("DB insert recovered after %d consecutive failures", self.consecutive_flush_errors)
-            self.consecutive_flush_errors = 0
-            if flush_elapsed > 1.0:
-                logger.warning("Slow DB flush: %d logs took %.2fs (>1s blocks UDP receive)", batch_len, flush_elapsed)
-            else:
-                logger.debug("Flushed %d logs in %.3fs", batch_len, flush_elapsed)
-        except Exception as e:
-            flush_elapsed = time.time() - flush_start
-            self.stats['flush_errors'] += 1
-            self.stats['dropped'] += batch_len
+            with self._worker_phase('producer', 'spool_stage'):
+                self._ensure_spool()
+                accepted, rejected = self._spool.stage(rows)
+            self._count('staged', len(accepted))
+            self._spool_state = self._spool.snapshot()
+            self._spool_failed = False
+            if rejected:
+                self._count('spool_dropped', rejected)
+                self._count('dropped', rejected)
+                rate_limited_warning(logger, 'receiver.spool_capacity',
+                                     "Ingest spool full or invalid payload: %d newest rows dropped", rejected)
+        except Exception:
+            self._spool_failed = True
+            self._count('spool_errors')
+            self._count('spool_dropped', len(rows))
+            self._count('dropped', len(rows))
+            rate_limited_warning(logger, 'receiver.spool_write',
+                                 "Ingest spool write failed: %d rows dropped", len(rows), exc_info=True)
+            return
+        finally:
+            self._staging_rows = 0
+            self._batch_started_at = None
+            self._metrics.observe('spool_stage', started)
+        self._delivery_wake.set()
+
+    def _retry_spool(self):
+        if self._spool is None or not self._spool.rows or time.time() < self._db_retry_at:
+            return
+        started = time.monotonic()
+        try:
+            with self._worker_phase('delivery', 'spool_read'):
+                rows, retrying = self._spool.due_batch(self.batch_size)
+        except Exception:
+            self._count('spool_errors')
+            self._spool_failed = True
+            self._db_retry_at = time.time() + 5
+            rate_limited_warning(logger, 'receiver.spool_read',
+                                 "Ingest spool read failed; queued data retained", exc_info=True)
+            return
+        finally:
+            self._metrics.observe('spool_read', started)
+        if not rows:
+            return
+        self._count('delivery_attempts')
+        if retrying:
+            self._count('retry_attempts')
+        started = time.monotonic()
+        rejected = 0
+        try:
+            with self._worker_phase('delivery', 'db_insert'):
+                result = self.db.insert_logs_batch(rows)
+            # A missing/old DB contract must never turn failure into success.
+            counts = (result.inserted, getattr(result, 'duplicates', 0), result.dropped)
+            if (any(type(value) is not int or value < 0 for value in counts)
+                    or not isinstance(result.retryable, list)
+                    or sum(counts) + len(result.retryable) != len(rows)
+                    or len({row['ingest_id'] for row in result.retryable}) != len(result.retryable)
+                    or not {row['ingest_id'] for row in result.retryable}.issubset(
+                        {row['ingest_id'] for row in rows})):
+                raise TypeError('Database did not return an InsertResult')
+            self._count('inserted', result.inserted)
+            self._count('duplicates', getattr(result, 'duplicates', 0))
+            rejected = result.dropped
+            retryable = result.retryable
+        except Exception:
+            retryable = rows
+            rate_limited_warning(logger, 'receiver.db_insert',
+                                 "Database insert failed; %d rows remain in durable spool", len(rows), exc_info=True)
+        finally:
+            self._metrics.observe('db_insert', started)
+        if retryable:
+            rate_limited_warning(logger, 'receiver.db_retry',
+                                 'Database deferred %d rows; retained in durable ingest spool', len(retryable))
+            self._count('flush_errors')
             self.consecutive_flush_errors += 1
-            logger.error("DB insert failed (%d logs lost, %.2fs, consecutive=%d): %s",
-                         batch_len, flush_elapsed, self.consecutive_flush_errors, e)
-            if self.consecutive_flush_errors >= 5:
-                logger.critical("DB insert failing repeatedly (%d consecutive). "
-                                "UDP packets are likely being dropped. Check DB connectivity.",
-                                self.consecutive_flush_errors)
+            self._db_retry_at = time.time() + min(60, 2 ** min(self.consecutive_flush_errors - 1, 6))
+        else:
+            self.consecutive_flush_errors = 0
+            self._db_retry_at = 0.0
+        started = time.monotonic()
+        try:
+            with self._worker_phase('delivery', 'spool_ack'):
+                self._spool.acknowledge(rows, retryable,
+                                        defer_success=not retryable and rejected == 0)
+            # A malformed row is not finally discarded until its spool removal
+            # commits. Do not count the same rejection again after an ack retry.
+            self._count('dropped', rejected)
+            self._spool_state = self._spool.snapshot()
+            # A RAM-only acknowledgement does not prove that a previously
+            # failed cleanup write recovered. A stage/cleanup commit does.
+            if not self._spool_state.get('ack_pending_rows', 0):
+                self._spool_failed = False
+        except Exception:
+            # PostgreSQL may already have committed: unchanged ingest IDs make
+            # replay safe even when the local acknowledgement could not commit.
+            self._count('spool_errors')
+            self._spool_failed = True
+            self._db_retry_at = time.time() + 5
+            rate_limited_warning(logger, 'receiver.spool_ack',
+                                 "Ingest spool acknowledgement failed; replay is idempotent", exc_info=True)
+        finally:
+            self._metrics.observe('spool_ack', started)
+        self.last_progress_at = time.time()
+        self._workers['delivery']['last_progress_at'] = self.last_progress_at
+        return True
+
+    def health_snapshot(self):
+        with self._stats_lock:
+            stats = dict(self.stats)
+        enrichment = self.enricher.network_stats()
+        if not isinstance(enrichment, dict):
+            enrichment = {}
+        providers = self.enricher.provider_stats()
+        if not isinstance(providers, dict):
+            providers = {}
+        with self.queue.mutex:
+            queue_depth = len(self.queue.queue)
+            oldest = self.queue.queue[0][2] if self.queue.queue else None
+        rates, timings = self._metrics.snapshot(stats)
+        workers = {name: dict(value, alive=bool(thread and thread.is_alive()))
+                   for name, value, thread in (
+                       ('producer', self._workers['producer'], self._worker),
+                       ('delivery', self._workers['delivery'], self._delivery_worker))}
+        spool = self._spool.snapshot() if self._spool is not None else dict(self._spool_state)
+        batch_started = self._batch_started_at
+        snapshot = {
+            'providers': providers,
+            'enrichment': enrichment,
+            'schema_version': 1, 'updated_at': time.time(), 'running': self.running,
+            'worker_alive': bool(self._worker and self._worker.is_alive()),
+            'last_progress_at': self.last_progress_at, 'last_receive_at': self.last_receive_time,
+            'stats': stats, 'queue': {'depth': queue_depth, 'capacity': self.queue.maxsize,
+                                    'oldest_age_seconds': max(0, time.time() - oldest) if oldest else 0},
+            'spool': dict(spool, failed=self._spool_failed),
+            'workers': workers, 'rates': rates, 'timings': timings,
+            'slow_operations': self._metrics.slow_operations(),
+            'batch': {'size': self.batch_size, 'flush_interval_seconds': self.batch_timeout,
+                      'pending': len(self.batch), 'inflight': max(self._processing_rows, self._staging_rows),
+                      'oldest_age_seconds': max(0, time.monotonic() - batch_started)
+                      if batch_started is not None else None},
+            'retry': {'consecutive_failures': self.consecutive_flush_errors,
+                      'next_retry_at': self._db_retry_at},
+        }
+        snapshot['collection'] = collection_state(snapshot)
+        return snapshot
+
+    def _write_status(self):
+        if not self._status_path:
+            return
+        temp_path = None
+        try:
+            directory = os.path.dirname(os.path.abspath(self._status_path))
+            os.makedirs(directory, exist_ok=True)
+            fd, temp_path = tempfile.mkstemp(prefix='.receiver-health-', dir=directory)
+            with os.fdopen(fd, 'w') as stream:
+                json.dump(self.health_snapshot(), stream, separators=(',', ':'))
+                stream.flush()
+            os.chmod(temp_path, 0o644)
+            os.replace(temp_path, self._status_path)
+        except OSError:
+            rate_limited_warning(logger, 'receiver.health_write',
+                                 "Could not publish ingest health snapshot", exc_info=True)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    def _health_loop(self):
+        while not self._health_stop.is_set():
+            self._write_status()
+            self._maybe_log_heartbeat()
+            self._health_stop.wait(2.0)
 
     def _maybe_log_heartbeat(self):
         """Periodic heartbeat log to confirm the receiver is alive."""
@@ -466,8 +804,11 @@ def _reload_config(db: Database, unifi_api, pihole, enricher, receiver):
 
 
 def _handle_config_reload_signal(db: Database, unifi_api, pihole, enricher, receiver):
-    """SIGUSR2 handler body. Never raises: the handler runs on the main thread
-    inside the receiver's recvfrom loop, which an exception would unwind."""
+    """Apply a requested reload on the ingestion worker. Never raises.
+
+    The SIGUSR2 handler only sets a flag so database/config IO cannot block
+    the socket thread or interrupt it while a queue lock is held.
+    """
     try:
         logger.info("Received SIGUSR2, reloading config from database...")
         _reload_config(db, unifi_api, pihole, enricher, receiver)
@@ -546,9 +887,6 @@ def main():
     db = Database(conn_params)
     db.connect()
 
-    # Create performance indexes that require CONCURRENTLY (existing installs)
-    db.ensure_post_boot_indexes()
-
     # Load system configuration and apply to parsers module
     # Check for existing user migration
     setup_complete = get_config(db, "setup_complete", None)
@@ -596,26 +934,38 @@ def main():
 
     # Start receiver
     receiver = SyslogReceiver(db, enricher)
+    index_thread = None
+
+    def start_index_maintenance():
+        nonlocal index_thread
+        # Intake is bound and workers are running before upgrade scans begin.
+        index_thread = threading.Thread(target=db.ensure_post_boot_indexes,
+                                        name='index-maintenance', daemon=True)
+        try:
+            index_thread.start()
+        except RuntimeError:
+            index_thread = None
+            logger.warning("Could not start index maintenance; intake continues", exc_info=True)
+
+    receiver.started_callback = start_index_maintenance
 
     # Handle graceful shutdown
     def shutdown(signum, frame):
         logger.info("Received signal %d, shutting down...", signum)
-        receiver.stop()
-        unifi_api.stop_polling()
-        pihole.stop_polling()
-        enricher.close()
-        db.close()
-        sys.exit(0)
+        receiver.request_stop()
 
     # Handle GeoIP database reload
     def reload_geoip(signum, frame):
         logger.info("Received SIGUSR1, reloading GeoIP databases...")
-        enricher.reload_geoip()
+        receiver.geoip_reload_requested = True
 
     # Handle config reload
     def reload_config(signum, frame):
         """Reload config from database when signaled by API process."""
-        _handle_config_reload_signal(db, unifi_api, pihole, enricher, receiver)
+        receiver.config_reload_requested = True
+
+    receiver.config_reload_callback = lambda: _handle_config_reload_signal(
+        db, unifi_api, pihole, enricher, receiver)
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
@@ -642,10 +992,14 @@ def main():
     try:
         receiver.start()
     except KeyboardInterrupt:
-        receiver.stop()
+        pass  # start() already drains in its finally block
+    finally:
         unifi_api.stop_polling()
         pihole.stop_polling()
         enricher.close()
+        db.cancel_index_maintenance()
+        if index_thread is not None:
+            index_thread.join(timeout=5)
         db.close()
 
 

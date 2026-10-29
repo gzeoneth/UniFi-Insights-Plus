@@ -41,6 +41,8 @@ permissions:
 
 jobs:
   snyk:
+    # Keep upstream publishing/integrations disabled in forks.
+    if: github.repository == 'jmasarweh/UniFi-Insights-Plus'
     permissions:
       contents: read
       security-events: write

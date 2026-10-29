@@ -5,6 +5,7 @@ import { parseRuleName, IDLESS_DOCS_URL, IDLESS_DOCS_LINK_TEXT } from '../lib/fi
 import { fetchAbuseIPDBStatus, enrichIP, matchFirewallPolicyForLog, patchFirewallPolicy } from '../api'
 import SyslogToggle from './SyslogToggle'
 import CopyButton from './CopyButton'
+import { identityDescription, PORT_SERVICE_DESCRIPTION } from '../lib/identityPresentation'
 
 const TEAL = 'text-teal-500 hover:text-teal-400'
 
@@ -80,7 +81,8 @@ export default function LogDetail({ log, hiddenColumns = new Set() }) {
   }, [canPrefetchBudget])
 
   // Match firewall log to policy for syslog toggle
-  const canMatchPolicy = log?.log_type === 'firewall' && log?.rule_name && parseRuleName(log.rule_name)
+  const canMatchPolicy = log?.log_type === 'firewall' && log?.event_source !== 'unifi_ips'
+    && log?.rule_name && parseRuleName(log.rule_name)
   useEffect(() => {
     if (!canMatchPolicy) return
     setPolicyLoading(true)
@@ -143,6 +145,38 @@ export default function LogDetail({ log, hiddenColumns = new Set() }) {
 
   const sections = []
 
+  if (displayLog.event_source === 'unifi_ips') {
+    const action = { block: 'Blocked', allow: 'Allowed' }[displayLog.rule_action] || 'Unknown'
+    sections.push(
+      <section key="ips" aria-label="UniFi IPS detection" className="col-span-full rounded border border-orange-800/40 bg-orange-950/10 p-3">
+        <h3 className="text-orange-300 text-[12px] uppercase tracking-wider mb-2">UniFi IPS detection</h3>
+        <div className="text-sm text-gray-200 break-words">{displayLog.ips_signature || 'Signature not supplied'}</div>
+        <dl className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3 text-xs">
+          {[
+            ['Signature ID', displayLog.ips_signature_id || 'Unknown'],
+            ['IPS severity', displayLog.ips_severity == null ? 'Unknown' : `${displayLog.ips_severity}/10`],
+            ['UniFi risk', displayLog.ips_risk || 'Unknown'],
+            ['IPS action', action],
+          ].map(([label, value]) => (
+            <div key={label}><dt className="text-gray-400">{label}</dt><dd className="text-gray-200 mt-1">{value}</dd></div>
+          ))}
+        </dl>
+        {displayLog.event_name && <div className="text-xs text-gray-400 mt-3">{displayLog.event_name}{displayLog.event_id ? ` (event ${displayLog.event_id})` : ''}</div>}
+        <dl className="grid grid-cols-2 gap-3 mt-3 text-xs">
+          {['src', 'dst'].map(prefix => (
+            <div key={prefix}>
+              <dt className="text-gray-400">{prefix === 'src' ? 'Reported source' : 'Reported destination'}</dt>
+              <dd className="text-gray-200 mt-1">{displayLog[`${prefix}_reported_name`] || 'Alias not supplied'}</dd>
+              {!displayLog[`${prefix}_ip`] && <dd className="text-amber-300 mt-1">IP not supplied by gateway</dd>}
+            </div>
+          ))}
+          {displayLog.reported_application && <div><dt className="text-gray-400">Reported application</dt><dd className="text-gray-200 mt-1">{displayLog.reported_application}</dd></div>}
+        </dl>
+        <p className="text-xs text-gray-400 mt-2">Reported aliases come from the event and do not establish endpoint identity.</p>
+      </section>
+    )
+  }
+
   // Source IP / Destination IP (always shown for copyability)
   if (displayLog.src_ip) {
     sections.push(
@@ -154,7 +188,7 @@ export default function LogDetail({ log, hiddenColumns = new Set() }) {
           <CopyButton text={displayLog.src_ip} color={TEAL} />
         </div>
         {displayLog.src_device_name && (
-          <div className="text-gray-500 text-[12px] mt-0.5">{displayLog.src_device_name}</div>
+          <div className="text-gray-500 text-[12px] mt-0.5" title={identityDescription(displayLog.src_identity_source)}>{displayLog.src_device_name}</div>
         )}
       </div>
     )
@@ -169,7 +203,7 @@ export default function LogDetail({ log, hiddenColumns = new Set() }) {
           <CopyButton text={displayLog.dst_ip} color={TEAL} />
         </div>
         {displayLog.dst_device_name && (
-          <div className="text-gray-500 text-[12px] mt-0.5">{displayLog.dst_device_name}</div>
+          <div className="text-gray-500 text-[12px] mt-0.5" title={identityDescription(displayLog.dst_identity_source)}>{displayLog.dst_device_name}</div>
         )}
       </div>
     )
@@ -265,7 +299,7 @@ export default function LogDetail({ log, hiddenColumns = new Set() }) {
   if (displayLog.log_type === 'firewall') {
     // Parsed rule breakdown (hidden when rule column is hidden)
     if (!hiddenColumns.has('rule')) {
-      const parsed = parseRuleName(displayLog.rule_name)
+      const parsed = displayLog.event_source !== 'unifi_ips' && parseRuleName(displayLog.rule_name)
       if (parsed) {
         const actionDisplay = parsed.action
           || (displayLog.rule_action && displayLog.rule_action.charAt(0).toUpperCase() + displayLog.rule_action.slice(1))
@@ -349,7 +383,7 @@ export default function LogDetail({ log, hiddenColumns = new Set() }) {
     if (displayLog.service_name) {
       sections.push(
         <div key="service">
-          <span className="text-gray-400 text-[12px] uppercase tracking-wider">Service</span>
+          <span className="text-gray-400 text-[12px] uppercase tracking-wider">Registered port service</span>
           <div className="text-gray-300 text-sm mt-0.5">
             {formatServiceName(displayLog.service_name)}
             {displayLog.dst_port && (
@@ -359,6 +393,7 @@ export default function LogDetail({ log, hiddenColumns = new Set() }) {
           {displayLog.service_description && (
             <div className="text-gray-400 text-xs mt-0.5">{displayLog.service_description}</div>
           )}
+          <div className="text-gray-400 text-xs mt-1">{PORT_SERVICE_DESCRIPTION}.</div>
         </div>
       )
     }

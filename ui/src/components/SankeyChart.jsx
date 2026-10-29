@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import { sankey as d3Sankey, sankeyLinkHorizontal } from 'd3-sankey'
 import { fetchFlowGraph } from '../api'
-import { readCache, writeCache } from '../lib/sessionCache'
+import useFlowQuery from '../hooks/useFlowQuery'
 import { formatNumber, formatServiceName, getInterfaceName } from '../utils'
 import NetworkBadge from './NetworkBadge'
 import FullscreenToggle from './FullscreenToggle'
@@ -90,15 +90,15 @@ function SankeyMenuItems({ onSaveView, onLoadView, savedViews, onDeleteView, onD
 }
 
 export default function SankeyChart({ filters, refreshKey, onNodeClick, activeFilter, hostIp, hostSearchInput, onHostSearchChange, onHostSearch, onHostSearchClear, dims, setDims, topN, setTopN, onSaveView, onLoadView, savedViews, onDeleteView, onRefreshViews, onDataLoaded, requestKey }) {
-  const [data, setData] = useState(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(null)
+  const n = Number(topN)
+  const { data, loading, error } = useFlowQuery('sankey',
+    { ...filters, dimensions: dims.join(','), top_n: n, ip: hostIp || undefined },
+    fetchFlowGraph, refreshKey, Number.isInteger(n) && n >= 1)
   const [tooltip, setTooltip] = useState(null)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [dimMenu, setDimMenu] = useState(null) // { dimIndex, x, y, color }
   const svgRef = useRef(null)
   const containerRef = useRef(null)
-  const refreshKeyRef = useRef(refreshKey)
   const [chartWidth, setChartWidth] = useState(0)
 
   // Measure container width (use clientWidth minus scrollbar to prevent resize loop)
@@ -116,31 +116,8 @@ export default function SankeyChart({ filters, refreshKey, onNodeClick, activeFi
   }, [])
 
   useEffect(() => {
-    // Guard: skip fetch when topN is empty or invalid (user mid-typing)
-    const n = Number(topN)
-    if (!n || n < 1) return
-
-    const params = { ...filters, dimensions: dims.join(','), top_n: n, ip: hostIp || undefined }
-    const disc = [filters.time_range, filters.time_from, filters.time_to, filters.rule_action, filters.direction, dims.join(','), n, hostIp || ''].join('|')
-    const cached = readCache('sankey', disc)
-    if (cached && refreshKey === refreshKeyRef.current) {
-      refreshKeyRef.current = refreshKey
-      setData(cached)
-      setLoading(false)
-      onDataLoaded?.(requestKey)
-      return
-    }
-    refreshKeyRef.current = refreshKey
-
-    let cancelled = false
-    setLoading(true)
-    setError(null)
-    fetchFlowGraph(params)
-      .then(d => { if (!cancelled) { setData(d); writeCache('sankey', disc, d) } })
-      .catch(err => { if (!cancelled) setError(err.message) })
-      .finally(() => { if (!cancelled) { setLoading(false); onDataLoaded?.(requestKey) } })
-    return () => { cancelled = true }
-  }, [filters.time_range, filters.time_from, filters.time_to, filters.rule_action, filters.direction, dims, topN, hostIp, refreshKey, requestKey])
+    if (!loading) onDataLoaded?.(requestKey)
+  }, [loading, requestKey, onDataLoaded])
 
   const setDim = (index, value) => {
     setDims(prev => {
@@ -487,7 +464,7 @@ export default function SankeyChart({ filters, refreshKey, onNodeClick, activeFi
             ))}
           </div>
         ) : error ? (
-          <div className="flex items-center justify-center h-48 text-xs text-red-400">{error}</div>
+          <div className="flex items-center justify-center h-48 text-xs text-red-400">{error?.message || String(error)}</div>
         ) : !layout ? (
           <div className="flex items-center justify-center h-48 text-xs text-gray-500">No flow data for this time range</div>
         ) : (
