@@ -18,23 +18,35 @@ def bounded_seconds_env(name, default=1.0, minimum=0.05, maximum=5.0):
 class IngestMetrics:
     """Only a fixed set of timings and at most 61 counter samples are retained."""
 
-    STAGES = ('parse', 'enrich', 'spool_stage', 'db_insert', 'spool_ack')
+    STAGES = ('parse', 'enrich', 'spool_stage', 'spool_read', 'db_insert', 'spool_ack')
     COUNTERS = ('received', 'staged', 'inserted', 'dropped', 'queue_dropped')
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._timings = {name: {'count': 0, 'total_ms': 0.0, 'last_ms': 0.0, 'max_ms': 0.0}
+        self._timings = {name: {'count': 0, 'total_ms': 0.0, 'last_ms': 0.0, 'max_ms': 0.0,
+                               'last_at': None, 'max_at': None}
                          for name in self.STAGES}
+        self._slow_operations = deque(maxlen=32)
         self._samples = deque([(time.monotonic(), dict.fromkeys(self.COUNTERS, 0))], maxlen=61)
 
     def observe(self, name, started):
         elapsed = max(0, (time.monotonic() - started) * 1000)
+        observed_at = time.time()
         with self._lock:
             value = self._timings[name]
             value['count'] += 1
             value['total_ms'] += elapsed
             value['last_ms'] = elapsed
-            value['max_ms'] = max(value['max_ms'], elapsed)
+            value['last_at'] = observed_at
+            if elapsed >= value['max_ms']:
+                value['max_ms'], value['max_at'] = elapsed, observed_at
+            if elapsed >= 1000:
+                self._slow_operations.append({'stage': name, 'duration_ms': elapsed,
+                                              'finished_at': observed_at})
+
+    def slow_operations(self):
+        with self._lock:
+            return [dict(value) for value in self._slow_operations]
 
     def snapshot(self, stats):
         now = time.monotonic()

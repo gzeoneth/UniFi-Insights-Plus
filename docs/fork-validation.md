@@ -2,6 +2,26 @@
 
 The changes were tested against the upstream v3.7.2 base using synthetic events and disposable local databases. No live collector, gateway or production database was modified for these checks.
 
+## Ingestion I/O release: 3.7.2-gzeon.7
+
+- All 1,306 backend tests passed with disposable PostgreSQL integration enabled; all 329 UI tests and the production UI build passed. A local ARM64 image passed actual UDP-to-PostgreSQL/filter checks. AMD64 and production storage were not tested in this run.
+- The image received, parsed and inserted all 1,210 synthetic UDP events with zero reported drops or errors. Cursor pages, DNS query parsing, host exclusions across Log Stream/Flow/CSV, and rule counts returned the expected results. Ten snapshots during ordinary batching remained normal processing without an attention warning.
+- Crash tests cover termination after durable admission, within staging, during acknowledgement and after PostgreSQL commit before acknowledgement. The final-image database replay returned 300 duplicates, zero new inserts and exactly 300 unique rows, then emptied the spool. SQLite integrity checks passed. SIGKILL tests process failure, not sudden power failure.
+- Other checks cover FIFO/retry/capacity behavior, reader-pinned WAL growth and recovery, DELETE-to-WAL upgrade and clean downgrade, bounded caches, stale-load invalidation, concurrent metadata reads, quota cooldown, storage-phase visibility and a permanently pending database-health request. Independent review found and fixed database-health polling holding up receiver display, and an optional quota check that could wait on provider persistence.
+- Browser inspection of the built image confirmed the version, 1,210 received/committed records, zero drops, idle workers, six stage timings with maximum-observation timestamps, and the independent refresh descriptions. No JavaScript errors were observed. This is a local synthetic run, not a deployment check.
+
+The SQLite benchmark compared `.6` with `.7` in a Linux ARM64 container. Each case stages and acknowledges 6,000 synthetic records of roughly 650 bytes. Both use FULL synchronization. Counts include initialization and final checkpoint/close; bytes are SQLite-requested writes measured with `strace`, not physical SSD writes.
+
+| Workload | Sync calls: .6 → .7 | Requested write bytes: .6 → .7 | SQL SELECTs: .6 → .7 |
+| --- | --- | --- | --- |
+| Alternating stage/ack, batch 60 | 808 → 215 | 19,392,728 → 10,888,828 | 12,200 → 400 |
+| Alternating stage/ack, batch 200 | 248 → 75 | 15,792,648 → 10,396,604 | 12,060 → 120 |
+| Stage full backlog, drain in 200s | 248 → 75 | 19,162,760 → 19,666,916 | 12,060 → 120 |
+
+With a fixed 5 ms delay injected into every sync call, the batch-60 run took 8.02 seconds before and 2.27 seconds after. Steady batches reduced requested write bytes by 34–44%; the backlog case wrote 2.6% more bytes with 70% fewer syncs. A separate 60,000-record spool run used about 15 MiB more peak process RAM with the larger page cache. These are synthetic comparisons, not production capacity claims.
+
+One hundred identity-label requests used one database transaction through the cache versus 300 separate transactions previously. Exact-IP queries on a one-million-row synthetic table already used existing indexes efficiently; this run did not justify adding more event indexes or changing PostgreSQL memory defaults. See [performance and upgrade details](performance.md) for memory limits, WAL backup requirements and health-path overrides.
+
 ## Browser-preferences release: 3.7.2-gzeon.6
 
 - All 327 UI tests and the production UI build passed. This release changes browser state handling, documentation and version references; backend code and database schema are unchanged, so backend and container checks were not repeated.

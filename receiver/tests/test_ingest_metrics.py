@@ -52,6 +52,7 @@ def test_rate_window_samples_remain_bounded_and_expire(monkeypatch):
 
 def test_stage_timings_count_failed_and_successful_attempts_thread_safely(monkeypatch):
     monkeypatch.setattr('ingest_metrics.time.monotonic', lambda: 101.0)
+    monkeypatch.setattr('ingest_metrics.time.time', lambda: 1000.0)
     metrics = IngestMetrics()
     threads = [threading.Thread(target=lambda: [metrics.observe('spool_stage', 100.5) for _ in range(100)])
                for _ in range(4)]
@@ -62,4 +63,25 @@ def test_stage_timings_count_failed_and_successful_attempts_thread_safely(monkey
     _, timings = metrics.snapshot(dict.fromkeys(metrics.COUNTERS, 0))
     assert timings['spool_stage'] == {
         'count': 400, 'total_ms': 200000, 'last_ms': 500, 'max_ms': 500, 'mean_ms': 500,
+        'last_at': 1000.0, 'max_at': 1000.0,
     }
+
+
+def test_slow_operation_history_is_bounded_and_keeps_when_maximum_occurred(monkeypatch):
+    monkeypatch.setattr('ingest_metrics.time.monotonic', lambda: 100.0)
+    wall = [1000.0]
+    monkeypatch.setattr('ingest_metrics.time.time', lambda: wall[0])
+    metrics = IngestMetrics()
+    metrics.observe('spool_stage', 90)
+    wall[0] += 1
+    for _ in range(100):
+        metrics.observe('spool_read', 98)
+    metrics.observe('spool_stage', 99.9)
+    recent = metrics.slow_operations()
+    assert len(recent) == 32
+    assert all(row == {'stage': 'spool_read', 'finished_at': 1001, 'duration_ms': 2000} for row in recent)
+    recent[0]['stage'] = 'changed'
+    assert metrics.slow_operations()[0]['stage'] == 'spool_read'
+    _, timings = metrics.snapshot(dict.fromkeys(metrics.COUNTERS, 0))
+    assert timings['spool_stage']['max_at'] == 1000
+    assert timings['spool_stage']['last_at'] == 1001

@@ -316,6 +316,11 @@ class AbuseIPDBEnricher:
             ttl_seconds=DEFAULT_TTL_SECONDS,
             max_entries=self.MEMORY_CACHE_MAX_ENTRIES,
         )  # 24h in-memory hot cache
+        # Repeated blocked packets must not read the same absent DB entry on
+        # every event while the external provider has no budget. This stores
+        # only a short retry delay, never a fabricated reputation result.
+        self._quota_misses = TTLCache(ttl_seconds=15, max_entries=1024,
+                                     prune_trigger_ratio=1.0)
         self.db = db  # Database instance for persistent threat cache
         self.enabled = bool(self.api_key)
         self._lock = threading.Lock()
@@ -500,7 +505,34 @@ class AbuseIPDBEnricher:
             except Exception:
                 pass
 
-    def lookup(self, ip_str: str) -> dict:
+    def quota_miss_active(self, ip_str: str) -> bool:
+        """Memory-only retry check, safe on the ingestion worker.
+
+        A renewed/unknown budget bypasses the delay immediately. Do not call
+        _check_rate_limit here: quota reset persistence can perform file/DB I/O.
+        """
+        if self._quota_misses.get(ip_str) is None:
+            return False
+        now = time.time()
+        # The provider can hold this lock while persisting a quota reset. Skip
+        # this optional optimization rather than make intake wait for that I/O.
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            if now < self._paused_until:
+                return True
+            if self._rate_limit_reset is not None:
+                try:
+                    if now > float(self._rate_limit_reset):
+                        return False
+                except (TypeError, ValueError):
+                    pass
+            return (self._rate_limit_remaining is not None
+                    and self._rate_limit_remaining <= self.SAFETY_BUFFER)
+        finally:
+            self._lock.release()
+
+    def lookup(self, ip_str: str, *, bypass_cooldown: bool = False) -> dict:
         """Check an IP against AbuseIPDB. Returns threat_score and categories.
         
         Lookup order:
@@ -519,19 +551,25 @@ class AbuseIPDBEnricher:
         cached = self.cache.get(ip_str)
         if cached is not None:
             return cached
+        if not bypass_cooldown and self.quota_miss_active(ip_str):
+            return {}
 
         # 2. Check persistent DB cache
+        db_missed = self.db is None
         if self.db:
             try:
                 db_result = self.db.get_threat_cache(ip_str, max_age_days=self.STALE_DAYS)
                 if db_result:
                     self.cache.set(ip_str, db_result)  # Promote to memory cache
                     return db_result
+                db_missed = True
             except Exception as e:
                 logger.debug("DB threat cache lookup failed for %s: %s", ip_str, e)
 
         # 3. Check rate limit before API call
         if not self._check_rate_limit():
+            if db_missed:
+                self._quota_misses.set(ip_str, {})
             return {}
 
         try:
@@ -564,6 +602,8 @@ class AbuseIPDBEnricher:
                 logger.warning("AbuseIPDB 429 — paused until %s",
                              time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self._paused_until)))
                 self._write_stats()
+                if db_missed:
+                    self._quota_misses.set(ip_str, {})
                 return {}
 
             resp.raise_for_status()
@@ -1097,7 +1137,8 @@ class Enricher:
             if threat_cached:
                 parsed.update(threat_cached)
             self._defer_network(ip_to_enrich, wants_rdns and not rdns_fresh,
-                                wants_threat and self.abuseipdb.enabled and not threat_cached)
+                                wants_threat and self.abuseipdb.enabled and not threat_cached
+                                and not self.abuseipdb.quota_miss_active(ip_to_enrich))
             return parsed
 
         # rDNS (skip for pihole — domain already in dns_query, or operator opt-out)

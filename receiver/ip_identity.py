@@ -4,7 +4,6 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from db import get_config
 from parsers import build_vpn_cidr_map, match_vpn_ip
 
 logger = logging.getLogger(__name__)
@@ -24,15 +23,16 @@ def load_identity_config(db) -> IdentityConfig:
 
     Returns a frozen snapshot safe to pass across function boundaries.
     """
-    gateway_vlans = get_config(db, 'gateway_ip_vlans') or {}
+    values = db.get_display_config()
+    gateway_vlans = values.get('gateway_ip_vlans') or {}
     if not isinstance(gateway_vlans, dict):
         logger.warning("Expected dict for gateway_ip_vlans, got %s — using empty", type(gateway_vlans).__name__)
         gateway_vlans = {}
-    wan_ip_names = get_config(db, 'wan_ip_names') or {}
+    wan_ip_names = values.get('wan_ip_names') or {}
     if not isinstance(wan_ip_names, dict):
         logger.warning("Expected dict for wan_ip_names, got %s — using empty", type(wan_ip_names).__name__)
         wan_ip_names = {}
-    vpn_networks = get_config(db, 'vpn_networks') or {}
+    vpn_networks = values.get('vpn_networks') or {}
     if not isinstance(vpn_networks, dict):
         logger.warning("Expected dict for vpn_networks, got %s — using empty", type(vpn_networks).__name__)
         vpn_networks = {}

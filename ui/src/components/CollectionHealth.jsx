@@ -26,8 +26,13 @@ const bytes = value => typeof value === 'number' ? `${(value / 1048576).toFixed(
 const milliseconds = value => typeof value === 'number' && Number.isFinite(value) ? `${value.toFixed(1)} ms` : 'Unknown'
 const STAGES = [
   ['parse', 'Parse packet'], ['enrich', 'Enrichment lookup'], ['spool_stage', 'Save retry batch'],
-  ['db_insert', 'Commit database batch'], ['spool_ack', 'Acknowledge retry batch'],
+  ['spool_read', 'Read retry batch'], ['db_insert', 'Commit database batch'], ['spool_ack', 'Acknowledge retry batch'],
 ]
+const PHASES = {
+  idle: 'Idle', spool_open: 'Opening retry storage', parse_enrich: 'Parsing and enriching',
+  spool_stage: 'Saving retry batch', spool_read: 'Reading retry batch',
+  db_insert: 'Committing database batch', spool_ack: 'Acknowledging retry batch',
+}
 
 function Metric({ label, value, detail, state }) {
   return (
@@ -41,20 +46,19 @@ function Metric({ label, value, detail, state }) {
   )
 }
 
-async function fetchCollectionHealth(_params, options) {
-  const [database, collector] = await Promise.allSettled([
-    apiFetch('/api/health', options), apiFetch('/api/health/ingest', options),
-  ])
-  return { database, collector }
-}
+const fetchDatabaseHealth = (_params, options) => apiFetch('/api/health', options)
+const fetchReceiverHealth = (_params, options) => apiFetch('/api/health/ingest', options)
 
 export default function CollectionHealth() {
-  const poll = useSerializedPoll({ params: {}, fetcher: fetchCollectionHealth, intervalMs: 10000 })
-  const health = poll.data?.database.status === 'fulfilled' ? poll.data.database.value : null
-  const ingestion = poll.data?.collector.status === 'fulfilled' ? poll.data.collector.value : null
-  const databaseError = poll.data?.database.status === 'rejected'
-  const snapshotError = poll.data?.collector.status === 'rejected'
-  const loaded = Boolean(poll.data)
+  // PostgreSQL can be the stalled component. Its slower summary must never
+  // hold up current receiver metrics or the next receiver-only refresh.
+  const collectorPoll = useSerializedPoll({ params: {}, fetcher: fetchReceiverHealth, intervalMs: 10000 })
+  const databasePoll = useSerializedPoll({ params: {}, fetcher: fetchDatabaseHealth, intervalMs: 60000 })
+  const health = databasePoll.error ? null : databasePoll.data
+  const ingestion = collectorPoll.error ? null : collectorPoll.data
+  const databaseError = Boolean(databasePoll.error)
+  const snapshotError = Boolean(collectorPoll.error)
+  const loaded = Boolean(collectorPoll.data || collectorPoll.error)
 
   const stats = ingestion?.stats || {}
   const queue = ingestion?.queue || {}
@@ -77,7 +81,10 @@ export default function CollectionHealth() {
           <h2 className="text-sm font-semibold text-gray-200">Collection health</h2>
           <p className="text-xs text-gray-500 mt-1">Current receiver session · refreshes while this tab is visible</p>
         </div>
-        <button type="button" onClick={() => poll.refresh()} disabled={poll.loading}
+        <button type="button" onClick={() => {
+          collectorPoll.refresh()
+          if (!databasePoll.loading) databasePoll.refresh()
+        }} disabled={collectorPoll.loading}
           className="text-xs text-teal-400 hover:text-teal-300 underline">Refresh health</button>
       </div>
       {!loaded ? <p role="status" className="text-sm text-gray-400">Loading collection health…</p> : <>
@@ -150,7 +157,7 @@ export default function CollectionHealth() {
             const worker = fresh ? ingestion?.workers?.[key] : null
             const workerState = worker?.failed ? 'error' : worker?.alive === true ? 'ready' : worker?.alive === false ? 'stalled' : 'unknown'
             return <Metric key={key} label={label} value={LABELS[workerState]} state={workerState}
-              detail={worker?.busy_since ? 'Working on a batch' : undefined} />
+              detail={PHASES[worker?.phase] || (worker?.busy_since ? 'Working on a batch' : undefined)} />
           })}
         </dl>
         <details className="border border-gray-800 rounded-lg p-3">
@@ -164,13 +171,23 @@ export default function CollectionHealth() {
           </dl>
           <div className="overflow-x-auto">
             <table className="w-full text-xs text-left" aria-label="Collection stage timings">
-              <thead className="text-gray-400"><tr><th className="py-2">Stage</th><th>Samples</th><th>Mean</th><th>Last</th><th>Maximum</th></tr></thead>
+              <thead className="text-gray-400"><tr><th className="py-2">Stage</th><th>Samples</th><th>Mean</th><th>Last</th><th>Maximum</th><th>Maximum observed</th></tr></thead>
               <tbody className="text-gray-300">{STAGES.map(([key, label]) => <tr key={key} className="border-t border-gray-800">
                 <th scope="row" className="py-2 font-normal">{label}</th><td>{number(timings[key]?.count)}</td>
                 <td>{milliseconds(timings[key]?.mean_ms)}</td><td>{milliseconds(timings[key]?.last_ms)}</td><td>{milliseconds(timings[key]?.max_ms)}</td>
+                <td>{timings[key]?.max_at ? new Date(timings[key].max_at * 1000).toLocaleString() : 'Unknown'}</td>
               </tr>)}</tbody>
             </table>
           </div>
+          {fresh && ingestion?.slow_operations?.length > 0 && <div className="mt-4">
+            <h3 className="text-xs font-medium text-gray-300">Recent operations over one second</h3>
+            <p className="text-xs text-gray-500 mt-1">Last 32 completed operations this session; a past delay does not mean collection is currently stalled.</p>
+            <ul className="text-xs text-gray-400 mt-2 space-y-1">{ingestion.slow_operations.slice(-32).reverse().map((operation, index) => (
+              <li key={`${operation.finished_at}-${index}`}>
+                {new Date(operation.finished_at * 1000).toLocaleString()} · {STAGES.find(([key]) => key === operation.stage)?.[1] || 'Collection operation'} · {milliseconds(operation.duration_ms)}
+              </li>
+            ))}</ul>
+          </div>}
         </details>
         <div className="border-t border-gray-800 pt-4">
           <h3 className="text-xs font-medium text-gray-300 mb-3">Enrichment providers</h3>
@@ -191,7 +208,8 @@ export default function CollectionHealth() {
           </p>
         </div>
         <p className="text-xs text-gray-500 border-t border-gray-800 pt-3">
-          Database rows: {health ? `approximately ${number(health.total_logs)}` : 'unavailable'}.
+          Database rows: {health ? `approximately ${number(health.total_logs)}` : databasePoll.loading ? 'loading' : 'unavailable'}.
+          {' '}Database summary refreshes every minute; receiver metrics refresh independently every ten seconds.
           {' '}Counters reset when the receiver restarts. UDP cannot confirm every event sent by the gateway; packets lost before reaching this process are not counted.
         </p>
       </>}

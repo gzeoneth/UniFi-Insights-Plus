@@ -56,6 +56,27 @@ def test_metrics_do_not_leak_unrecognized_payloads(read_snapshot):
     assert '203.0.113.2' not in json.dumps(result)
 
 
+def test_storage_phases_and_recent_delays_are_bounded_and_allowlisted(read_snapshot):
+    now = time.time()
+    result = read_snapshot(
+        spool={'storage': {'journal_mode': 'wal', 'synchronous': 'FULL', 'cache_kib': 16384,
+                           'head_cache_bytes': 2048, 'path': 'Synthetic secret'},
+               'operations': {'stage': {'phase': 'commit', 'phase_elapsed_seconds': 12,
+                                        'commit': {'last_seconds': 4, 'sql': 'Synthetic secret'},
+                                        'payload': 'Synthetic secret'}}},
+        workers={'producer': {'phase': 'spool_stage', 'phase_started_at': now, 'busy_since': now},
+                 'delivery': {'phase': {'bad': 'Synthetic secret'}}},
+        slow_operations=[{'stage': 'spool_ack', 'finished_at': now, 'duration_ms': 1250,
+                          'payload': 'Synthetic secret'}] * 40)
+    assert result['spool']['storage']['journal_mode'] == 'wal'
+    assert result['spool']['operations']['stage']['phase'] == 'commit'
+    assert result['spool']['operations']['stage']['commit']['last_seconds'] == 4
+    assert result['workers']['producer']['phase'] == 'spool_stage'
+    assert result['workers']['delivery']['phase'] is None
+    assert len(result['slow_operations']) == 32
+    assert 'Synthetic secret' not in json.dumps(result)
+
+
 @pytest.mark.parametrize('invalid', [float('nan'), float('inf'), 10 ** 400, -1, True, '12'])
 def test_invalid_numbers_are_unknown(read_snapshot, invalid):
     result = read_snapshot(rates={'window_seconds': 60, 'received_per_second': invalid},

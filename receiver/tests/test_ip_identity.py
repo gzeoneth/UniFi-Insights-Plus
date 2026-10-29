@@ -207,27 +207,28 @@ class TestAnnotateRecord:
 
 class TestLoadIdentityConfig:
     @patch('ip_identity.build_vpn_cidr_map')
-    @patch('ip_identity.get_config')
-    def test_loads_all_configs(self, mock_get_config, mock_build_vpn):
-        mock_get_config.side_effect = lambda db, key: {
-            'gateway_ip_vlans': {'192.168.1.1': {'vlan': 10}},
+    def test_loads_all_configs(self, mock_build_vpn):
+        db = MagicMock()
+        db.get_display_config.return_value = {
+            'gateway_ip_vlans': {'192.0.2.1': {'vlan': 20}},
             'wan_ip_names': {'203.0.113.5': 'ISP WAN'},
-            'vpn_networks': {'wg0': {'cidr': '10.13.13.0/24'}},
-        }.get(key)
+            'vpn_networks': {'wg0': {'cidr': '198.51.100.0/24'}},
+        }
         mock_build_vpn.return_value = [('fake_cidr_tuple',)]
 
-        cfg = load_identity_config(MagicMock())
+        cfg = load_identity_config(db)
 
-        assert '192.168.1.1' in cfg.gateway_vlans
+        assert '192.0.2.1' in cfg.gateway_vlans
         assert '203.0.113.5' in cfg.wan_ip_names
         assert len(cfg.vpn_cidrs) == 1
-        assert cfg.exclude_ips == {'192.168.1.1', '203.0.113.5'}
+        assert cfg.exclude_ips == {'192.0.2.1', '203.0.113.5'}
+        db.get_display_config.assert_called_once_with()
 
     @patch('ip_identity.build_vpn_cidr_map')
-    @patch('ip_identity.get_config')
-    def test_empty_configs(self, mock_get_config, mock_build_vpn):
-        mock_get_config.return_value = None
-        cfg = load_identity_config(MagicMock())
+    def test_empty_configs(self, mock_build_vpn):
+        db = MagicMock()
+        db.get_display_config.return_value = {}
+        cfg = load_identity_config(db)
 
         assert cfg.gateway_vlans == {}
         assert cfg.wan_ip_names == {}

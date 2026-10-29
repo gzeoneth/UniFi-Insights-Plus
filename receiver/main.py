@@ -20,6 +20,7 @@ import queue
 import tempfile
 import uuid
 from collections import deque
+from contextlib import contextmanager
 
 import schedule
 
@@ -32,6 +33,7 @@ from enrichment import Enricher
 from ingest_queue import RetrySpool, positive_env
 from ingest_metrics import IngestMetrics, bounded_seconds_env
 from ingest_health import collection_state
+from ingest_runtime import DEFAULT_QUEUE_CAPACITY, status_path
 from backfill import BackfillTask
 from blacklist import BlacklistFetcher
 from unifi_api import UniFiAPI
@@ -141,10 +143,11 @@ class SyslogReceiver:
             'queue_dropped', 'spool_dropped', 'spool_errors', 'delivery_attempts', 'retry_attempts',
             'shutdown_dropped',
         ), 0)
-        self.queue = queue.Queue(maxsize=positive_env('INGEST_QUEUE_CAPACITY', 4096, 65536))
+        self.queue = queue.Queue(maxsize=positive_env('INGEST_QUEUE_CAPACITY', DEFAULT_QUEUE_CAPACITY, 65536))
         self._worker = None
         self._delivery_worker = None
-        self._workers = {name: {'failed': False, 'last_progress_at': time.time(), 'busy_since': None}
+        self._workers = {name: {'failed': False, 'last_progress_at': time.time(), 'busy_since': None,
+                                'phase': 'idle', 'phase_started_at': None}
                          for name in ('producer', 'delivery')}
         self._health_worker = None
         self._stop_event = threading.Event()
@@ -165,13 +168,27 @@ class SyslogReceiver:
             'max_rows': positive_env('INGEST_SPOOL_MAX_ROWS', 100000, 1000000),
             'max_bytes': positive_env('INGEST_SPOOL_MAX_BYTES', 64 * 1024 * 1024, 512 * 1024 * 1024),
         }
-        self._status_path = os.environ.get('INGEST_STATUS_PATH',
-                                          '/run/unifi-log-insight/receiver-health.json')
+        self._status_path = status_path()
         self._load_disabled_types()
 
     def _count(self, key, count=1):
         with self._stats_lock:
             self.stats[key] += count
+
+    @contextmanager
+    def _worker_phase(self, worker, phase):
+        """Publish lock-free phase snapshots, including stage/read/ack waits."""
+        previous = self._workers[worker]
+        now = time.time()
+        self._workers[worker] = dict(previous, phase=phase, phase_started_at=now,
+                                     busy_since=previous['busy_since'] or now)
+        try:
+            yield
+        finally:
+            current = self._workers[worker]
+            self._workers[worker] = dict(current, phase=previous['phase'],
+                                         phase_started_at=previous['phase_started_at'],
+                                         busy_since=previous['busy_since'], last_progress_at=time.time())
 
     def _load_disabled_types(self):
         disabled = set()
@@ -246,7 +263,8 @@ class SyslogReceiver:
 
     def _process_queue(self):
         try:
-            self._ensure_spool()
+            with self._worker_phase('producer', 'spool_open'):
+                self._ensure_spool()
         except Exception:
             self._spool_failed = True
             self._count('spool_errors')
@@ -261,12 +279,11 @@ class SyslogReceiver:
                     pass
                 else:
                     try:
-                        self._workers['producer']['busy_since'] = time.time()
                         self._processing_rows = 1
-                        self._handle_message(data, addr, count_received=False)
+                        with self._worker_phase('producer', 'parse_enrich'):
+                            self._handle_message(data, addr, count_received=False)
                     finally:
                         self._processing_rows = 0
-                        self._workers['producer']['busy_since'] = None
                         self.queue.task_done()
                 self._maybe_flush_batch()
                 if self.geoip_reload_requested:
@@ -395,8 +412,9 @@ class SyslogReceiver:
         self.last_flush = time.monotonic()
         started = time.monotonic()
         try:
-            self._ensure_spool()
-            accepted, rejected = self._spool.stage(rows)
+            with self._worker_phase('producer', 'spool_stage'):
+                self._ensure_spool()
+                accepted, rejected = self._spool.stage(rows)
             self._count('staged', len(accepted))
             self._spool_state = self._spool.snapshot()
             self._spool_failed = False
@@ -422,8 +440,10 @@ class SyslogReceiver:
     def _retry_spool(self):
         if self._spool is None or not self._spool.rows or time.time() < self._db_retry_at:
             return
+        started = time.monotonic()
         try:
-            rows, retrying = self._spool.due_batch(self.batch_size)
+            with self._worker_phase('delivery', 'spool_read'):
+                rows, retrying = self._spool.due_batch(self.batch_size)
         except Exception:
             self._count('spool_errors')
             self._spool_failed = True
@@ -431,17 +451,18 @@ class SyslogReceiver:
             rate_limited_warning(logger, 'receiver.spool_read',
                                  "Ingest spool read failed; queued data retained", exc_info=True)
             return
+        finally:
+            self._metrics.observe('spool_read', started)
         if not rows:
             return
         self._count('delivery_attempts')
         if retrying:
             self._count('retry_attempts')
         started = time.monotonic()
-        self._workers['delivery']['busy_since'] = time.time()
-        self._workers['delivery']['last_progress_at'] = self._workers['delivery']['busy_since']
         rejected = 0
         try:
-            result = self.db.insert_logs_batch(rows)
+            with self._worker_phase('delivery', 'db_insert'):
+                result = self.db.insert_logs_batch(rows)
             # A missing/old DB contract must never turn failure into success.
             counts = (result.inserted, getattr(result, 'duplicates', 0), result.dropped)
             if (any(type(value) is not int or value < 0 for value in counts)
@@ -461,7 +482,6 @@ class SyslogReceiver:
                                  "Database insert failed; %d rows remain in durable spool", len(rows), exc_info=True)
         finally:
             self._metrics.observe('db_insert', started)
-            self._workers['delivery']['busy_since'] = None
         if retryable:
             rate_limited_warning(logger, 'receiver.db_retry',
                                  'Database deferred %d rows; retained in durable ingest spool', len(retryable))
@@ -473,7 +493,8 @@ class SyslogReceiver:
             self._db_retry_at = 0.0
         started = time.monotonic()
         try:
-            self._spool.acknowledge(rows, retryable)
+            with self._worker_phase('delivery', 'spool_ack'):
+                self._spool.acknowledge(rows, retryable)
             # A malformed row is not finally discarded until its spool removal
             # commits. Do not count the same rejection again after an ack retry.
             self._count('dropped', rejected)
@@ -522,6 +543,7 @@ class SyslogReceiver:
                                     'oldest_age_seconds': max(0, time.time() - oldest) if oldest else 0},
             'spool': dict(spool, failed=self._spool_failed),
             'workers': workers, 'rates': rates, 'timings': timings,
+            'slow_operations': self._metrics.slow_operations(),
             'batch': {'size': self.batch_size, 'flush_interval_seconds': self.batch_timeout,
                       'pending': len(self.batch), 'inflight': max(self._processing_rows, self._staging_rows),
                       'oldest_age_seconds': max(0, time.monotonic() - batch_started)

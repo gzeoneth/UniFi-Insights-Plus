@@ -188,6 +188,22 @@ describe('CollectionHealth', () => {
     expect(screen.getByRole('row', { name: /Parse packet/ })).toHaveTextContent('Unknown')
   })
 
+  it('shows the active storage phase and dates completed slow operations', async () => {
+    apiFetch.mockImplementation(url => Promise.resolve(url.endsWith('/ingest') ? {
+      ...ingestion, workers: { delivery: { alive: true, phase: 'spool_ack', busy_since: 1793099998 } },
+      timings: { spool_ack: { count: 2, mean_ms: 750, last_ms: 250, max_ms: 1250, max_at: 1793099990 } },
+      slow_operations: [{ stage: 'spool_ack', finished_at: 1793099990, duration_ms: 1250 }],
+    } : {}))
+    render(<CollectionHealth />)
+    await screen.findByText('Acknowledging retry batch')
+    fireEvent.click(screen.getByText('Collection performance details'))
+    expect(screen.getByRole('row', { name: /Acknowledge retry batch/ })).toHaveTextContent(
+      new Date(1793099990000).toLocaleString())
+    expect(screen.getByText('Recent operations over one second')).toBeTruthy()
+    expect(screen.getByText(/past delay does not mean collection is currently stalled/)).toBeTruthy()
+    expect(screen.getByRole('listitem')).toHaveTextContent('1250.0 ms')
+  })
+
   it('serializes a requested refresh behind slow health calls and stops polling while hidden', async () => {
     vi.useFakeTimers()
     const completions = []
@@ -201,5 +217,23 @@ describe('CollectionHealth', () => {
     fireEvent(document, new Event('visibilitychange'))
     await act(async () => { await vi.advanceTimersByTimeAsync(30000) })
     expect(apiFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps showing and refreshing receiver metrics while database health is pending', async () => {
+    vi.useFakeTimers()
+    apiFetch.mockImplementation(url => url.endsWith('/ingest')
+      ? Promise.resolve({ ...ingestion, workers: { delivery: { alive: true, phase: 'spool_ack' } } })
+      : new Promise(() => {}))
+    render(<CollectionHealth />)
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    expect(screen.getByText('Acknowledging retry batch')).toBeTruthy()
+    expect(screen.getByText('Refresh health')).not.toBeDisabled()
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000) })
+    expect(apiFetch.mock.calls.filter(([url]) => url.endsWith('/ingest'))).toHaveLength(2)
+    expect(apiFetch.mock.calls.filter(([url]) => url === '/api/health')).toHaveLength(1)
+    fireEvent.click(screen.getByText('Refresh health'))
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    expect(apiFetch.mock.calls.filter(([url]) => url.endsWith('/ingest'))).toHaveLength(3)
+    expect(apiFetch.mock.calls.filter(([url]) => url === '/api/health')).toHaveLength(1)
   })
 })

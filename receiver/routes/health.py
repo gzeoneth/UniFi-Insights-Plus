@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException
 from db import Database, estimate_log_count, get_config, is_external_db
 from enrichment import get_abuseipdb_stats
 from ingest_health import collection_state, receiver_state
+from ingest_runtime import status_path
 from deps import get_conn, put_conn, enricher_db, APP_VERSION
 
 logger = logging.getLogger('api.health')
@@ -29,8 +30,9 @@ _PROVIDER_NAMES = ('geoip', 'asn', 'rdns', 'abuseipdb', 'unifi')
 _PROVIDER_STATES = {'not_configured', 'ready', 'missing', 'error', 'pending'}
 _RATE_FIELDS = ('received_per_second', 'staged_per_second', 'inserted_per_second',
                 'dropped_per_second', 'queue_dropped_per_second')
-_TIMING_STAGES = ('parse', 'enrich', 'spool_stage', 'db_insert', 'spool_ack')
-_TIMING_FIELDS = ('count', 'total_ms', 'last_ms', 'max_ms', 'mean_ms')
+_TIMING_STAGES = ('parse', 'enrich', 'spool_stage', 'spool_read', 'db_insert', 'spool_ack')
+_TIMING_FIELDS = ('count', 'total_ms', 'last_ms', 'max_ms', 'mean_ms', 'last_at', 'max_at')
+_WORKER_PHASES = {'idle', 'spool_open', 'parse_enrich', 'spool_stage', 'spool_read', 'db_insert', 'spool_ack'}
 
 
 def _number(value, default=None):
@@ -64,6 +66,25 @@ def _performance_snapshot(raw, snapshot, now):
                                        'oldest_age_seconds')}
     snapshot['spool']['oldest_age_seconds'] = _number(
         _mapping(raw.get('spool')).get('oldest_age_seconds'))
+    storage = _mapping(_mapping(raw.get('spool')).get('storage'))
+    snapshot['spool']['storage'] = {
+        field: _number(storage.get(field)) for field in (
+            'cache_kib', 'head_cache_rows', 'head_cache_bytes', 'head_cache_max_bytes',
+            'wal_bytes', 'wal_checkpoint_bytes', 'wal_max_bytes', 'checkpoint_busy', 'checkpoint_errors')}
+    snapshot['spool']['storage']['journal_mode'] = (
+        storage.get('journal_mode') if storage.get('journal_mode') in ('wal', 'memory', 'delete') else None)
+    snapshot['spool']['storage']['synchronous'] = 'FULL' if storage.get('synchronous') == 'FULL' else None
+    snapshot['spool']['operations'] = {}
+    for name in ('stage', 'due', 'acknowledge'):
+        operation = _mapping(_mapping(_mapping(raw.get('spool')).get('operations')).get(name))
+        phase = operation.get('phase')
+        clean = {'phase': phase if phase in ('idle', 'waiting_lock', 'sql', 'commit', 'checkpoint') else None}
+        for field in ('phase_started_at', 'phase_elapsed_seconds', 'errors'):
+            clean[field] = _number(operation.get(field))
+        for timing in ('lock_wait', 'sql', 'commit', 'checkpoint'):
+            clean[timing] = {field: _number(_mapping(operation.get(timing)).get(field))
+                             for field in ('count', 'last_seconds', 'max_seconds', 'total_seconds')}
+        snapshot['spool']['operations'][name] = clean
     # Old receivers did not count staged records; do not imply they staged zero.
     snapshot['stats']['staged'] = _number(_mapping(raw.get('stats')).get('staged'))
     snapshot['workers'] = {}
@@ -71,12 +92,22 @@ def _performance_snapshot(raw, snapshot, now):
         worker = _mapping(_mapping(raw.get('workers')).get(name))
         clean = {field: worker.get(field) if isinstance(worker.get(field), bool) else None
                  for field in ('alive', 'failed')}
-        for field in ('last_progress_at', 'busy_since'):
+        for field in ('last_progress_at', 'busy_since', 'phase_started_at'):
             value = _number(worker.get(field))
             clean[field] = value if value and value <= now + 5 else None
         clean['progress_age_seconds'] = (
             max(0, now - clean['last_progress_at']) if clean['last_progress_at'] else None)
+        phase = worker.get('phase')
+        clean['phase'] = phase if isinstance(phase, str) and phase in _WORKER_PHASES else None
         snapshot['workers'][name] = clean
+    snapshot['slow_operations'] = []
+    operations = raw.get('slow_operations')
+    for operation in operations[-32:] if isinstance(operations, list) else []:
+        operation = _mapping(operation)
+        stage, finished = operation.get('stage'), _number(operation.get('finished_at'))
+        duration = _number(operation.get('duration_ms'))
+        if stage in _TIMING_STAGES and finished and finished <= now + 5 and duration is not None:
+            snapshot['slow_operations'].append(dict(stage=stage, finished_at=finished, duration_ms=duration))
 
 
 def read_ingest_health():
@@ -88,7 +119,7 @@ def read_ingest_health():
     unavailable = {'status': 'unavailable', 'state': 'unknown', 'updated_at': None,
                    'age_seconds': None, 'providers': {}}
     unavailable['collection'] = collection_state(unavailable)
-    path = os.environ.get('INGEST_STATUS_PATH', '/run/unifi-log-insight/receiver-health.json')
+    path = status_path()
     try:
         with open(path, 'r', encoding='utf-8') as stream:
             payload = stream.read(65537)

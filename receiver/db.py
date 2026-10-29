@@ -21,6 +21,7 @@ from psycopg2 import pool, extras, sql as pg_sql
 from psycopg2.extras import Json
 
 from security_predicates import SECURITY_INDEXES
+from read_cache import ReadCache
 
 logger = logging.getLogger(__name__)
 
@@ -330,6 +331,10 @@ class Database:
         self.max_conn = max_conn
         self._index_maintenance_connection = None
         self._index_maintenance_stop = False
+        # Only display labels use this cache. Auth, filters, policies and
+        # ordinary get_config reads retain their existing immediate semantics.
+        self._display_config_cache = ReadCache(seconds=10, max_entries=1,
+                                              max_bytes=1024 * 1024)
 
     def connect(self):
         """Initialize the connection pool."""
@@ -1811,6 +1816,23 @@ END $$;""",
 
     # ── System configuration ──────────────────────────────────────────────────
 
+    _DISPLAY_CONFIG_KEYS = ('gateway_ip_vlans', 'wan_ip_names', 'vpn_networks')
+
+    def get_display_config(self):
+        """One bounded snapshot for API labels instead of three reads per page.
+
+        Writes through this Database instance invalidate after commit. Other
+        processes' updates become visible within ten seconds. This cache is
+        deliberately unavailable to authorization or event query predicates.
+        """
+        def load():
+            with self.get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute('SELECT key, value FROM system_config WHERE key = ANY(%s)',
+                                [list(self._DISPLAY_CONFIG_KEYS)])
+                    return dict(cur.fetchall())
+        return self._display_config_cache.get_or_load('identity', load)
+
     def get_config(self, key: str, default=None):
         """Fetch a config value from system_config table.
 
@@ -1836,6 +1858,8 @@ END $$;""",
                     ON CONFLICT (key) DO UPDATE
                     SET value = EXCLUDED.value, updated_at = NOW()
                 """, [key, Json(value)])  # Use Json() for proper JSONB handling
+        if key in self._DISPLAY_CONFIG_KEYS:
+            self._display_config_cache.clear()
 
 
     # ── rDNS cache (issue #98) ───────────────────────────────────────────────

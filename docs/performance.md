@@ -42,21 +42,41 @@ These aggregations still inspect the selected time window. A top-200 result does
 
 UDP reception, parsing/staging and database delivery have separate workers. A slow PostgreSQL batch no longer holds up the worker writing new records to the SQLite retry spool. Staging and acknowledgement retain durable SQLite commits, and database commits remain synchronous before spool acknowledgement. Ingest IDs prevent duplicate rows after a retry or crash following a database commit.
 
+Version `.7` uses SQLite WAL with `synchronous=FULL`, batched insert/delete/lookups, and a bounded cache of committed retry payloads. It removes an unused retry-time index: delivery uses FIFO row order instead. WAL reduces journal creation and synchronization overhead while preserving durable admission. The page cache defaults to 16 MiB; the head cache holds at most 512 rows and 1 MiB of serialized payloads, plus Python object overhead. Cached payloads are decoded into independent rows for each delivery attempt.
+
+Keep the spool on a local persistent volume. It is **not** an in-memory database. One receiver owns each spool, with one locked connection shared by its workers. Writes and checkpoints use that same connection. Checkpoints run near 4 MiB of WAL; if an external reader pins the WAL, new writes stop at a 16 MiB threshold until it can be checkpointed. One bounded transaction may exceed the threshold. Inspect checkpoint and storage-error metrics if this happens; do not leave a diagnostic read transaction open.
+
+The WAL file is part of the database. For a live backup use SQLite's backup API; for a filesystem copy stop the receiver cleanly first and retain the whole spool directory. Do not copy only `retry.sqlite3` from a running receiver or delete its `-wal` file. See SQLite's [WAL documentation](https://www.sqlite.org/wal.html) and [synchronous settings](https://www.sqlite.org/pragma.html#pragma_synchronous).
+
 The in-memory queue and the current uncommitted batch remain volatile. The disk spool has finite capacity. UDP cannot report packets lost before the receiver sees them, so zero application drops does not establish lossless transport.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `INGEST_BATCH_SIZE` | `200` | Maximum records per staging/delivery batch; capped at 1,000 |
 | `INGEST_FLUSH_INTERVAL_SECONDS` | `1.0` | Flush partial staging batches; valid values are bounded to 0.05–5 seconds |
-| `INGEST_QUEUE_CAPACITY` | `4096` | Maximum volatile intake messages |
+| `INGEST_QUEUE_CAPACITY` | `16384` | Maximum volatile intake messages; up to 128 MiB of UDP payload plus Python overhead at the 8 KiB receive limit |
 | `INGEST_SPOOL_MAX_ROWS` | `100000` | Maximum disk-spool records |
 | `INGEST_SPOOL_MAX_BYTES` | `67108864` | Maximum disk-spool payload bytes |
+| `INGEST_SPOOL_CACHE_KIB` | `16384` | SQLite page-cache target in KiB; capped at 65,536 |
+| `INGEST_SPOOL_HEAD_CACHE_BYTES` | `1048576` | Serialized retry-head cache limit; capped at 8 MiB and 512 rows |
 
 Larger batches amortize commit cost but use more memory and can increase latency. Queue and spool capacity absorb a burst; they do not fix sustained intake exceeding delivery. Start with the defaults and compare received, staged and inserted rates over a representative busy period before increasing limits. Spool byte limits describe stored payloads, not an exact bound on SQLite filesystem usage.
+
+Existing environment overrides still apply after upgrading. An installation explicitly using `INGEST_QUEUE_CAPACITY=4096` will keep that value until changed. The larger default buys time during a finite storage pause; queued packets and uncommitted batches can still be lost if the process exits before staging. It does not make UDP reliable.
+
+Display labels use one batched configuration read cached for ten seconds, bounded to 1 MiB per database instance. Local committed configuration writes invalidate that cache; writes from another process become visible within the TTL. Concurrent readers share a load for the same key. Authorization, filtering policies and event/security query results do not use this cache. Existing metadata endpoint caches now include all arguments in their keys and have entry/byte limits.
+
+When reputation quota is exhausted, confirmed cache misses have a fifteen-second retry delay, bounded to 1,024 addresses. This avoids reading the same missing database record for each repeated packet. Positive in-memory results, renewed quota and explicit manual refresh bypass that delay. A missing reputation score remains unknown; the cooldown does not create a score or bypass the provider's quota.
 
 ## Health
 
 The database-independent `/api/health/ingest` snapshot includes rolling rates, queue/spool age, producer and delivery worker state, batch settings and stage timings. Older snapshots report unavailable new metrics as unknown. Stale snapshots do not claim a current throughput rate.
+
+The Collection Health panel polls receiver metrics independently every ten seconds and the database summary every minute. A pending database request cannot hide a completed receiver snapshot or stop its next refresh. Manual refresh still works for the receiver while the database request is pending, without starting another database request.
+
+By default health snapshots use `/dev/shm/unifi-log-insight/receiver-health.json` where shared memory exists, with `/run` as the fallback. Docker provides `/dev/shm` as tmpfs, so two-second health publication does not require persistent-volume writes. The receiver and API run in the same container and use the same path. `INGEST_STATUS_PATH` still overrides the default: remove an old `/run` override or update it to use shared memory. Only these disposable metrics move to RAM; the retry spool stays persistent.
+
+Worker phases include opening, staging, reading and acknowledging the spool, so a partial-batch commit or acknowledgement wait cannot appear idle. Storage metrics separate lock wait, SQL work, commit and checkpoint time. Maximum timings have timestamps, and the last 32 completed operations taking at least one second remain available until restart. The Collection Health panel shows these recent delays separately from current collection status. These timings narrow an investigation; they do not identify a host disk fault by themselves.
 
 Recent queued, batched or currently writing events show **Processing recent events** without an amber warning. Pending counts and completeness metadata remain available. Attention is required when recorded waiting time exceeds the greater of ten seconds or twice the flush interval, when the intake queue reaches 80% of capacity, or when retries, worker/storage failure, stalls or stale/missing health data prevent a healthy assessment.
 
