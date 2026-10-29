@@ -2,6 +2,15 @@
 
 The changes were tested against the upstream v3.7.2 base using synthetic events and disposable local databases. No live collector, gateway or production database was modified for these checks.
 
+## GeoIP concurrency audit fix: 3.7.2-gzeon.9
+
+The audit reproduced a `.8` regression: a slow background GeoIP read held the shared reader lock and prevented an unrelated cold lookup on the ingestion worker from proceeding. A receiver-level test failed before the fix and passed after it. Reader leases now permit concurrent lookups while keeping old readers open until their users finish. Replacement results cannot enter the wrong cache generation. Serialized reloads and one retirement worker bound retained reader pairs, including during a stalled lookup or close.
+
+- All 1,354 backend tests passed with disposable PostgreSQL integration enabled. GeoIP concurrency tests passed in twenty consecutive runs. Independent checks covered unrelated reads, old/new cache isolation, queued reload bounds, shutdown with active generations, close during file opening and exception-path lease release.
+- The local ARM64 image passed the concurrency reproduction using actual MaxMind synthetic test databases: a cold lookup completed while another read remained blocked, replacement readers served immediately, and shutdown returned before old-reader retirement. Its enrichment source hash matched the reviewed source. No frontend code changed; AMD64 and production storage were not tested in this run.
+- The broader spool audit found no actionable defect in 15,000 randomized operations and twelve abrupt-exit/reopen cases, including recovery with `.6` and `.7` code. A separate PostgreSQL audit checked 4,896 mixed entries and their replay, synchronous commits and unchanged metadata updates. These are bounded tests, not proof against every failure or physical power loss.
+- Dense malformed batches remain more expensive than `.7`: a synthetic 1,000-row all-invalid-INET batch took approximately 1.2 seconds versus 0.42 seconds, while a 200-row batch with one invalid row improved from 198 to 25 ms. The extra round trips did not produce incorrect acknowledgements or stored duplicates. This is an error-path cost to monitor, separate from the fixed GeoIP lock regression.
+
 ## Coalesced cleanup and caching: 3.7.2-gzeon.8
 
 - All 1,348 backend tests passed with disposable PostgreSQL integration enabled. A local ARM64 image received and stored all 1,210 synthetic UDP events with zero reported drops/errors. Cursor pages, DNS parsing, log/flow/CSV exclusions and rule counts agreed. No frontend source changed; AMD64 and production storage were not tested in this run.

@@ -76,6 +76,8 @@ When reputation quota is exhausted, confirmed cache misses have a fifteen-second
 
 GeoIP/ASN results use an 8,192-entry cache with a one-hour TTL. Returned values are independent copies. Successful MMDB replacement invalidates the cache; failed or missing replacements preserve working readers. Reload file opening runs on a separate maintenance worker so it does not hold staging or database delivery. The cache avoids repeated MMDB lookups for active peers, but adds bookkeeping for cold addresses. It does not cache event queries or change security filters.
 
+Version `.9` also permits unrelated cold GeoIP lookups to run concurrently. In `.8`, a slow background lookup held a reader lock needed by ingestion. Each lookup now retains its reader pair until it finishes; a short lock protects only the pair/cache selection and reference counts. Reload publishes the new pair immediately and closes the old pair after its readers finish. Further reloads wait for retirement, bounding retained mappings; shutdown queues retirement without waiting for a slow lookup or close. A lookup already in flight can finish using its original pair, but cannot populate the replacement cache. This follows MaxMind's [concurrent-read guidance](https://github.com/maxmind/MaxMind-DB-Reader-python#thread-safety) while preventing close during a read.
+
 ## Health
 
 The database-independent `/api/health/ingest` snapshot includes rolling rates, queue/spool age, producer and delivery worker state, batch settings and stage timings. Older snapshots report unavailable new metrics as unknown. Stale snapshots do not claim a current throughput rate.

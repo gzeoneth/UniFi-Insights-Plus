@@ -222,6 +222,15 @@ class TTLCache:
 
 # ── GeoIP Enrichment ─────────────────────────────────────────────────────────
 
+class _GeoIPGeneration:
+    """Reader leases and retirement state, guarded by the enricher condition."""
+
+    def __init__(self):
+        self.active = 0
+        self.readers = ()
+        self.closed = threading.Event()
+
+
 class GeoIPEnricher:
     """MaxMind lookups with a bounded cache of scalar result fields."""
 
@@ -233,7 +242,10 @@ class GeoIPEnricher:
         self.asn_reader = None
         self.db_dir = db_dir
         self._reader_lock = threading.Lock()
-        self._close_lock = threading.Lock()
+        self._reader_condition = threading.Condition(self._reader_lock)
+        self._reload_lock = threading.Lock()
+        self._reader_generation = _GeoIPGeneration()
+        self._retired_generations = []
         self._close_worker = None
         self._closed = False
         self._cache = self._new_cache()
@@ -253,7 +265,28 @@ class GeoIPEnricher:
                 except Exception:
                     logger.debug("Failed to close MaxMind reader", exc_info=True)
 
+    def _retire_current_locked(self):
+        generation = self._reader_generation
+        generation.readers = (self.city_reader, self.asn_reader)
+        if any(reader is not None for reader in generation.readers):
+            self._retired_generations.append(generation)
+            if self._close_worker is None:
+                self._close_worker = threading.Thread(
+                    target=self._finish_close, name='geoip-close', daemon=True)
+                self._close_worker.start()
+            self._reader_condition.notify_all()
+        else:
+            generation.closed.set()
+        return generation
+
     def _load_databases(self, db_dir: str):
+        # Serialize opening as well as retirement. A stuck old reader retains
+        # at most its generation and the working replacement, even if further
+        # reload requests arrive. Lookups do not take this lock.
+        with self._reload_lock:
+            return self._replace_databases(db_dir)
+
+    def _replace_databases(self, db_dir: str):
         # File opening may wait on storage. Keep the working readers and cache
         # available while replacement files are opened in the reload worker.
         if self._closed:
@@ -290,19 +323,21 @@ class GeoIPEnricher:
             logger.error("Failed to load MaxMind databases: %s", e)
             return False
 
-        # Cold lookups hold this lock, so no lookup can still be using an old
-        # mmap when it is closed. Cache hits never wait for a cold lookup.
-        with self._reader_lock:
+        with self._reader_condition:
             if self._closed:
-                old_city, old_asn = city_reader, asn_reader
-                installed = False
+                old_generation = None
             else:
-                old_city, old_asn = self.city_reader, self.asn_reader
+                old_generation = self._retire_current_locked()
                 self.city_reader, self.asn_reader = city_reader, asn_reader
+                self._reader_generation = _GeoIPGeneration()
                 self._cache = self._new_cache()
-                installed = True
-        self._close_readers(old_city, old_asn)
-        return installed
+        if old_generation is None:
+            self._close_readers(city_reader, asn_reader)
+            return False
+        # New lookups already use the replacement. Only the reload worker waits
+        # for old leases and close(), bounding retained mappings and workers.
+        old_generation.closed.wait()
+        return True
 
     def reload(self):
         """Replace readers and invalidate cached results after a successful load."""
@@ -319,20 +354,33 @@ class GeoIPEnricher:
         cached = self._cache.get(ip_str)
         if cached is not None:
             return dict(cached)
-        with self._reader_lock:
+        with self._reader_condition:
             if self._closed:
                 return {}
-            # A concurrent lookup or reload may have populated/replaced it.
+            # Capture one reader pair and cache generation. MaxMind permits
+            # concurrent reads; only reader retirement must wait for leases.
             cache = self._cache
             cached = cache.get(ip_str)
             if cached is not None:
                 return dict(cached)
-            result, complete = self._lookup_readers(ip_str)
-            if complete and not self._closed:
+            generation = self._reader_generation
+            generation.active += 1
+            city_reader, asn_reader = self.city_reader, self.asn_reader
+        try:
+            result, complete = self._lookup_readers(ip_str, city_reader, asn_reader)
+            with self._reader_condition:
+                current = generation is self._reader_generation and not self._closed
+            if complete and current:
+                # Always write the captured cache. A concurrent reload cannot
+                # let this old result populate its replacement cache.
                 cache.set(ip_str, dict(result))
             return result
+        finally:
+            with self._reader_condition:
+                generation.active -= 1
+                self._reader_condition.notify_all()
 
-    def _lookup_readers(self, ip_str):
+    def _lookup_readers(self, ip_str, city_reader, asn_reader):
         try:
             from geoip2.errors import AddressNotFoundError
         except ImportError:
@@ -340,9 +388,9 @@ class GeoIPEnricher:
 
         result = {}
         complete = True
-        if self.city_reader:
+        if city_reader:
             try:
-                resp = self.city_reader.city(ip_str)
+                resp = city_reader.city(ip_str)
                 result['geo_country'] = resp.country.iso_code
                 result['geo_city'] = resp.city.name
                 if resp.location:
@@ -353,9 +401,9 @@ class GeoIPEnricher:
             except Exception:
                 complete = False  # A transient failure must not poison the cache.
 
-        if self.asn_reader:
+        if asn_reader:
             try:
-                resp = self.asn_reader.asn(ip_str)
+                resp = asn_reader.asn(ip_str)
                 result['asn_number'] = resp.autonomous_system_number
                 result['asn_name'] = resp.autonomous_system_organization
             except AddressNotFoundError:
@@ -365,30 +413,35 @@ class GeoIPEnricher:
         return result, complete
 
     def _finish_close(self):
-        with self._reader_lock:
-            old_city, old_asn = self.city_reader, self.asn_reader
-            self.city_reader = self.asn_reader = None
-        self._close_readers(old_city, old_asn)
+        # One worker owns all reader closes. Keep closing generations in the
+        # list until finished, so a slow close cannot spawn another worker.
+        while True:
+            with self._reader_condition:
+                while True:
+                    generation = next((item for item in self._retired_generations
+                                       if item.active == 0), None)
+                    if generation is not None:
+                        break
+                    if not self._retired_generations:
+                        self._close_worker = None
+                        return
+                    self._reader_condition.wait()
+            self._close_readers(*generation.readers)
+            with self._reader_condition:
+                self._retired_generations.remove(generation)
+                generation.closed.set()
+                self._reader_condition.notify_all()
 
     def close(self):
-        # A cold mmap lookup can be stalled on host storage. Shutdown must not
-        # wait for it or close its live reader. One daemon retires it afterward.
-        with self._close_lock:
+        # Neither a cold lookup nor closing an mmap may hold up shutdown.
+        # Retire through the same bounded worker used by database reloads.
+        with self._reader_condition:
             if self._closed:
                 return
             self._closed = True
             self._cache = self._new_cache()
-        if self._reader_lock.acquire(blocking=False):
-            try:
-                old_city, old_asn = self.city_reader, self.asn_reader
-                self.city_reader = self.asn_reader = None
-            finally:
-                self._reader_lock.release()
-            self._close_readers(old_city, old_asn)
-        else:
-            self._close_worker = threading.Thread(
-                target=self._finish_close, name='geoip-close', daemon=True)
-            self._close_worker.start()
+            self._retire_current_locked()
+            self.city_reader = self.asn_reader = None
 
 
 # ── AbuseIPDB Enrichment ─────────────────────────────────────────────────────

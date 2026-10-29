@@ -57,6 +57,47 @@ def test_slow_reload_does_not_block_staging_or_delivery(receiver):
         release.set()
 
 
+def test_background_geoip_read_does_not_block_unrelated_ingestion(receiver, tmp_path):
+    from enrichment import GeoIPEnricher
+
+    geoip = GeoIPEnricher(str(tmp_path / 'synthetic-mmdb'))
+    entered, release, delivered = threading.Event(), threading.Event(), threading.Event()
+    city = MagicMock()
+
+    def lookup(ip):
+        if ip == '192.0.2.1':
+            entered.set()
+            assert release.wait(10)
+        return SimpleNamespace(country=SimpleNamespace(iso_code='AU'),
+                               city=SimpleNamespace(name='Example city'), location=None)
+
+    city.city.side_effect = lookup
+    geoip.city_reader = city
+    receiver.enricher.enrich.side_effect = lambda row, **kwargs: {
+        **row, **geoip.lookup('198.51.100.2')}
+
+    def insert(rows):
+        assert rows[0]['geo_country'] == 'AU'
+        delivered.set()
+        return SimpleNamespace(inserted=len(rows), duplicates=0, dropped=0, retryable=[])
+
+    receiver.db.insert_logs_batch.side_effect = insert
+    background = threading.Thread(target=lambda: geoip.lookup('192.0.2.1'), daemon=True)
+    background.start()
+    try:
+        assert entered.wait(2)
+        receiver._start_workers()
+        receiver._accept_datagram(b'synthetic unrelated cold lookup', ('192.0.2.10', 514))
+        assert delivered.wait(2), 'Background GeoIP read held ingestion'
+        assert receiver.stats['staged'] == 1
+        assert receiver.stats['dropped'] == 0
+    finally:
+        release.set()
+        background.join(2)
+        receiver.stop()
+        geoip.close()
+
+
 def test_reload_requests_coalesce_and_worker_recovers_after_failure(receiver):
     entered, release, second = threading.Event(), threading.Event(), threading.Event()
     calls = []
