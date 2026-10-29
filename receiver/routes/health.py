@@ -160,6 +160,8 @@ def read_ingest_health():
             snapshot['stats']['retry_attempts'] = None
         spool = raw.get('spool')
         snapshot['spool']['failed'] = isinstance(spool, dict) and spool.get('failed') is True
+        for field in ('stored_rows', 'ack_pending_rows', 'ack_pending_bytes', 'ack_pending_age_seconds'):
+            snapshot['spool'][field] = _number(spool.get(field)) if isinstance(spool, dict) else None
         _performance_snapshot(raw, snapshot, now)
         providers = raw.get('providers')
         providers = providers if isinstance(providers, dict) else {}

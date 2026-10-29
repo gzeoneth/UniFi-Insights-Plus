@@ -2,6 +2,26 @@
 
 The changes were tested against the upstream v3.7.2 base using synthetic events and disposable local databases. No live collector, gateway or production database was modified for these checks.
 
+## Coalesced cleanup and caching: 3.7.2-gzeon.8
+
+- All 1,348 backend tests passed with disposable PostgreSQL integration enabled. A local ARM64 image received and stored all 1,210 synthetic UDP events with zero reported drops/errors. Cursor pages, DNS parsing, log/flow/CSV exclusions and rule counts agreed. No frontend source changed; AMD64 and production storage were not tested in this run.
+- The image committed 300 events to PostgreSQL, queued their SQLite cleanup in RAM, and was killed before that cleanup. A fresh process replayed all 300 as duplicates, leaving exactly 300 unique database rows and an empty, valid spool. Admission remained SQLite WAL/FULL and PostgreSQL synchronous commit remained enabled. This tests process death, not host power failure.
+- Independent checks covered 4,000 randomized spool operations, FIFO/capacity/retry accounting, failed cleanup/admission, pinned-WAL recovery, bounded acknowledgement memory, cold-reader/reload/shutdown races and slow reloads that do not block staging or database delivery.
+
+The following synthetic comparisons use `.7` as baseline and the same FULL durability setting. Each spool case stages/delivers 6,000 events of roughly 650 bytes. Bytes are requested SQLite writes, not physical SSD writes.
+
+| Spool workload | Sync calls before → after | Requested write bytes before → after |
+| --- | ---: | ---: |
+| Steady, batch 60 | 215 → 113 | 10,888,828 → 5,533,108 |
+| Steady, batch 200 | 75 → 43 | 10,396,604 → 10,209,532 |
+| Full backlog, batch 200 | 75 → 51 | 19,666,916 → 18,629,660 |
+
+With 5 ms injected per sync, steady batch-60 time fell from 1.78 to 1.01 seconds. A separate paced 30,000-event concurrent test reduced syncs from 997 to 534 and requested writes from 75.23 to 37.42 MB. Stage p95 fell from 20.76 to 12.02 ms, while acknowledgement p95 fell from 22.97 to 0.83 ms. All unique IDs were delivered. Both concurrent runs lasted approximately ten seconds because input was paced; this is a latency comparison, not a higher throughput claim.
+
+Real PostgreSQL tests found a 200-row batch with one malformed row needed 199 commits before and one after, with median time 288 to 29 ms. Repeating an unchanged threat-detail patch over 10,000 rows changed 10,000 updates to zero, reducing approximately 12 MB WAL to 0–35 KB. First-time and changed metadata still update normally. Ordinary valid batches still use one commit; these tests do not identify malformed data or backfill as the production stall's cause.
+
+The GeoIP cache reduced reader calls from 60,000 to 16 for 30,000 events involving eight repeated addresses, with median time 146.12 to 6.43 ms. All-cold misses cost 17.26 to 28.84 ms for 12,000 addresses. Cache bookkeeping therefore has a cost when addresses never repeat. Positive-cache Python allocation peaked around 5.87 MB in the synthetic memory test; this is not a universal RSS bound. These measurements show less repeated MMDB work, not measured physical disk savings.
+
 ## Ingestion I/O release: 3.7.2-gzeon.7
 
 - All 1,306 backend tests passed with disposable PostgreSQL integration enabled; all 329 UI tests and the production UI build passed. A local ARM64 image passed actual UDP-to-PostgreSQL/filter checks. AMD64 and production storage were not tested in this run.

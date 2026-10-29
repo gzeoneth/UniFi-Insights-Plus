@@ -12,6 +12,7 @@ from the locally available v3.7.2 Git tag; dump/restore use that container's own
 matching PostgreSQL tools, so host client installation is unnecessary.
 """
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 import os
@@ -182,11 +183,11 @@ def test_dump_restore_upgrade_and_cef_backfill_are_lossless_and_idempotent(upgra
 
 def test_actual_insert_counts_dedupe_across_pages_and_isolate_bad_rows(upgrade_clone):
     db = upgrade_clone.db
-    rows = [_row('synthetic batch ' + str(index)) for index in range(250)]
+    rows = [_row('synthetic batch ' + str(index)) for index in range(1250)]
     result = db.insert_logs_batch(rows + [rows[37]])
-    assert (result.inserted, result.duplicates, result.dropped, result.retryable) == (250, 1, 0, [])
+    assert (result.inserted, result.duplicates, result.dropped, result.retryable) == (1250, 1, 0, [])
     replay = db.insert_logs_batch(rows)
-    assert (replay.inserted, replay.duplicates, replay.dropped, replay.retryable) == (0, 250, 0, [])
+    assert (replay.inserted, replay.duplicates, replay.dropped, replay.retryable) == (0, 1250, 0, [])
     batch = [_row('valid before invalid'), _row('bad inet', src_ip='not-an-ip'),
              _row('bad integer', src_port='not-a-port'), _row('bad NUL \x00 raw'),
              _row('bad NUL array', threat_categories=['synthetic\x00category']),
@@ -198,6 +199,154 @@ def test_actual_insert_counts_dedupe_across_pages_and_isolate_bad_rows(upgrade_c
             cur.execute('SELECT raw_log FROM logs WHERE ingest_id = ANY(%s::uuid[]) ORDER BY raw_log',
                         [[row['ingest_id'] for row in batch]])
             assert cur.fetchall() == [('valid after invalid',), ('valid before invalid',)]
+
+
+def test_one_invalid_row_does_not_force_per_row_commits(upgrade_clone, monkeypatch):
+    db = upgrade_clone.db
+    original = db.get_conn
+    transactions = {'commits': 0, 'rollbacks': 0}
+
+    @contextmanager
+    def counted_connection():
+        try:
+            with original() as conn:
+                yield conn
+        except Exception:
+            transactions['rollbacks'] += 1
+            raise
+        else:
+            transactions['commits'] += 1
+
+    rows = [_row(f'synthetic isolation {index}') for index in range(200)]
+    rows[97]['src_ip'] = 'synthetic-invalid-address'
+    monkeypatch.setattr(db, 'get_conn', counted_connection)
+    result = db.insert_logs_batch(rows + [rows[33]])
+    assert (result.inserted, result.duplicates, result.dropped, result.retryable) == (199, 1, 1, [])
+    assert transactions == {'commits': 1, 'rollbacks': 1}
+
+
+def test_bad_later_values_page_rolls_back_earlier_pages_before_isolation(upgrade_clone):
+    db = upgrade_clone.db
+    rows = [_row(f'synthetic paged isolation {index}') for index in range(1100)]
+    rows[1098]['src_ip'] = 'synthetic-invalid-address'
+    result = db.insert_logs_batch(rows + [rows[10], rows[1050]])
+    assert (result.inserted, result.duplicates, result.dropped, result.retryable) == (1099, 2, 1, [])
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT COUNT(*) FROM logs WHERE ingest_id = ANY(%s::uuid[])',
+                        [[row['ingest_id'] for row in rows]])
+            assert cur.fetchone()[0] == 1099
+
+
+@pytest.mark.parametrize('after_commit', [False, True])
+def test_isolated_batch_commit_failure_never_acknowledges_rows(upgrade_clone, monkeypatch, after_commit):
+    db = upgrade_clone.db
+    original = db.get_conn
+    calls = 0
+
+    @contextmanager
+    def failing_connection():
+        nonlocal calls
+        calls += 1
+        current_call = calls
+        with original() as conn:
+            yield conn
+            if current_call == 2 and not after_commit:
+                raise psycopg2.OperationalError('synthetic failure before commit')
+        if current_call == 2 and after_commit:
+            raise psycopg2.OperationalError('synthetic lost commit acknowledgement')
+
+    rows = [_row('synthetic isolation before'),
+            _row('synthetic invalid inet', src_ip='invalid-address'),
+            _row('synthetic isolation after')]
+    monkeypatch.setattr(db, 'get_conn', failing_connection)
+    result = db.insert_logs_batch(rows)
+    assert (result.inserted, result.duplicates, result.dropped) == (0, 0, 0)
+    assert result.retryable == rows
+    monkeypatch.setattr(db, 'get_conn', original)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT COUNT(*) FROM logs WHERE ingest_id = ANY(%s::uuid[])',
+                        [[row['ingest_id'] for row in rows]])
+            assert cur.fetchone()[0] == (2 if after_commit else 0)
+    replay = db.insert_logs_batch(rows)
+    assert (replay.inserted, replay.duplicates, replay.dropped, replay.retryable) == (
+        0 if after_commit else 2, 2 if after_commit else 0, 1, [])
+
+
+def test_transient_failure_during_isolation_rolls_back_valid_segments(upgrade_clone):
+    db = upgrade_clone.db
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('''CREATE FUNCTION synthetic_isolation_retry() RETURNS trigger AS $$
+                BEGIN
+                    IF NEW.raw_log = 'synthetic isolation serialization' THEN
+                        RAISE EXCEPTION 'synthetic retry' USING ERRCODE='40001';
+                    END IF;
+                    RETURN NEW;
+                END; $$ LANGUAGE plpgsql''')
+            cur.execute('''CREATE TRIGGER synthetic_isolation_retry BEFORE INSERT ON logs
+                FOR EACH ROW EXECUTE FUNCTION synthetic_isolation_retry()''')
+    rows = [_row('synthetic isolation valid prefix'),
+            _row('synthetic isolation bad inet', src_ip='invalid-address'),
+            _row('synthetic isolation serialization')]
+    try:
+        result = db.insert_logs_batch(rows)
+        assert (result.inserted, result.duplicates, result.dropped) == (0, 0, 0)
+        assert result.retryable == rows
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT COUNT(*) FROM logs WHERE ingest_id = ANY(%s::uuid[])',
+                            [[row['ingest_id'] for row in rows]])
+                assert cur.fetchone()[0] == 0
+    finally:
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('DROP TRIGGER synthetic_isolation_retry ON logs')
+                cur.execute('DROP FUNCTION synthetic_isolation_retry()')
+    replay = db.insert_logs_batch(rows)
+    assert (replay.inserted, replay.duplicates, replay.dropped, replay.retryable) == (2, 0, 1, [])
+
+
+def test_abuse_detail_patch_skips_unchanged_rows_without_usage_type(upgrade_clone):
+    db = upgrade_clone.db
+    ips = ['203.0.113.200', '203.0.113.201']
+    rows = []
+    for ip, side in zip(ips, ('src_ip', 'dst_ip')):
+        for categories in (None, [], ['existing synthetic category']):
+            rows.append(_row('synthetic metadata patch', **{
+                side: ip, 'rule_action': 'block', 'threat_score': 42,
+                'threat_categories': categories,
+            }))
+        rows.append(_row('synthetic allowed metadata remains unchanged', **{
+            side: ip, 'rule_action': 'allow', 'threat_score': 42,
+        }))
+        db.upsert_threat(ip, {'threat_score': 42, 'threat_categories': ['synthetic threat category'],
+                             'abuse_total_reports': 3, 'abuse_is_tor': False})
+    assert db.insert_logs_batch(rows).inserted == 8
+    assert db.patch_abuse_fields_for_ips(ips, ips) == 0  # excluded gateways/WANs
+    assert db.patch_abuse_fields_for_ips(ips, []) == 6
+    assert db.patch_abuse_fields_for_ips(ips, []) == 0
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('''SELECT rule_action, abuse_usage_type, abuse_total_reports,
+                                  abuse_is_tor, threat_categories
+                           FROM logs WHERE ingest_id = ANY(%s::uuid[]) ORDER BY id''',
+                        [[row['ingest_id'] for row in rows]])
+            values = cur.fetchall()
+    assert values == [
+        ('block', None, 3, False, ['synthetic threat category']),
+        ('block', None, 3, False, ['synthetic threat category']),
+        ('block', None, 3, False, ['existing synthetic category']),
+        ('allow', None, None, None, None),
+    ] * 2
+    # Changed data must still patch, including zero and false values. Repeating
+    # that patch must not rewrite the same heap/index records again.
+    for ip in ips:
+        db.upsert_threat(ip, {'threat_score': 42, 'threat_categories': ['synthetic threat category'],
+                             'abuse_total_reports': 0, 'abuse_is_tor': True})
+    assert db.patch_abuse_fields_for_ips(ips, []) == 6
+    assert db.patch_abuse_fields_for_ips(ips, []) == 0
 
 
 def test_postgres_retryable_failure_does_not_acknowledge_uncommitted_rows(upgrade_clone):

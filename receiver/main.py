@@ -136,6 +136,7 @@ class SyslogReceiver:
         self.last_progress_at = time.time()
         self.consecutive_flush_errors = 0
         self._db_retry_at = 0.0
+        self._ack_retry_at = 0.0
         self._stats_lock = threading.Lock()
         self.stats = dict.fromkeys((
             'received', 'parsed', 'filtered', 'failed', 'staged', 'inserted', 'duplicates',
@@ -146,6 +147,7 @@ class SyslogReceiver:
         self.queue = queue.Queue(maxsize=positive_env('INGEST_QUEUE_CAPACITY', DEFAULT_QUEUE_CAPACITY, 65536))
         self._worker = None
         self._delivery_worker = None
+        self._maintenance_worker = None
         self._workers = {name: {'failed': False, 'last_progress_at': time.time(), 'busy_since': None,
                                 'phase': 'idle', 'phase_started_at': None}
                          for name in ('producer', 'delivery')}
@@ -258,8 +260,25 @@ class SyslogReceiver:
     def _start_workers(self):
         self._worker = threading.Thread(target=self._process_queue, name='ingest-stage', daemon=True)
         self._delivery_worker = threading.Thread(target=self._deliver_spool, name='ingest-delivery', daemon=True)
+        self._maintenance_worker = threading.Thread(target=self._maintenance_loop,
+                                                    name='ingest-maintenance', daemon=True)
         self._worker.start()
         self._delivery_worker.start()
+        self._maintenance_worker.start()
+
+    def _maintenance_loop(self):
+        """Open replacement GeoIP files outside staging and database delivery.
+
+        A boolean request coalesces signals; a request received during a reload
+        is handled on the next pass. Only this one worker performs reloads.
+        """
+        while not self._stop_event.wait(0.2):
+            if self.geoip_reload_requested:
+                self.geoip_reload_requested = False
+                try:
+                    self.enricher.reload_geoip()
+                except Exception:
+                    logger.exception("GeoIP reload failed; ingestion continues")
 
     def _process_queue(self):
         try:
@@ -286,12 +305,6 @@ class SyslogReceiver:
                         self._processing_rows = 0
                         self.queue.task_done()
                 self._maybe_flush_batch()
-                if self.geoip_reload_requested:
-                    self.geoip_reload_requested = False
-                    try:
-                        self.enricher.reload_geoip()
-                    except Exception:
-                        logger.exception("GeoIP reload failed")
                 self.last_progress_at = time.time()
                 self._workers['producer']['last_progress_at'] = self.last_progress_at
         except Exception:
@@ -308,6 +321,7 @@ class SyslogReceiver:
                 self._delivery_wake.clear()
                 # One bounded batch per pass; errors retain backoff in SQLite.
                 delivered = self._retry_spool()
+                self._flush_acknowledgements()
                 # Configuration reads can wait for PostgreSQL. Keep them off
                 # the staging worker just like ordinary database delivery.
                 if self.config_reload_requested and self.config_reload_callback:
@@ -318,6 +332,31 @@ class SyslogReceiver:
         except Exception:
             self._workers['delivery']['failed'] = True
             logger.exception("Delivery worker stopped unexpectedly; durable rows retained")
+        finally:
+            # This remains on the daemon thread: stop() only waits up to its
+            # existing deadline if storage is stalled. PG-committed rows left
+            # in the spool are safe to replay after an interrupted cleanup.
+            self._flush_acknowledgements(force=True)
+
+    def _flush_acknowledgements(self, force=False):
+        if self._spool is None or (not force and time.monotonic() < self._ack_retry_at):
+            return
+        started = time.monotonic()
+        try:
+            with self._worker_phase('delivery', 'spool_ack'):
+                flushed = self._spool.flush_acknowledgements(force=force)
+            if flushed:
+                self._spool_state = self._spool.snapshot()
+                self._spool_failed = False
+                self._ack_retry_at = 0.0
+                self._metrics.observe('spool_ack', started)
+        except Exception:
+            self._spool_failed = True
+            self._count('spool_errors')
+            self._ack_retry_at = time.monotonic() + 5
+            self._metrics.observe('spool_ack', started)
+            rate_limited_warning(logger, 'receiver.spool_ack_flush',
+                                 "Committed rows await spool cleanup; replay remains safe", exc_info=True)
 
     def stop(self):
         """Bounded drain; committed spool rows survive forced/slow DB shutdown."""
@@ -335,6 +374,8 @@ class SyslogReceiver:
             self._flush_batch()
         if self._delivery_worker and self._delivery_worker is not threading.current_thread():
             self._delivery_worker.join(timeout=max(0, self._shutdown_deadline - time.monotonic()))
+        if self._maintenance_worker and self._maintenance_worker is not threading.current_thread():
+            self._maintenance_worker.join(timeout=max(0, self._shutdown_deadline - time.monotonic()))
         # UDP memory backlog cannot survive process exit: count its loss explicitly.
         while True:
             try:
@@ -494,12 +535,16 @@ class SyslogReceiver:
         started = time.monotonic()
         try:
             with self._worker_phase('delivery', 'spool_ack'):
-                self._spool.acknowledge(rows, retryable)
+                self._spool.acknowledge(rows, retryable,
+                                        defer_success=not retryable and rejected == 0)
             # A malformed row is not finally discarded until its spool removal
             # commits. Do not count the same rejection again after an ack retry.
             self._count('dropped', rejected)
             self._spool_state = self._spool.snapshot()
-            self._spool_failed = False
+            # A RAM-only acknowledgement does not prove that a previously
+            # failed cleanup write recovered. A stage/cleanup commit does.
+            if not self._spool_state.get('ack_pending_rows', 0):
+                self._spool_failed = False
         except Exception:
             # PostgreSQL may already have committed: unchanged ingest IDs make
             # replay safe even when the local acknowledgement could not commit.

@@ -1114,7 +1114,7 @@ END $$;""",
         inserted = extras.execute_values(
             cur, f"INSERT INTO logs ({', '.join(INSERT_COLUMNS)}) VALUES %s "
                  "ON CONFLICT (ingest_id) WHERE ingest_id IS NOT NULL DO NOTHING RETURNING id",
-            rows, page_size=100, fetch=True,
+            rows, page_size=1000, fetch=True,
         )
         return len(inserted)
 
@@ -1123,6 +1123,8 @@ END $$;""",
 
         Connection failures never trigger dozens of per-row connection retries.
         The caller durably retains retryable rows with their original ingest IDs.
+        A malformed batch is split under savepoints in one transaction, avoiding
+        a durable commit for every otherwise-valid row.
         """
         if not logs:
             return InsertResult()
@@ -1132,27 +1134,46 @@ END $$;""",
                     count = self._execute_log_insert(cur, logs)
             return InsertResult(inserted=count, duplicates=len(logs) - count)
         except (psycopg2.DataError, psycopg2.IntegrityError):
-            logger.warning("Malformed batch; isolating invalid rows")
+            logger.warning("Malformed batch; isolating invalid rows with savepoints")
         except Exception as exc:
             logger.warning("Database batch pending retry (%s)", type(exc).__name__)
             return InsertResult(retryable=list(logs))
 
         result = InsertResult()
-        for index, log in enumerate(logs):
+
+        def insert_segment(cur, segment):
+            # Release each savepoint before descending, so only one is live at
+            # a time. A failed statement may have inserted earlier VALUES pages;
+            # rollback must remove all of them before splitting the segment.
+            cur.execute('SAVEPOINT isolate_log_rows')
             try:
-                with self.get_conn() as conn:
-                    with conn.cursor() as cur:
-                        count = self._execute_log_insert(cur, [log])
+                count = self._execute_log_insert(cur, segment)
+            except (psycopg2.DataError, psycopg2.IntegrityError):
+                cur.execute('ROLLBACK TO SAVEPOINT isolate_log_rows')
+                cur.execute('RELEASE SAVEPOINT isolate_log_rows')
+                if len(segment) == 1:
+                    result.dropped += 1
+                    return
+                middle = len(segment) // 2
+                insert_segment(cur, segment[:middle])
+                insert_segment(cur, segment[middle:])
+            else:
+                cur.execute('RELEASE SAVEPOINT isolate_log_rows')
                 result.inserted += count
-                result.duplicates += 1 - count
-            except (psycopg2.DataError, psycopg2.IntegrityError) as exc:
-                result.dropped += 1
-                logger.warning("Invalid log row rejected (%s)", type(exc).__name__)
-            except Exception as exc:
-                result.retryable.extend(logs[index:])
-                logger.warning("Remaining batch pending retry (%s)", type(exc).__name__)
-                break
-        return result
+                result.duplicates += len(segment) - count
+
+        try:
+            with self.get_conn() as conn:
+                with conn.cursor() as cur:
+                    insert_segment(cur, logs)
+            # Counters become acknowledgements only after the outer commit.
+            logger.warning("Rejected %d invalid log rows from batch", result.dropped)
+            return result
+        except Exception as exc:
+            # A failed or ambiguous commit must not acknowledge any part of
+            # this transaction. Retried ingest IDs suppress committed duplicates.
+            logger.warning("Isolated batch pending retry (%s)", type(exc).__name__)
+            return InsertResult(retryable=list(logs))
 
     def insert_pihole_batch(self, logs: list[dict], new_cursor: int):
         """Atomic insert of Pi-hole logs + cursor update. No row-by-row fallback.
@@ -1664,10 +1685,23 @@ END $$;""",
         """Targeted: copy abuse detail from ip_threats to logs for specific IPs.
 
         Only updates rows that have a threat_score but are missing abuse detail.
-        Two passes (src_ip, dst_ip) with WAN IP exclusion.
+        Two passes (src_ip, dst_ip) with WAN IP exclusion. Providers can return
+        detail without a usage type; skip rows whose assigned values already
+        match, since their NULL usage type will still match future passes.
         """
         if not ips:
             return 0
+        fields = ('abuse_usage_type', 'abuse_hostnames', 'abuse_total_reports',
+                  'abuse_last_reported', 'abuse_is_whitelisted', 'abuse_is_tor')
+        changed = (
+            'ROW(' + ', '.join('logs.' + field for field in fields) + ', logs.threat_categories) '
+            'IS DISTINCT FROM ROW(' + ', '.join('t.' + field for field in fields) + ', '
+            'CASE WHEN t.threat_categories IS NOT NULL '
+            'AND array_length(t.threat_categories, 1) > 0 '
+            'AND (logs.threat_categories IS NULL OR array_length(logs.threat_categories, 1) IS NULL '
+            'OR array_length(logs.threat_categories, 1) = 0) '
+            'THEN t.threat_categories ELSE logs.threat_categories END)'
+        )
         total = 0
         with self.get_conn() as conn:
             with conn.cursor() as cur:
@@ -1699,7 +1733,7 @@ END $$;""",
                     "       OR t.abuse_total_reports IS NOT NULL OR t.abuse_last_reported IS NOT NULL "
                     "       OR t.abuse_is_whitelisted IS NOT NULL OR t.abuse_is_tor IS NOT NULL) "
                     "  AND logs.log_type = 'firewall' "
-                    "  AND logs.rule_action = 'block'",
+                    "  AND logs.rule_action = 'block' AND " + changed,
                     [ips, wan_ips]
                 )
                 total += cur.rowcount
@@ -1731,7 +1765,7 @@ END $$;""",
                     "       OR t.abuse_total_reports IS NOT NULL OR t.abuse_last_reported IS NOT NULL "
                     "       OR t.abuse_is_whitelisted IS NOT NULL OR t.abuse_is_tor IS NOT NULL) "
                     "  AND logs.log_type = 'firewall' "
-                    "  AND logs.rule_action = 'block'",
+                    "  AND logs.rule_action = 'block' AND " + changed,
                     [ips, wan_ips]
                 )
                 total += cur.rowcount

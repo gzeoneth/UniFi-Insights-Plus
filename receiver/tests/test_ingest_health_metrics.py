@@ -38,6 +38,16 @@ def test_legacy_metrics_remain_unknown(read_snapshot):
     assert result['workers']['delivery']['alive'] is None
     assert result['spool']['oldest_age_seconds'] is None
     assert result['state'] == 'ready'
+    assert result['spool']['ack_pending_rows'] is None
+
+
+def test_committed_cleanup_is_not_missing_history(read_snapshot):
+    result = read_snapshot(spool={'rows': 0, 'bytes': 0, 'stored_rows': 60,
+                                  'ack_pending_rows': 60, 'ack_pending_bytes': 24000,
+                                  'ack_pending_age_seconds': 0.5})
+    assert result['spool']['stored_rows'] == result['spool']['ack_pending_rows'] == 60
+    assert result['collection']['state'] == 'ready'
+    assert result['collection']['incomplete'] is False
 
 
 def test_metrics_do_not_leak_unrecognized_payloads(read_snapshot):

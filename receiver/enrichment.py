@@ -223,82 +223,172 @@ class TTLCache:
 # ── GeoIP Enrichment ─────────────────────────────────────────────────────────
 
 class GeoIPEnricher:
-    """MaxMind GeoLite2 lookups for City and ASN."""
+    """MaxMind lookups with a bounded cache of scalar result fields."""
+
+    CACHE_MAX_ENTRIES = 8192
+    CACHE_TTL_SECONDS = 3600
 
     def __init__(self, db_dir: str = '/app/maxmind'):
         self.city_reader = None
         self.asn_reader = None
         self.db_dir = db_dir
+        self._reader_lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._close_worker = None
+        self._closed = False
+        self._cache = self._new_cache()
         self._load_databases(db_dir)
 
+    def _new_cache(self):
+        return TTLCache(ttl_seconds=self.CACHE_TTL_SECONDS,
+                        max_entries=self.CACHE_MAX_ENTRIES,
+                        prune_trigger_ratio=1.0)
+
+    @staticmethod
+    def _close_readers(*readers):
+        for reader in readers:
+            if reader is not None:
+                try:
+                    reader.close()
+                except Exception:
+                    logger.debug("Failed to close MaxMind reader", exc_info=True)
+
     def _load_databases(self, db_dir: str):
+        # File opening may wait on storage. Keep the working readers and cache
+        # available while replacement files are opened in the reload worker.
+        if self._closed:
+            return False
+        city_was_loaded = self.city_reader is not None
+        asn_was_loaded = self.asn_reader is not None
+        city_reader = asn_reader = None
         try:
             import geoip2.database
             city_path = os.path.join(db_dir, 'GeoLite2-City.mmdb')
             asn_path = os.path.join(db_dir, 'GeoLite2-ASN.mmdb')
 
             if os.path.exists(city_path):
-                self.city_reader = geoip2.database.Reader(city_path)
+                city_reader = geoip2.database.Reader(city_path)
                 logger.info("Loaded GeoLite2-City database")
             else:
                 logger.warning("GeoLite2-City.mmdb not found at %s", city_path)
+                if city_was_loaded:
+                    raise FileNotFoundError("Replacement GeoLite2-City database is missing")
 
             if os.path.exists(asn_path):
-                self.asn_reader = geoip2.database.Reader(asn_path)
+                asn_reader = geoip2.database.Reader(asn_path)
                 logger.info("Loaded GeoLite2-ASN database")
             else:
                 logger.warning("GeoLite2-ASN.mmdb not found at %s", asn_path)
-
+                if asn_was_loaded:
+                    raise FileNotFoundError("Replacement GeoLite2-ASN database is missing")
         except ImportError:
+            self._close_readers(city_reader, asn_reader)
             logger.error("geoip2 package not installed")
+            return False
         except Exception as e:
+            self._close_readers(city_reader, asn_reader)
             logger.error("Failed to load MaxMind databases: %s", e)
+            return False
+
+        # Cold lookups hold this lock, so no lookup can still be using an old
+        # mmap when it is closed. Cache hits never wait for a cold lookup.
+        with self._reader_lock:
+            if self._closed:
+                old_city, old_asn = city_reader, asn_reader
+                installed = False
+            else:
+                old_city, old_asn = self.city_reader, self.asn_reader
+                self.city_reader, self.asn_reader = city_reader, asn_reader
+                self._cache = self._new_cache()
+                installed = True
+        self._close_readers(old_city, old_asn)
+        return installed
 
     def reload(self):
-        """Reload databases from disk (called after geoipupdate)."""
+        """Replace readers and invalidate cached results after a successful load."""
         logger.info("Reloading MaxMind databases...")
-        old_city = self.city_reader
-        old_asn = self.asn_reader
-        self._load_databases(self.db_dir)
-        # Close old readers after loading new ones
-        if old_city:
-            try: old_city.close()
-            except: pass
-        if old_asn:
-            try: old_asn.close()
-            except: pass
-        logger.info("MaxMind databases reloaded")
+        loaded = self._load_databases(self.db_dir)
+        if loaded:
+            logger.info("MaxMind databases reloaded")
+        return loaded
 
     def lookup(self, ip_str: str) -> dict:
-        """Look up GeoIP and ASN data for an IP. Returns dict of fields."""
-        result = {}
+        """Return GeoIP/ASN fields without repeating MMDB work for hot IPs."""
+        if self._closed:
+            return {}
+        cached = self._cache.get(ip_str)
+        if cached is not None:
+            return dict(cached)
+        with self._reader_lock:
+            if self._closed:
+                return {}
+            # A concurrent lookup or reload may have populated/replaced it.
+            cache = self._cache
+            cached = cache.get(ip_str)
+            if cached is not None:
+                return dict(cached)
+            result, complete = self._lookup_readers(ip_str)
+            if complete and not self._closed:
+                cache.set(ip_str, dict(result))
+            return result
 
+    def _lookup_readers(self, ip_str):
+        try:
+            from geoip2.errors import AddressNotFoundError
+        except ImportError:
+            return {}, False
+
+        result = {}
+        complete = True
         if self.city_reader:
             try:
                 resp = self.city_reader.city(ip_str)
                 result['geo_country'] = resp.country.iso_code
                 result['geo_city'] = resp.city.name
                 if resp.location:
-                    result['geo_lat'] = float(resp.location.latitude) if resp.location.latitude else None
-                    result['geo_lon'] = float(resp.location.longitude) if resp.location.longitude else None
+                    result['geo_lat'] = float(resp.location.latitude) if resp.location.latitude is not None else None
+                    result['geo_lon'] = float(resp.location.longitude) if resp.location.longitude is not None else None
+            except AddressNotFoundError:
+                pass  # A real database miss can be cached until TTL/reload.
             except Exception:
-                pass
+                complete = False  # A transient failure must not poison the cache.
 
         if self.asn_reader:
             try:
                 resp = self.asn_reader.asn(ip_str)
                 result['asn_number'] = resp.autonomous_system_number
                 result['asn_name'] = resp.autonomous_system_organization
-            except Exception:
+            except AddressNotFoundError:
                 pass
+            except Exception:
+                complete = False
+        return result, complete
 
-        return result
+    def _finish_close(self):
+        with self._reader_lock:
+            old_city, old_asn = self.city_reader, self.asn_reader
+            self.city_reader = self.asn_reader = None
+        self._close_readers(old_city, old_asn)
 
     def close(self):
-        if self.city_reader:
-            self.city_reader.close()
-        if self.asn_reader:
-            self.asn_reader.close()
+        # A cold mmap lookup can be stalled on host storage. Shutdown must not
+        # wait for it or close its live reader. One daemon retires it afterward.
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._cache = self._new_cache()
+        if self._reader_lock.acquire(blocking=False):
+            try:
+                old_city, old_asn = self.city_reader, self.asn_reader
+                self.city_reader = self.asn_reader = None
+            finally:
+                self._reader_lock.release()
+            self._close_readers(old_city, old_asn)
+        else:
+            self._close_worker = threading.Thread(
+                target=self._finish_close, name='geoip-close', daemon=True)
+            self._close_worker.start()
 
 
 # ── AbuseIPDB Enrichment ─────────────────────────────────────────────────────
@@ -1204,4 +1294,4 @@ class Enricher:
 
     def reload_geoip(self):
         """Reload GeoIP databases (called via SIGUSR1)."""
-        self.geoip.reload()
+        return self.geoip.reload()

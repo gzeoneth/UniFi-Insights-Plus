@@ -62,6 +62,13 @@ class RetrySpool:
         self._head_max_rows = 512
         self._head, self._head_bytes = (), 0
         self._head_complete, self._head_changes = False, -1
+        # These IDs have committed in PostgreSQL. Losing this bounded RAM map
+        # only replays them; the destination's ingest_id constraint deduplicates.
+        self._deferred_acks = {}
+        self._deferred_ack_bytes = 0
+        self._deferred_ack_started = None
+        self._deferred_ack_max_rows = 1000
+        self._deferred_ack_max_age = 1.0
         self._wal_checkpoint_bytes, self._wal_max_bytes = 4 * 1024 * 1024, 16 * 1024 * 1024
         self._wal_bytes = self._checkpoint_busy = self._checkpoint_errors = 0
         if path != ':memory:':
@@ -102,6 +109,10 @@ class RetrySpool:
         self._state = {'rows': self.rows, 'bytes': self.bytes,
                        'max_rows': self.max_rows, 'max_bytes': self.max_bytes,
                        'oldest_at': self._oldest_at,
+                       'stored_rows': self.rows + len(self._deferred_acks),
+                       'ack_pending_rows': len(self._deferred_acks),
+                       'ack_pending_bytes': self._deferred_ack_bytes,
+                       '_ack_started': self._deferred_ack_started,
                        'storage': {
                            'journal_mode': self._journal_mode, 'synchronous': 'FULL',
                            'cache_kib': self._cache_kib,
@@ -212,6 +223,57 @@ class RetrySpool:
         self._head, self._head_bytes = (), 0
         self._head_complete, self._head_changes = False, -1
 
+    def _delete_deferred_acks(self):
+        """Called inside a transaction; clear the RAM map only after commit."""
+        for chunk in _chunks(list(self._deferred_acks)):
+            placeholders = ','.join('?' for _ in chunk)
+            self.conn.execute(f'DELETE FROM pending WHERE ingest_id IN ({placeholders})', chunk)
+
+    def _clear_deferred_acks(self):
+        self._deferred_acks.clear()
+        self._deferred_ack_bytes = 0
+        self._deferred_ack_started = None
+
+    def _oldest_pending(self, ignored=None):
+        # Deferred IDs normally form the FIFO prefix. The bounded over-read also
+        # handles a caller acknowledging a subset without a large SQL IN list.
+        ignored = self._deferred_acks if ignored is None else ignored
+        rows = self.conn.execute('SELECT ingest_id,created_at FROM pending '
+                                 'ORDER BY rowid LIMIT ?', (len(ignored) + 1,)).fetchall()
+        return next((row[1] for row in rows if row[0] not in ignored), None)
+
+    def flush_acknowledgements(self, force=False):
+        """Persist completed IDs after one second, at capacity, or on shutdown.
+
+        Admission is always FULL-synchronous. This only coalesces deletion of
+        events already committed to PostgreSQL, which are safe to replay.
+        """
+        # Most delivery-loop polls have nothing due. Read one immutable state
+        # snapshot rather than waiting behind a concurrent admission's fsync.
+        state = self._state
+        if not state['ack_pending_rows'] or (not force
+                and state['ack_pending_rows'] < self._deferred_ack_max_rows
+                and time.monotonic() - state['_ack_started'] < self._deferred_ack_max_age):
+            return False
+        with self._operation('acknowledge'):
+            if not self._deferred_acks or (not force
+                    and len(self._deferred_acks) < self._deferred_ack_max_rows
+                    and time.monotonic() - self._deferred_ack_started < self._deferred_ack_max_age):
+                return False
+            self._prepare_write('acknowledge')
+            started = time.monotonic()
+            try:
+                self.conn.execute('BEGIN')
+                self._delete_deferred_acks()
+                self._timing('acknowledge', 'sql', started)
+                self._committed('acknowledge')
+            except Exception:
+                self._rollback()
+                raise
+            self._clear_deferred_acks()
+            self._maintenance('acknowledge')
+            return True
+
     def stage(self, rows):
         """Return (admitted rows, rejected count), committing before returning."""
         with self._operation('stage'):
@@ -222,14 +284,17 @@ class RetrySpool:
             for row in rows:
                 if 'ingest_id' not in row:
                     row['ingest_id'] = str(uuid.uuid4())
-            ids = list(dict.fromkeys(row['ingest_id'] for row in rows))
-            existing = set()
-            for chunk in _chunks(ids):
-                placeholders = ','.join('?' for _ in chunk)
-                existing.update(row[0] for row in self.conn.execute(
-                    f'SELECT ingest_id FROM pending WHERE ingest_id IN ({placeholders})', chunk))
             try:
                 self.conn.execute('BEGIN')
+                # Admission and previous successful acknowledgements share one
+                # durable transaction instead of paying for two separate syncs.
+                self._delete_deferred_acks()
+                ids = list(dict.fromkeys(row['ingest_id'] for row in rows))
+                existing = set()
+                for chunk in _chunks(ids):
+                    placeholders = ','.join('?' for _ in chunk)
+                    existing.update(row[0] for row in self.conn.execute(
+                        f'SELECT ingest_id FROM pending WHERE ingest_id IN ({placeholders})', chunk))
                 inserts = []
                 for row in rows:
                     try:
@@ -262,6 +327,7 @@ class RetrySpool:
             except Exception:
                 self._rollback()
                 raise
+            self._clear_deferred_acks()
             self.rows, self.bytes, self._oldest_at = count, size, oldest_at
             self._maintenance('stage')
             return accepted, rejected
@@ -282,8 +348,9 @@ class RetrySpool:
             else:
                 # Serialized immutable cache: mutations to returned rows cannot
                 # corrupt retries. Page cache handles rows beyond this RAM cap.
-                result = self.conn.execute('''SELECT payload, attempts, next_retry_at FROM pending
-                    ORDER BY rowid LIMIT ?''', (limit,)).fetchall()
+                fetched = self.conn.execute('''SELECT payload, attempts, next_retry_at,ingest_id FROM pending
+                    ORDER BY rowid LIMIT ?''', (limit + len(self._deferred_acks),)).fetchall()
+                result = [row[:3] for row in fetched if row[3] not in self._deferred_acks][:limit]
                 cached, cached_bytes = [], 0
                 for row in result[:self._head_max_rows]:
                     length = len(row[0].encode('utf-8'))
@@ -303,19 +370,52 @@ class RetrySpool:
             due.append(row)
         return [json.loads(row[0]) for row in due], any(row[1] > 0 for row in due)
 
-    def acknowledge(self, attempted, retryable, now=None):
-        """Commit removal or capped retry backoff; never expire a durable event."""
+    def acknowledge(self, attempted, retryable, now=None, defer_success=False):
+        """Remove committed events or persist capped retry backoff.
+
+        A receiver may coalesce a successful acknowledgement with its next stage
+        transaction. Failed/malformed deliveries must use immediate persistence.
+        """
         now = time.time() if now is None else now
         retry_ids = {row['ingest_id'] for row in retryable}
         ids = list(dict.fromkeys(row['ingest_id'] for row in attempted))
         removed_ids = [value for value in ids if value not in retry_ids]
         retried_ids = [value for value in ids if value in retry_ids]
         with self._operation('acknowledge'):
+            if defer_success and not retryable:
+                # Flush first if this call could exceed the bounded ID map.
+                new_ids = [value for value in ids if value not in self._deferred_acks]
+                if len(self._deferred_acks) + len(new_ids) > self._deferred_ack_max_rows:
+                    self.flush_acknowledgements(force=True)
+                if len(new_ids) <= self._deferred_ack_max_rows:
+                    started = time.monotonic()
+                    found = {}
+                    for chunk in _chunks(new_ids):
+                        placeholders = ','.join('?' for _ in chunk)
+                        found.update(self.conn.execute('SELECT ingest_id,payload_bytes FROM pending '
+                                                       f'WHERE ingest_id IN ({placeholders})', chunk))
+                    found = {key: size for key, size in found.items() if key not in self._deferred_acks}
+                    if found:
+                        oldest_at = self._oldest_pending(self._deferred_acks.keys() | found.keys())
+                        if not self._deferred_acks:
+                            self._deferred_ack_started = time.monotonic()
+                        self._deferred_acks.update(found)
+                        removed_bytes = sum(found.values())
+                        self._deferred_ack_bytes += removed_bytes
+                        self.rows -= len(found)
+                        self.bytes -= removed_bytes
+                        self._oldest_at = oldest_at
+                        self._invalidate_head()
+                    self._timing('acknowledge', 'sql', started)
+                    self._publish_state()
+                    self.flush_acknowledgements()
+                    return
             self._prepare_write('acknowledge')
             removed_count = removed_bytes = 0
             started = time.monotonic()
             try:
                 self.conn.execute('BEGIN')
+                self._delete_deferred_acks()
                 for chunk in _chunks(removed_ids):
                     placeholders = ','.join('?' for _ in chunk)
                     count, size = self.conn.execute(
@@ -336,6 +436,7 @@ class RetrySpool:
             except Exception:
                 self._rollback()
                 raise
+            self._clear_deferred_acks()
             self.rows -= removed_count
             self.bytes -= removed_bytes
             self._oldest_at = oldest[0] if oldest else None
@@ -352,11 +453,16 @@ class RetrySpool:
                                                             if operation['phase'] != 'idle' else 0)}
                           for name, operation in self._operations.items()}
         return {key: (dict(value) if isinstance(value, dict) else value)
-                for key, value in state.items() if key != 'oldest_at'} | {
+                for key, value in state.items() if key != 'oldest_at' and not key.startswith('_')} | {
             'oldest_age_seconds': max(0, time.time() - state['oldest_at']) if state['oldest_at'] else 0,
+            'ack_pending_age_seconds': (max(0, now - state['_ack_started'])
+                                        if state['_ack_started'] is not None else 0),
             'operations': operations,
         }
 
     def close(self):
         with self._lock:
-            self.conn.close()
+            try:
+                self.flush_acknowledgements(force=True)
+            finally:
+                self.conn.close()
