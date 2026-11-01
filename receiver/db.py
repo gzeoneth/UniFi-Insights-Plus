@@ -1882,7 +1882,8 @@ END $$;""",
     def set_config(self, key: str, value):
         """Upsert a config value to system_config table.
 
-        Value is automatically converted to JSONB.
+        Value is automatically converted to JSONB. Repeated discovery polls
+        leave unchanged values and their modification timestamp intact.
         """
         with self.get_conn() as conn:
             with conn.cursor() as cur:
@@ -1891,6 +1892,7 @@ END $$;""",
                     VALUES (%s, %s, NOW())
                     ON CONFLICT (key) DO UPDATE
                     SET value = EXCLUDED.value, updated_at = NOW()
+                    WHERE system_config.value IS DISTINCT FROM EXCLUDED.value
                 """, [key, Json(value)])  # Use Json() for proper JSONB handling
         if key in self._DISPLAY_CONFIG_KEYS:
             self._display_config_cache.clear()

@@ -164,6 +164,7 @@ def test_delivery_counter_separates_first_attempts_from_known_retries(receiver):
 def test_blocked_db_worker_does_not_block_durable_staging(receiver, monkeypatch):
     import main
     receiver.batch_size = 1
+    receiver.delivery_batch_size = receiver.effective_delivery_batch_size = 1
     monkeypatch.setattr(main, 'parse_log', lambda _raw: {'raw_log': 'event'})
     receiver.queue = queue.Queue(maxsize=3)
     entered, release = threading.Event(), threading.Event()
@@ -411,6 +412,7 @@ def test_malformed_database_ack_never_removes_rows(receiver):
 def test_shutdown_drains_to_disk_even_when_pg_is_blocked(receiver, monkeypatch):
     import main
     receiver.batch_size = 1
+    receiver.delivery_batch_size = receiver.effective_delivery_batch_size = 1
     monkeypatch.setattr(main, 'parse_log', lambda raw: {'raw_log': raw})
     entered, release = threading.Event(), threading.Event()
 

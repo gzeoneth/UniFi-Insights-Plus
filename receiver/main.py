@@ -71,6 +71,8 @@ SYSLOG_PORT = 514
 SYSLOG_BUFFER_SIZE = 8192      # Max UDP packet size
 BATCH_SIZE = 200                # Bounded batches amortize durable transaction cost
 BATCH_TIMEOUT = 1.0             # Maximum partial-batch staging delay
+DELIVERY_BATCH_SIZE = 1000      # PostgreSQL transactions combine durable stage batches
+DELIVERY_BATCH_TIMEOUT = 2.0    # Maximum additional hold after local durable admission
 STATS_INTERVAL_MINUTES = 15     # Log stats every N minutes (DEBUG only)
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -129,6 +131,12 @@ class SyslogReceiver:
         self.batch_lock = threading.Lock()
         self.batch_size = positive_env('INGEST_BATCH_SIZE', BATCH_SIZE, 1000)
         self.batch_timeout = bounded_seconds_env('INGEST_FLUSH_INTERVAL_SECONDS', BATCH_TIMEOUT)
+        self.delivery_batch_size = positive_env('INGEST_DELIVERY_BATCH_SIZE', DELIVERY_BATCH_SIZE, 1000)
+        self.delivery_batch_timeout = bounded_seconds_env(
+            'INGEST_DELIVERY_FLUSH_INTERVAL_SECONDS', DELIVERY_BATCH_TIMEOUT)
+        self.effective_delivery_batch_size = self.delivery_batch_size
+        self._delivery_fast_successes = 0
+        self._delivery_batch_deadline = None
         self._metrics = IngestMetrics()
         self.last_flush = time.monotonic()
         self.last_heartbeat = time.time()
@@ -319,8 +327,9 @@ class SyslogReceiver:
         try:
             while not self._stop_event.is_set():
                 self._delivery_wake.clear()
-                # One bounded batch per pass; errors retain backoff in SQLite.
-                delivered = self._retry_spool()
+                # Combine committed stage batches without delaying durable
+                # admission. A backlog drains immediately in bounded batches.
+                delivered = self._retry_spool(coalesce=True)
                 self._flush_acknowledgements()
                 # Configuration reads can wait for PostgreSQL. Keep them off
                 # the staging worker just like ordinary database delivery.
@@ -478,13 +487,59 @@ class SyslogReceiver:
             self._metrics.observe('spool_stage', started)
         self._delivery_wake.set()
 
-    def _retry_spool(self):
+    def _delivery_batch_ready(self):
+        """Coalesce only durable rows; arrivals never extend the first deadline.
+
+        Persisted age makes old/replayed backlogs ready on startup. The local
+        monotonic deadline also bounds a sparse batch if the wall clock moves
+        backwards. This check does not acquire SQLite's transaction lock.
+        """
+        state = self._spool.snapshot()
+        if not state['rows']:
+            self._delivery_batch_deadline = None
+            return False
+        remaining = self.delivery_batch_timeout - state['oldest_age_seconds']
+        now = time.monotonic()
+        if (state['rows'] >= self.effective_delivery_batch_size or remaining <= 0
+                or self.consecutive_flush_errors
+                or (self._delivery_batch_deadline is not None
+                    and now >= self._delivery_batch_deadline)):
+            self._delivery_batch_deadline = None
+            return True
+        if self._delivery_batch_deadline is None:
+            self._delivery_batch_deadline = now + remaining
+        return False
+
+    def _adjust_delivery_batch_size(self, attempted, retryable, rejected, db_seconds):
+        """Reduce slow/retried transactions, then recover after sustained success.
+
+        Only the database call drives this limit. SQLite admission/cleanup can
+        be slow independently and must not make PostgreSQL batches shrink.
+        """
+        current = self.effective_delivery_batch_size
+        if retryable or db_seconds >= 10.0:
+            floor = min(self.delivery_batch_size, 50)
+            self.effective_delivery_batch_size = max(floor, current // 2)
+            self._delivery_fast_successes = 0
+        elif rejected or attempted < current or db_seconds >= 2.0:
+            self._delivery_fast_successes = 0
+        else:
+            self._delivery_fast_successes += 1
+            if self._delivery_fast_successes >= 4:
+                self.effective_delivery_batch_size = min(self.delivery_batch_size, current * 2)
+                self._delivery_fast_successes = 0
+
+    def _retry_spool(self, coalesce=False):
         if self._spool is None or not self._spool.rows or time.time() < self._db_retry_at:
+            if self._spool is None or not self._spool.rows:
+                self._delivery_batch_deadline = None
+            return
+        if coalesce and not self._delivery_batch_ready():
             return
         started = time.monotonic()
         try:
             with self._worker_phase('delivery', 'spool_read'):
-                rows, retrying = self._spool.due_batch(self.batch_size)
+                rows, retrying = self._spool.due_batch(self.effective_delivery_batch_size)
         except Exception:
             self._count('spool_errors')
             self._spool_failed = True
@@ -501,9 +556,14 @@ class SyslogReceiver:
             self._count('retry_attempts')
         started = time.monotonic()
         rejected = 0
+        db_seconds = 0.0
         try:
             with self._worker_phase('delivery', 'db_insert'):
-                result = self.db.insert_logs_batch(rows)
+                db_started = time.monotonic()
+                try:
+                    result = self.db.insert_logs_batch(rows)
+                finally:
+                    db_seconds = max(0.0, time.monotonic() - db_started)
             # A missing/old DB contract must never turn failure into success.
             counts = (result.inserted, getattr(result, 'duplicates', 0), result.dropped)
             if (any(type(value) is not int or value < 0 for value in counts)
@@ -523,6 +583,7 @@ class SyslogReceiver:
                                  "Database insert failed; %d rows remain in durable spool", len(rows), exc_info=True)
         finally:
             self._metrics.observe('db_insert', started)
+        self._adjust_delivery_batch_size(len(rows), retryable, rejected, db_seconds)
         if retryable:
             rate_limited_warning(logger, 'receiver.db_retry',
                                  'Database deferred %d rows; retained in durable ingest spool', len(retryable))
@@ -593,6 +654,9 @@ class SyslogReceiver:
                       'pending': len(self.batch), 'inflight': max(self._processing_rows, self._staging_rows),
                       'oldest_age_seconds': max(0, time.monotonic() - batch_started)
                       if batch_started is not None else None},
+            'delivery': {'batch_size': self.delivery_batch_size,
+                         'effective_batch_size': self.effective_delivery_batch_size,
+                         'flush_interval_seconds': self.delivery_batch_timeout},
             'retry': {'consecutive_failures': self.consecutive_flush_errors,
                       'next_retry_at': self._db_retry_at},
         }

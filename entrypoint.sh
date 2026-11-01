@@ -22,6 +22,9 @@ if [ "$_external_db" = "true" ]; then
     sed -i '/\[program:postgresql\]/,/^\[/{s/autostart=true/autostart=false/; s/autorestart=true/autorestart=false/}' /etc/supervisor/conf.d/supervisord.conf
 else
 
+# Reject invalid opt-in settings before initializing or touching an existing cluster.
+/app/venv/bin/python /app/postgres_config.py --validate
+
 # Initialize PostgreSQL if data directory is empty
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
     echo "[entrypoint] Initializing PostgreSQL..."
@@ -73,6 +76,10 @@ else
     chown -R postgres:postgres "$PGDATA"
 
 fi
+
+# Unlike init-only defaults, the optional profile also applies to existing clusters.
+# It validates effective settings without starting PostgreSQL and is reversible.
+/app/venv/bin/python /app/postgres_config.py "$PGDATA"
 fi  # end external_db else block
 
 echo "[entrypoint] Starting services via supervisord..."

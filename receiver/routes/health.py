@@ -64,6 +64,8 @@ def _performance_snapshot(raw, snapshot, now):
     snapshot['batch'] = {field: _number(_mapping(raw.get('batch')).get(field))
                          for field in ('size', 'flush_interval_seconds', 'pending', 'inflight',
                                        'oldest_age_seconds')}
+    snapshot['delivery'] = {field: _number(_mapping(raw.get('delivery')).get(field))
+                            for field in ('batch_size', 'effective_batch_size', 'flush_interval_seconds')}
     snapshot['spool']['oldest_age_seconds'] = _number(
         _mapping(raw.get('spool')).get('oldest_age_seconds'))
     storage = _mapping(_mapping(raw.get('spool')).get('storage'))

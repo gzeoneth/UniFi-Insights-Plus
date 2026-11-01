@@ -39,6 +39,8 @@ def test_legacy_metrics_remain_unknown(read_snapshot):
     assert result['spool']['oldest_age_seconds'] is None
     assert result['state'] == 'ready'
     assert result['spool']['ack_pending_rows'] is None
+    assert result['delivery'] == {'batch_size': None, 'effective_batch_size': None,
+                                 'flush_interval_seconds': None}
 
 
 def test_committed_cleanup_is_not_missing_history(read_snapshot):
@@ -58,10 +60,14 @@ def test_metrics_do_not_leak_unrecognized_payloads(read_snapshot):
                               'error': 'Synthetic secret', 'destination': '203.0.113.2'}},
         timings={'db_insert': {'count': 3, 'mean_ms': 7.5, 'sql': 'Synthetic secret'}},
         batch={'size': 200, 'pending': 0, 'flush_interval_seconds': 1, 'message': 'Synthetic secret'},
+        delivery={'batch_size': 1000, 'effective_batch_size': 500,
+                  'flush_interval_seconds': 2, 'message': 'Synthetic secret'},
         collection={'incomplete': False, 'reasons': ['Synthetic secret']})
     assert result['rates']['received_per_second'] == 123.5
     assert result['rates']['inserted_per_second'] == 0
     assert result['timings']['db_insert']['mean_ms'] == 7.5
+    assert result['delivery'] == {'batch_size': 1000, 'effective_batch_size': 500,
+                                 'flush_interval_seconds': 2}
     assert 'Synthetic secret' not in json.dumps(result)
     assert '203.0.113.2' not in json.dumps(result)
 
@@ -91,10 +97,14 @@ def test_storage_phases_and_recent_delays_are_bounded_and_allowlisted(read_snaps
 def test_invalid_numbers_are_unknown(read_snapshot, invalid):
     result = read_snapshot(rates={'window_seconds': 60, 'received_per_second': invalid},
                            timings={'parse': {'mean_ms': invalid}},
-                           batch={'size': invalid})
+                           batch={'size': invalid},
+                           delivery={'batch_size': invalid, 'effective_batch_size': invalid,
+                                     'flush_interval_seconds': invalid})
     assert result['rates']['received_per_second'] is None
     assert result['timings']['parse']['mean_ms'] is None
     assert result['batch']['size'] is None
+    assert result['delivery'] == {'batch_size': None, 'effective_batch_size': None,
+                                 'flush_interval_seconds': None}
 
 
 def test_stale_rates_are_not_presented_as_current(read_snapshot):

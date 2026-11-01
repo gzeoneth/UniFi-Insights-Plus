@@ -58,15 +58,23 @@ The in-memory queue and the current uncommitted batch remain volatile. The disk 
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `INGEST_BATCH_SIZE` | `200` | Maximum records per staging/delivery batch; capped at 1,000 |
+| `INGEST_BATCH_SIZE` | `200` | Maximum records per durable staging batch; capped at 1,000 |
 | `INGEST_FLUSH_INTERVAL_SECONDS` | `1.0` | Flush partial staging batches; valid values are bounded to 0.05–5 seconds |
+| `INGEST_DELIVERY_BATCH_SIZE` | `1000` | Maximum already-durable records in one PostgreSQL delivery transaction; capped at 1,000 |
+| `INGEST_DELIVERY_FLUSH_INTERVAL_SECONDS` | `2.0` | Coalesce partial durable batches before database delivery; bounded to 0.05–5 seconds |
 | `INGEST_QUEUE_CAPACITY` | `16384` | Maximum volatile intake messages; up to 128 MiB of UDP payload plus Python overhead at the 8 KiB receive limit |
 | `INGEST_SPOOL_MAX_ROWS` | `100000` | Maximum disk-spool records |
 | `INGEST_SPOOL_MAX_BYTES` | `67108864` | Maximum disk-spool payload bytes |
 | `INGEST_SPOOL_CACHE_KIB` | `16384` | SQLite page-cache target in KiB; capped at 65,536 |
 | `INGEST_SPOOL_HEAD_CACHE_BYTES` | `1048576` | Serialized retry-head cache limit; capped at 8 MiB and 512 rows |
 
-Larger batches amortize commit cost but use more memory and can increase latency. Queue and spool capacity absorb a burst; they do not fix sustained intake exceeding delivery. Start with the defaults and compare received, staged and inserted rates over a representative busy period before increasing limits. Spool byte limits describe stored payloads, not an exact bound on SQLite filesystem usage.
+Version `.10` separates PostgreSQL delivery from durable staging. Small staged batches may wait up to two seconds to combine with other committed spool rows; full batches and older backlogs become eligible without a coalescing delay. Retry backoff and database latency still apply. The existing one-second admission interval stays unchanged, so this wait does not add uncommitted events in RAM. A crash during coalescing leaves those rows in SQLite for replay. Explicit staging overrides do not set the new delivery limits; set the delivery variables separately when needed.
+
+The configured delivery size is a ceiling. A retryable database failure or a database call lasting at least ten seconds halves the effective size, down to 50 rows (or the configured size if smaller). Four consecutive full, successful calls under two seconds double it toward the ceiling. Partial batches, rejected rows and moderately slow calls reset that recovery streak. Only database-call time affects adaptation; SQLite cleanup time does not. Health exposes `delivery.effective_batch_size` alongside the configured ceiling. This avoids repeatedly retrying the same large batch when storage is slow, but cannot guarantee progress through a persistent database outage.
+
+Larger transactions amortize commit cost but do not remove per-row heap/index writes. Queue and spool capacity absorb a burst; they do not fix sustained intake exceeding delivery. Compare received, staged and inserted rates over a representative busy period before increasing limits. Spool byte limits describe stored payloads, not an exact bound on SQLite filesystem usage.
+
+For embedded PostgreSQL, the optional [buffering profile](postgresql.md) increases shared buffers and spreads checkpoints over a larger WAL budget. It applies at controlled startup to existing clusters. It preserves durable commits and is disabled by default. Unchanged JSON configuration writes also retain their existing heap row and modification time; polling timestamps and actual changed values still update. No log indexes or raw fields are removed automatically.
 
 Existing environment overrides still apply after upgrading. An installation explicitly using `INGEST_QUEUE_CAPACITY=4096` will keep that value until changed. The larger default buys time during a finite storage pause; queued packets and uncommitted batches can still be lost if the process exits before staging. It does not make UDP reliable.
 
@@ -100,7 +108,7 @@ Run [query-diagnostics.sql](../scripts/query-diagnostics.sql) through `psql` aga
 
 Check actual plans on a disposable restored database with representative filters. Compare row retrieval separately from exact counts. Use `EXPLAIN (ANALYZE, BUFFERS)` only when ready to execute the query; it is not a cost-free preview. Measure both warm and cold-cache behavior where practical, along with insert throughput and index size.
 
-Avoid adding an index for every filter. Indexes cost disk space and insert work; a broad text index can be particularly expensive. The earlier pagination work favored native address predicates, cursor paging and optional counts. This release adds small indexes for sparse security candidates, based on measured query plans. Synthetic timings do not establish production capacity or predict a long-retention database.
+Avoid adding an index for every filter. Indexes cost disk space and insert work; a broad text index can be particularly expensive. The earlier pagination work favored native address predicates, cursor paging and optional counts. Earlier releases added small indexes for sparse security candidates, based on measured query plans. Synthetic timings do not establish production capacity or predict a long-retention database.
 
 See [query and index coverage](query-indexes.md) for the field-by-field audit, measured improvements and remaining scan costs.
 

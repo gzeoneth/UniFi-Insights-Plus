@@ -25,6 +25,7 @@ def receiver(monkeypatch, tmp_path):
         inserted=len(rows), duplicates=0, dropped=0, retryable=[])
     receiver = module.SyslogReceiver(db, enricher)
     receiver.batch_size = 1
+    receiver.delivery_batch_size = receiver.effective_delivery_batch_size = 1
     receiver.running = True
     yield receiver
     receiver.stop()

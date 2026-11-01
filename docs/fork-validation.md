@@ -2,6 +2,17 @@
 
 The changes were tested against the upstream v3.7.2 base using synthetic events and disposable local databases. No live collector, gateway or production database was modified for these checks.
 
+## Database buffering: 3.7.2-gzeon.10
+
+- All 1,440 backend tests passed with disposable PostgreSQL integration enabled. The separate embedded-profile integration test passed against PostgreSQL 16: applying the profile to an existing cluster, starting it with the intended settings, preserving existing data, disabling the profile, and rejecting a conflicting durability override without changing the original configuration. Eighteen focused UI tests and the production UI/image build passed.
+- A deterministic 40-events/second test staged all 2,400 events durably at the original cadence. Coalescing reduced successful database calls from 60 to 30 with FIFO ordering and no missing records. Failed/slow writes shrink the effective batch; tests cover recovery, partial retries, bounded growth, clock rollback and shutdown while records await delivery.
+- The final local ARM64 image received and stored all 2,000 synthetic UDP events in two delivery transactions, with 2,000 distinct ingest IDs, an empty spool and zero reported drops/errors. Seven key source hashes matched the image. Effective PostgreSQL settings confirmed the balanced profile and durability safeguards. AMD64 and production storage were not tested in this run.
+- The real-schema benchmark inserted 50,000 events after 10,000 seed events, with 900-byte synthetic raw payloads and 26 valid indexes. Moving from 200 to 1,000 rows per transaction reduced durable insert commits from 250 to 50. Baseline median throughput increased from approximately 17,900 to 19,400 rows/s on local Docker storage. This is not production capacity; schema creation, generation, concurrent queries and SQLite staging are excluded.
+- WAL compression saved only about 0.35% on that append workload. A separate post-checkpoint update of 4,615 existing rows reduced WAL from 66.13 to 55.46 MB (16.1%), while elapsed time increased from 0.125 to 0.680 seconds. Compression trades CPU for I/O and stays configurable. The small fixture fits approximately within the old cache, so it does not establish a larger-cache benefit.
+- Disposable index-removal experiments reduced WAL by roughly 7%, but did not validate query performance. Existing indexes and raw log fields remain intact. An integration test confirms that repeated identical JSON configuration saves preserve the heap version and modification timestamp; actual changed values still update.
+
+Reproduce the write measurements with `scripts/benchmark-ingest-io.py`. It uses isolated disposable Docker resources, no production DSN or deployment environment, and bounds both fixture memory and container memory. See [PostgreSQL settings and rollback](postgresql.md) and [batching behavior](performance.md).
+
 ## GeoIP concurrency audit fix: 3.7.2-gzeon.9
 
 The audit reproduced a `.8` regression: a slow background GeoIP read held the shared reader lock and prevented an unrelated cold lookup on the ingestion worker from proceeding. A receiver-level test failed before the fix and passed after it. Reader leases now permit concurrent lookups while keeping old readers open until their users finish. Replacement results cannot enter the wrong cache generation. Serialized reloads and one retirement worker bound retained reader pairs, including during a stalled lookup or close.
