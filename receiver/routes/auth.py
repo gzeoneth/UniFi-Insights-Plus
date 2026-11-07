@@ -14,6 +14,7 @@ from psycopg2.extras import RealDictCursor
 
 from db import get_config, set_config
 from deps import get_conn, put_conn, enricher_db
+from request_auth import remember_bearer_context
 
 logger = logging.getLogger('api.auth')
 router = APIRouter()
@@ -291,8 +292,12 @@ def _validate_api_token(token: str) -> dict | None:
                 if expected and salt:
                     computed = _hmac.new(salt.encode(), token.encode(), 'sha256').hexdigest()
                     if _hmac.compare_digest(computed, expected):
-                        # Update last_used_at
-                        cur.execute("UPDATE api_tokens SET last_used_at = NOW() WHERE id = %s", [row['token_id']])
+                        # Authorization is always read afresh. Only this
+                        # informational timestamp is coalesced across requests.
+                        cur.execute("""UPDATE api_tokens SET last_used_at = NOW()
+                            WHERE id = %s AND (last_used_at IS NULL
+                                OR last_used_at < NOW() - INTERVAL '60 seconds')""",
+                                    [row['token_id']])
                         conn.commit()
                         return dict(row)
         conn.commit()
@@ -317,7 +322,7 @@ def validate_token_with_effective_scopes(token: str) -> dict | None:
         return None
     token_scopes = set(info.get('scopes') or [])
     owner_perms = set(info.get('user_permissions') or [])
-    if info.get('owner_user_id') and owner_perms and '*' not in owner_perms:
+    if info.get('owner_user_id') and '*' not in owner_perms:
         effective = token_scopes & owner_perms
     else:
         effective = token_scopes
@@ -369,6 +374,7 @@ def require_auth(request: Request) -> dict | None:
         token = auth_header[7:].strip()
         info = validate_token_with_effective_scopes(token)
         if info:
+            remember_bearer_context(request, token, info)
             return info
         raise HTTPException(401, "Invalid or expired API token")
 

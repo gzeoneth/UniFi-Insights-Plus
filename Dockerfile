@@ -75,4 +75,7 @@ WORKDIR /app
 EXPOSE 514/udp
 EXPOSE 8000
 
+ARG APP_VERSION=development
+LABEL org.opencontainers.image.version="${APP_VERSION}"
+
 CMD ["/app/entrypoint.sh"]

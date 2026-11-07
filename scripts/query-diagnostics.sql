@@ -9,14 +9,17 @@ SELECT name, setting, unit, source
 FROM pg_settings
 WHERE name IN ('shared_buffers', 'work_mem', 'maintenance_work_mem',
                'effective_cache_size', 'max_connections', 'synchronous_commit',
-               'statement_timeout', 'autovacuum')
+               'statement_timeout', 'autovacuum', 'track_counts',
+               'autovacuum_analyze_threshold', 'autovacuum_analyze_scale_factor',
+               'default_statistics_target', 'track_io_timing')
 ORDER BY name;
 
 SELECT c.reltuples::bigint AS estimated_rows,
        pg_size_pretty(pg_relation_size(c.oid)) AS table_size,
        pg_size_pretty(pg_indexes_size(c.oid)) AS index_size,
        pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size,
-       s.n_live_tup, s.n_dead_tup, s.last_analyze, s.last_autoanalyze,
+       s.n_live_tup, s.n_dead_tup, s.n_mod_since_analyze, c.reloptions,
+       s.last_analyze, s.last_autoanalyze,
        s.last_vacuum, s.last_autovacuum
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace

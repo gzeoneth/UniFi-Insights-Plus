@@ -20,6 +20,7 @@ from starlette.requests import Request as StarletteRequest
 from starlette.responses import Response as StarletteResponse
 
 from deps import APP_VERSION
+from request_auth import clear_bearer_context
 from routes.logs import router as logs_router
 from routes.security import router as security_router
 from routes.retention import router as retention_router
@@ -187,6 +188,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         # Initialise auth_info so route handlers can always read it
         request.state.auth_info = None
+        clear_bearer_context(request)
 
         # Only gate /api/ paths — static assets, SPA, etc. pass through
         if not path.startswith('/api/'):
@@ -221,7 +223,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
             is_token = bool(auth_info.get('token_id'))
             if is_token:
                 # effective_scopes already computed by require_auth (token ∩ owner role)
-                scopes = auth_info.get('effective_scopes') or set(auth_info.get('scopes') or [])
+                effective = auth_info.get('effective_scopes')
+                scopes = set(effective) if effective is not None else set(auth_info.get('scopes') or [])
 
                 # Token management is session-only — reject tokens entirely
                 if path.startswith('/api/tokens'):

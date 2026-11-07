@@ -11,6 +11,14 @@ import db as db_module
 from db import Database
 
 
+@pytest.fixture(autouse=True)
+def _isolate_static_index_tests(monkeypatch):
+    # The conditional lifecycle has real PostgreSQL coverage in
+    # test_pihole_persistence_postgres.py; these scripted cursors exercise
+    # the older static migration/index worker without starting daemon threads.
+    monkeypatch.setattr(Database, 'request_service_name_index_maintenance', MagicMock())
+
+
 class FakeCursor:
     """Minimal cursor stub that records SQL and can inject failures."""
 
@@ -108,6 +116,8 @@ def test_ensure_schema_uses_transaction_scoped_advisory_lock(monkeypatch):
     assert "SELECT pg_try_advisory_lock(20250314)" not in executed_sql
     assert "SELECT pg_advisory_unlock(20250314)" not in executed_sql
     assert any(sql.startswith("SAVEPOINT sp_0") for sql in executed_sql)
+    assert not any('CREATE INDEX' in sql and 'idx_logs_fw_service_name_null_id' in sql
+                   for sql in executed_sql)
     database._backfill_tz_timestamps.assert_called_once_with()
 
 
@@ -771,6 +781,7 @@ def test_index_maintenance_recovers_invalid_build_before_retry(monkeypatch):
     database = Database(conn_params={'user': 'unifi'})
     database._POST_BOOT_INDEXES = [Database._POST_BOOT_INDEXES[0]]
     database._POST_BOOT_DROPS = []
+    monkeypatch.setattr(database, 'request_service_name_index_maintenance', MagicMock())
     monkeypatch.setattr(db_module.psycopg2, 'connect', lambda **kwargs: conn)
     database.ensure_post_boot_indexes()
     statements = [call.args[0] for call in cursor.execute.call_args_list]
@@ -800,6 +811,7 @@ def test_index_maintenance_cancellation_stops_following_ddl(monkeypatch):
     cursor = conn.cursor.return_value.__enter__.return_value
     cursor.fetchone.side_effect = [(True,), None]
     database = Database(conn_params={'user': 'unifi'})
+    monkeypatch.setattr(database, 'request_service_name_index_maintenance', MagicMock())
     def execute(sql, params=None):
         if sql.startswith('CREATE INDEX'):
             database.cancel_index_maintenance()

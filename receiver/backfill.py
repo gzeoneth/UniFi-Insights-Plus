@@ -223,7 +223,8 @@ class BackfillTask:
         """
         from db import get_config, set_config
 
-        if get_config(self.db, 'service_name_backfill_done', False):
+        self.db.request_service_name_index_maintenance()
+        if get_config(self.db, 'service_name_backfill_done', False) is True:
             return
 
         last_id = get_config(self.db, 'service_name_backfill_last_id', 0) or 0
@@ -235,6 +236,7 @@ class BackfillTask:
         if not rows:
             # No more rows — mark as done
             set_config(self.db, 'service_name_backfill_done', True)
+            self.db.request_service_name_index_maintenance()
             logger.info("Service-name backfill complete (cursor at id=%d)", last_id)
             return
 

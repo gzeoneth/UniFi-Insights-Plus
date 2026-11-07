@@ -132,6 +132,8 @@ def test_concurrent_upgrade_recovers_invalid_index_in_nondefault_schema():
         database = Database(conn_params=params)
         database._POST_BOOT_INDEXES = SECURITY_INDEXES
         database._POST_BOOT_DROPS = []
+        # This fixture exercises only the static security-index lifecycle.
+        database._SERVICE_NAME_INDEX = None
         database.ensure_post_boot_indexes()
         with connection.cursor() as cursor:
             cursor.execute("SELECT c.relname,i.indisvalid,i.indisunique FROM pg_index i "

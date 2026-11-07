@@ -8,7 +8,7 @@ arch=${platform#linux/}
 tag="unifi-insights-plus:${version}-${arch}"
 mkdir -p .local/buildx
 export BUILDX_CONFIG="${BUILDX_CONFIG:-$(pwd)/.local/buildx}"
-docker buildx build --platform "$platform" --load --tag "$tag" .
+docker buildx build --platform "$platform" --build-arg "APP_VERSION=$version" --load --tag "$tag" .
 docker tag "$tag" "unifi-insights-plus:$version"
 mkdir -p .local/artifacts
 archive=".local/artifacts/unifi-insights-plus-${version}-${arch}.tar.gz"

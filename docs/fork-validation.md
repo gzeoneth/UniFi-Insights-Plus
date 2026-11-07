@@ -2,6 +2,19 @@
 
 The changes were tested against the upstream v3.7.2 base using synthetic events and disposable local databases. No live collector, gateway or production database was modified for these checks.
 
+## Import and request efficiency: 3.7.2-gzeon.11
+
+- The backend suite passed 1,501 tests with disposable PostgreSQL 16 integration enabled. The Linux-only embedded-profile test passed separately in the built image. All 332 UI tests and the production UI build passed.
+- In a controlled 100-request HTTP/auth test, fresh authorization reads and auth commits fell from 200 to 100, and actual token timestamp updates fell from 200 to one. All 100 audit callbacks remained. A separate packaged-image test confirmed 200 versus one token timestamp updates with all 100 audit records written. These compare work performed, not production response-time guarantees.
+- Two overlapping 1,000-event Pi-hole transactions stored exactly 1,000 events; the stale worker could not move the cursor backward. A 5,000-event replay retained exactly 5,000 unique events using the existing ingest index. Tests cover lost commit acknowledgements, restarted workers, endpoint aliases, reused query IDs with different timestamps and stale source generations. Historical rows are not rewritten.
+- A real collector-to-PostgreSQL test imported 1,200 events in three chunks. Replaying after an endpoint alias change retained 1,200 rows; an explicit cursor reset followed by a reused ID at a new time produced the expected 1,201st row. Chunk failures and cancellation retain committed cursor boundaries.
+- With enrichment enabled, 100 distinct domains required one cached resolver-endpoint lookup instead of one lookup per domain. Numeric DNS endpoints require no hostname lookup. With enrichment set to None, import issued no DNS/enricher calls. Budget exhaustion retained every fetched event. Tests cover blocked lookups, repeated starts, cancellation, transient reload failure and recovery.
+- Real PostgreSQL tests exercise completed, incomplete and malformed service-backfill markers, concurrent index creation, fail-fast marker contention, interrupted builds, retirement and rebuilding after a reset. Re-running bootstrap SQL does not recreate a retired completed-migration index. Other event indexes remain intact.
+- The packaged ARM64 image stored all 2,000 synthetic UDP events with 2,000 unique ingest IDs, an empty pending spool and no reported drops, parse failures or database errors. Durability settings remained enabled. ARM64 and AMD64 image builds and runtime health checks passed; ten critical source hashes matched the tested checkout in both images.
+- A packaged `.10` to `.11` upgrade preserved all 200 fixture events, token identities and an encrypted configuration value. Authenticated browsing and decryption worked afterward. This validates that disposable upgrade fixture, not an operator's production backup or deployment.
+
+Tests and documentation use reserved addresses, synthetic users and disposable databases. Local timings depend on the test host. No production throughput, lossless UDP transport or historical deduplication is claimed. See [performance](performance.md) and [Pi-hole import](pihole-import.md) for behavior and upgrade limits.
+
 ## Database buffering: 3.7.2-gzeon.10
 
 - All 1,440 backend tests passed with disposable PostgreSQL integration enabled. The separate embedded-profile integration test passed against PostgreSQL 16: applying the profile to an existing cluster, starting it with the intended settings, preserving existing data, disabling the profile, and rejecting a conflicting durability override without changing the original configuration. Eighteen focused UI tests and the production UI/image build passed.

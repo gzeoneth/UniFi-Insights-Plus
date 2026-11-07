@@ -1,6 +1,7 @@
 """Pi-hole v6 settings, connection test endpoints."""
 
 import logging
+import ipaddress
 
 from fastapi import APIRouter, HTTPException
 
@@ -23,6 +24,7 @@ def update_pihole_settings(body: dict):
     """Save Pi-hole settings to system_config."""
     # Validate all fields before persisting anything
     interval = None
+    dns_server = None
     if 'poll_interval' in body:
         try:
             interval = int(body['poll_interval'])
@@ -33,16 +35,25 @@ def update_pihole_settings(body: dict):
     if 'enrichment' in body:
         if body['enrichment'] not in ('none', 'geoip', 'threat', 'both'):
             raise HTTPException(400, 'enrichment must be one of: none, geoip, threat, both')
+    if 'dns_server' in body:
+        if not isinstance(body['dns_server'], str):
+            raise HTTPException(400, 'dns_server must be a numeric IP address or empty')
+        dns_server = body['dns_server'].strip()
+        if dns_server:
+            try:
+                dns_server = str(ipaddress.ip_address(dns_server))
+            except ValueError:
+                raise HTTPException(400, 'dns_server must be a numeric IP address or empty') from None
+    if 'host' in body and not isinstance(body['host'], str):
+        raise HTTPException(400, 'host must be a string')
 
     # All valid — persist
-    current_host = get_config(enricher_db, 'pihole_host', '')
-
     if 'enabled' in body:
         set_config(enricher_db, 'pihole_enabled', body['enabled'])
         if not body['enabled']:
             set_config(enricher_db, 'pihole_poll_status', None)
     if 'host' in body:
-        set_config(enricher_db, 'pihole_host', body['host'])
+        enricher_db.set_pihole_host(body['host'])
     if 'password' in body:
         val = body['password']
         if val:
@@ -51,13 +62,12 @@ def update_pihole_settings(body: dict):
         set_config(enricher_db, 'pihole_poll_interval', interval)
     if 'enrichment' in body:
         set_config(enricher_db, 'pihole_enrichment', body['enrichment'])
+    if dns_server is not None:
+        set_config(enricher_db, 'pihole_dns_server', dns_server)
 
-    # Reset cursor when host changes so we re-fetch from the new instance
-    new_host = body.get('host')
-    if new_host is not None and new_host != current_host:
-        set_config(enricher_db, 'pihole_last_cursor', 0)
-
-    pihole_poller.reload_config()
+    # Only the receiver collects. This API-local instance supplies settings
+    # and connection tests, never a second background importer.
+    pihole_poller.reload_config(restart_polling=False)
     signal_receiver()
 
     return {"success": True}

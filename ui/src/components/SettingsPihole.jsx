@@ -67,6 +67,7 @@ export default function SettingsPihole() {
       || (draft.enabled && !settings.enabled)
       || draft.poll_interval !== settings.poll_interval
       || draft.enrichment !== settings.enrichment
+      || (draft.dns_server || '') !== (settings.dns_server || '')
       || (!!draft.password)
   }, [settings, draft])
 
@@ -292,7 +293,29 @@ export default function SettingsPihole() {
                   <option key={opt.value} value={opt.value}>{opt.label}</option>
                 ))}
               </select>
-              <p className="text-sm text-gray-500 mt-1">Apply GeoIP and/or threat score enrichment to DNS query IPs.</p>
+              <p className="text-sm text-gray-500 mt-1">
+                {draft.enrichment === 'none'
+                  ? 'Import queries without extra DNS lookups or GeoIP and threat enrichment.'
+                  : 'Look up current destination IPs for GeoIP and threat enrichment. These lookups do not establish the original DNS answer.'}
+              </p>
+            </div>
+
+            <div>
+              <label htmlFor="pihole-dns-server" className="text-sm font-medium text-gray-200 block mb-1">
+                DNS server for enrichment (optional)
+              </label>
+              <input
+                id="pihole-dns-server"
+                type="text"
+                value={draft.dns_server || ''}
+                onChange={e => setDraft(prev => ({ ...prev, dns_server: e.target.value }))}
+                placeholder="192.0.2.53 or 2001:db8::53"
+                disabled={draft.enrichment === 'none'}
+                className={`${INPUT_CLS} disabled:opacity-50`}
+              />
+              <p className="text-sm text-gray-500 mt-1">
+                Use Pi-hole's DNS IP when its web URL goes through a reverse proxy. Leave blank to use the URL's host.
+              </p>
             </div>
 
             {/* Test connection */}

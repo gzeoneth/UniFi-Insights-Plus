@@ -11,6 +11,9 @@ import sys
 import json
 import logging
 import time
+import threading
+import uuid
+from decimal import Decimal, InvalidOperation
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import NamedTuple, Optional
@@ -291,6 +294,17 @@ class RetentionDaysConfig(NamedTuple):
 class Database:
     """PostgreSQL connection pool and operations."""
 
+    # These locks also cover absent config rows on a fresh installation.
+    _PIHOLE_CURSOR_LOCK = 2026110701
+    _SERVICE_NAME_INDEX_LOCK = 2026110702
+    _SERVICE_NAME_INDEX = {
+        'name': 'idx_logs_fw_service_name_null_id',
+        'sql': 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_logs_fw_service_name_null_id '
+               "ON logs (id) WHERE log_type = 'firewall' "
+               'AND service_name IS NULL AND dst_port IS NOT NULL',
+        'label': 'unfinished service-name backfill',
+    }
+
     # Heavyweight indexes created post-boot with CONCURRENTLY for upgrades.
     # Security indexes are created here on both fresh installs and upgrades;
     # older performance indexes are also present in init.sql.
@@ -331,6 +345,9 @@ class Database:
         self.max_conn = max_conn
         self._index_maintenance_connection = None
         self._index_maintenance_stop = False
+        self._service_index_connection = None
+        self._service_index_thread = None
+        self._service_index_thread_lock = threading.Lock()
         # Only display labels use this cache. Auth, filters, policies and
         # ordinary get_config reads retain their existing immediate semantics.
         self._display_config_cache = ReadCache(seconds=10, max_entries=1,
@@ -736,12 +753,8 @@ END $$;""",
                   AND threat_score IS NOT NULL
                   AND abuse_usage_type IS NULL
                   AND dst_ip IS NOT NULL""",
-            # 5. One-shot service-name migration support (ID-cursor reads)
-            """CREATE INDEX IF NOT EXISTS idx_logs_fw_service_name_null_id
-                ON logs (id)
-                WHERE log_type = 'firewall'
-                  AND service_name IS NULL
-                  AND dst_port IS NOT NULL""",
+            # The one-shot service-name index is maintained concurrently after
+            # boot, and retired only after its committed completion marker.
             # ── Issue #98: persistent rDNS cache (DB-backed cold tier) ─────
             """CREATE TABLE IF NOT EXISTS rdns_cache (
                 ip            INET PRIMARY KEY,
@@ -901,12 +914,78 @@ END $$;""",
     def cancel_index_maintenance(self):
         """Cancel the dedicated maintenance session during receiver shutdown."""
         self._index_maintenance_stop = True
-        connection = self._index_maintenance_connection
-        if connection is not None:
-            try:
-                connection.cancel()
-            except Exception:
-                logger.debug("Index maintenance connection already closed", exc_info=True)
+        for connection in (self._index_maintenance_connection, self._service_index_connection):
+            if connection is not None:
+                try:
+                    connection.cancel()
+                except Exception:
+                    logger.debug("Index maintenance connection already closed", exc_info=True)
+
+    def request_service_name_index_maintenance(self):
+        """Retry the one-shot index lifecycle without blocking backfill work."""
+        with self._service_index_thread_lock:
+            if self._index_maintenance_stop:
+                return
+            if self._service_index_thread and self._service_index_thread.is_alive():
+                return
+            self._service_index_thread = threading.Thread(
+                target=self.maintain_service_name_backfill_index,
+                daemon=True, name='service-name-index',
+            )
+            self._service_index_thread.start()
+
+    def maintain_service_name_backfill_index(self):
+        """Keep the migration index only while its marker is not JSON true.
+
+        DDL has its own autocommit session. The same advisory lock guards
+        marker writes, so a reset cannot occur between the marker read and a
+        concurrent drop. Failure never changes backfill progress; a later
+        backfill cycle or startup retries it.
+        """
+        if self._index_maintenance_stop or not self._SERVICE_NAME_INDEX:
+            return
+        conn = None
+        try:
+            conn = psycopg2.connect(**self.conn_params)
+            conn.autocommit = True
+            self._service_index_connection = conn
+            with conn.cursor() as cur:
+                cur.execute('SELECT pg_try_advisory_lock(%s)', [self._SERVICE_NAME_INDEX_LOCK])
+                if not cur.fetchone()[0]:
+                    return
+                cur.execute("SET lock_timeout = '5s'")
+                cur.execute("SET statement_timeout = '30min'")
+                if self._index_maintenance_stop:
+                    return
+                cur.execute("SELECT value FROM system_config WHERE key = 'service_name_backfill_done'")
+                marker = cur.fetchone()
+                done = marker is not None and marker[0] is True
+                name = self._SERVICE_NAME_INDEX['name']
+                cur.execute('''SELECT i.indisvalid, n.nspname FROM pg_index i
+                    JOIN pg_class c ON c.oid = i.indexrelid
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE i.indrelid = 'logs'::regclass AND c.relname = %s''', [name])
+                existing = cur.fetchone()
+                if self._index_maintenance_stop:
+                    return
+                if existing and (done or not existing[0]):
+                    cur.execute(pg_sql.SQL('DROP INDEX CONCURRENTLY IF EXISTS {}').format(
+                        pg_sql.Identifier(existing[1], name)))
+                    logger.info('Retired %s' if done else 'Removed interrupted %s', name)
+                if not done and (not existing or not existing[0]):
+                    if self._index_maintenance_stop:
+                        return
+                    cur.execute(self._SERVICE_NAME_INDEX['sql'])
+                    logger.info('Created %s for unfinished backfill', name)
+        except Exception:
+            if not self._index_maintenance_stop:
+                logger.warning('Service-name index maintenance failed; will retry next cycle',
+                               exc_info=True)
+        finally:
+            if conn is not None:
+                if self._service_index_connection is conn:
+                    self._service_index_connection = None
+                conn.close()  # Releases the session advisory lock.
 
     def ensure_post_boot_indexes(self):
         """Build upgrade indexes without delaying intake or locking out inserts.
@@ -984,6 +1063,8 @@ END $$;""",
         finally:
             self._index_maintenance_connection = None
             conn.close()  # Releases the session advisory lock as well.
+
+        self.request_service_name_index_maintenance()
 
 
     def _backfill_tz_timestamps(self):
@@ -1175,28 +1256,76 @@ END $$;""",
             logger.warning("Isolated batch pending retry (%s)", type(exc).__name__)
             return InsertResult(retryable=list(logs))
 
-    def insert_pihole_batch(self, logs: list[dict], new_cursor: int):
-        """Atomic insert of Pi-hole logs + cursor update. No row-by-row fallback.
+    @staticmethod
+    def _pihole_event_id(source_id, log):
+        """Identity excludes mutable replies, enrichment and endpoint aliases."""
+        record = json.loads(log['raw_log'], parse_float=Decimal)
+        query_id = record.get('id')
+        if type(query_id) is not int or query_id < 0:
+            raise ValueError('Pi-hole query requires a nonnegative integer id')
+        try:
+            epoch = Decimal(str(record['time']))
+            if not epoch.is_finite() or not 0 <= epoch <= Decimal('253402300799.999999'):
+                raise ValueError('Pi-hole query requires a valid timestamp')
+        except (KeyError, InvalidOperation) as exc:
+            raise ValueError('Pi-hole query requires a finite timestamp') from exc
+        identity = [query_id, format(epoch.normalize(), 'f'),
+                    (record.get('client') or {}).get('ip'),
+                    record.get('domain'), record.get('type')]
+        return str(uuid.uuid5(uuid.UUID(source_id), json.dumps(identity, separators=(',', ':'))))
 
-        Uses _execute_log_insert() for the shared insert logic, then updates
-        the cursor in the same transaction.  On ANY failure the entire
-        transaction rolls back — no partial inserts, no cursor drift.
+    def insert_pihole_batch(self, logs: list[dict], new_cursor: int,
+                            expected_host=None, expected_generation=None):
+        """Durably insert events and monotonically advance one source cursor.
+
+        The transaction lock serializes independent API/receiver workers,
+        including the first insert before a cursor row exists. Deterministic
+        UUIDs reuse the existing unique ingest index for retries after an
+        ambiguous commit. Return the committed cursor, or None for a stale
+        source generation. No partial insert or cursor update is acknowledged.
         """
-        if not logs:
-            return
+        if type(new_cursor) is not int or new_cursor < 0:
+            raise ValueError('Pi-hole cursor must be a nonnegative integer')
         conn = self.pool.getconn()
         failed = False
         try:
             with conn.cursor() as cur:
-                self._execute_log_insert(cur, logs)
+                cur.execute("SET LOCAL statement_timeout = '30s'")
+                cur.execute('SET LOCAL synchronous_commit = on')
+                cur.execute('SELECT pg_advisory_xact_lock(%s)', [self._PIHOLE_CURSOR_LOCK])
+                cur.execute('SELECT key, value FROM system_config WHERE key = ANY(%s)', [[
+                    'pihole_host', 'pihole_source_generation', 'pihole_source_id',
+                    'pihole_last_cursor',
+                ]])
+                config = dict(cur.fetchall())
+                host = (os.environ.get('PIHOLE_HOST') or config.get('pihole_host') or '').strip().rstrip('/')
+                generation = config.get('pihole_source_generation', 0)
+                if type(generation) is not int or generation < 0:
+                    raise ValueError('Stored Pi-hole generation is invalid')
+                if ((expected_host is not None and expected_host.strip().rstrip('/') != host)
+                        or (expected_generation is not None and expected_generation != generation)):
+                    conn.rollback()
+                    return None
+                source_id = config.get('pihole_source_id')
+                if source_id is None:
+                    source_id = str(uuid.uuid4())
+                    self._set_config_tx(cur, 'pihole_source_id', source_id)
+                identified = [dict(log, ingest_id=self._pihole_event_id(source_id, log)) for log in logs]
+                inserted = self._execute_log_insert(cur, identified)
+                current = config.get('pihole_last_cursor', 0)
+                if type(current) is not int or current < 0:
+                    raise ValueError('Stored Pi-hole cursor is invalid')
+                committed_cursor = max(current, new_cursor)
                 cur.execute(
                     """INSERT INTO system_config (key, value, updated_at)
                        VALUES ('pihole_last_cursor', %s::jsonb, NOW())
                        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()""",
-                    [str(new_cursor)]
+                    [str(committed_cursor)]
                 )
             conn.commit()
-            logger.debug("Pi-hole batch: inserted %d logs, cursor=%d", len(logs), new_cursor)
+            logger.debug("Pi-hole batch: inserted %d, duplicates %d, cursor=%d",
+                         inserted, len(logs) - inserted, committed_cursor)
+            return committed_cursor
         except Exception:
             failed = True
             conn.rollback()
@@ -1887,15 +2016,58 @@ END $$;""",
         """
         with self.get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
+                if key == 'service_name_backfill_done':
+                    cur.execute("SET LOCAL lock_timeout = '5s'")
+                    cur.execute("SET LOCAL statement_timeout = '30s'")
+                    cur.execute('SET LOCAL synchronous_commit = on')
+                    # Never wait here: concurrent index creation may itself
+                    # need this statement's snapshot to finish. Let the next
+                    # backfill cycle retry without holding that old snapshot.
+                    cur.execute('SELECT pg_try_advisory_xact_lock(%s)', [self._SERVICE_NAME_INDEX_LOCK])
+                    if not cur.fetchone()[0]:
+                        raise psycopg2.errors.LockNotAvailable(
+                            'Service-name index maintenance is busy; retry the completion marker')
+                self._set_config_tx(cur, key, value)
+        if key in self._DISPLAY_CONFIG_KEYS:
+            self._display_config_cache.clear()
+
+    @staticmethod
+    def _set_config_tx(cur, key, value):
+        """Upsert using a caller-owned transaction; never acknowledges commit."""
+        cur.execute("""
                     INSERT INTO system_config (key, value, updated_at)
                     VALUES (%s, %s, NOW())
                     ON CONFLICT (key) DO UPDATE
                     SET value = EXCLUDED.value, updated_at = NOW()
                     WHERE system_config.value IS DISTINCT FROM EXCLUDED.value
-                """, [key, Json(value)])  # Use Json() for proper JSONB handling
-        if key in self._DISPLAY_CONFIG_KEYS:
-            self._display_config_cache.clear()
+                """, [key, Json(value)])
+
+    def set_pihole_host(self, host):
+        """Atomically replace the endpoint and invalidate in-flight old polls.
+
+        The stable source UUID survives URL/alias changes; a reset cursor can
+        safely revisit existing events without creating another copy.
+        """
+        host = host.strip().rstrip('/')
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SET LOCAL statement_timeout = '30s'")
+                cur.execute('SET LOCAL synchronous_commit = on')
+                cur.execute('SELECT pg_advisory_xact_lock(%s)', [self._PIHOLE_CURSOR_LOCK])
+                cur.execute('SELECT key, value FROM system_config WHERE key = ANY(%s)', [[
+                    'pihole_host', 'pihole_source_generation',
+                ]])
+                config = dict(cur.fetchall())
+                old_host = (config.get('pihole_host') or '').strip().rstrip('/')
+                generation = config.get('pihole_source_generation', 0)
+                if type(generation) is not int or generation < 0:
+                    raise ValueError('Stored Pi-hole generation is invalid')
+                if host != old_host:
+                    generation += 1
+                    self._set_config_tx(cur, 'pihole_host', host)
+                    self._set_config_tx(cur, 'pihole_last_cursor', 0)
+                    self._set_config_tx(cur, 'pihole_source_generation', generation)
+        return generation
 
 
     # ── rDNS cache (issue #98) ───────────────────────────────────────────────

@@ -23,6 +23,7 @@ from routes import unifi as unifi_routes
 from routes import health as health_routes
 from routes import threats as threats_routes
 from routes.auth import get_forwarded_proto, validate_token_with_effective_scopes
+from request_auth import validated_bearer_context
 
 logger = logging.getLogger('api.mcp')
 
@@ -110,6 +111,12 @@ def _lookup_token(token: str) -> dict | None:
     if not token:
         return None
     return validate_token_with_effective_scopes(token)
+
+
+def _request_token(request: Request, token: str) -> dict | None:
+    """Reuse middleware validation, or validate when middleware is inactive."""
+    info = validated_bearer_context(request, token)
+    return info if info is not None else _lookup_token(token)
 
 
 def _require_scope(token_info: dict, required: list[str]) -> None:
@@ -785,7 +792,7 @@ async def mcp_get(request: Request):
     _validate_protocol_version(request)
 
     token = _get_bearer_token(request)
-    token_info = await run_in_threadpool(_lookup_token, token)
+    token_info = await run_in_threadpool(_request_token, request, token)
     if not token_info:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -805,7 +812,7 @@ async def mcp_post(request: Request):
     _validate_protocol_version(request)
 
     token = _get_bearer_token(request)
-    token_info = await run_in_threadpool(_lookup_token, token)
+    token_info = await run_in_threadpool(_request_token, request, token)
     if not token_info:
         raise HTTPException(status_code=401, detail="Unauthorized")
 

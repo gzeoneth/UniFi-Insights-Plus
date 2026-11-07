@@ -114,6 +114,16 @@ See [query and index coverage](query-indexes.md) for the field-by-field audit, m
 
 Memory settings also need measurement. PostgreSQL `work_mem` applies per sort/hash operation and concurrent queries can use several such allocations. Disk capacity is not a reason to increase it or the connection pool. Keep searchable retention separate from optional archives and summaries.
 
+## Release 3.7.2-gzeon.11
+
+MCP reuses bearer authentication already completed for the current HTTP request. A new request still reads current token, owner and role permissions. Token revocation and empty effective permissions remain enforced. The informational token `last_used_at` timestamp is written at most once per minute; enabled audit records are still written per tool call. This reduces database writes without caching authorization across requests or weakening event-ingest durability.
+
+Pi-hole import has one receiver-owned worker and deterministic event identities using the existing ingest-ID uniqueness index. Overlapping polls and retries cannot add the same newly identified event twice or move the cursor backward. Settings reload waits for the old worker to finish before starting another. See [Pi-hole import](pihole-import.md) for DNS enrichment behavior and upgrade limits.
+
+The service-name migration index now has a lifecycle. Background maintenance retains or rebuilds it while the backfill marker is missing, false or malformed. Only a strictly true completion marker allows concurrent retirement. Resetting that marker allows the index to be rebuilt. Startup does not recreate an already retired index for a completed migration. Other event indexes and historical rows remain intact.
+
+These changes target repeated work rather than adding an index for every filter. The diagnostic script now includes changes since ANALYZE and both global analyze settings and table overrides. Inaccurate row estimates should prompt a statistics check and comparable plans before index or memory changes. This release does not automatically run ANALYZE or change autovacuum thresholds.
+
 ## Upgrade verification
 
 Back up the database and preserve encryption keys before staging an upgrade. Verify new count/cursor behavior and a fresh event through receipt, parsing, durable staging, database insertion and the intended filtered view. Confirm queue/spool ages settle after a burst and drop counters stop increasing. Compare actual filter latency and memory against the previous version before switching production traffic.
