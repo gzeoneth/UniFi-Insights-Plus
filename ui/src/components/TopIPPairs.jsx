@@ -1,11 +1,12 @@
-import { useState, useEffect, useRef } from 'react'
+import usePreference from '../hooks/usePreference'
 import { fetchIPPairs } from '../api'
-import { readCache, writeCache } from '../lib/sessionCache'
+import useFlowQuery from '../hooks/useFlowQuery'
 import { formatNumber, formatServiceName, resolveIpSublines } from '../utils'
 import IPCell from './IPCell'
 import InfoTooltip from './InfoTooltip'
 import KebabMenu, { SaveLoadMenuItems } from './KebabMenu'
 import { exportCsv } from '../lib/exportCsv'
+import { FLOW_PAIR_LIMIT_KEY } from '../lib/flowPreferences'
 
 // Sankey node type → API param name mapping
 const SANKEY_PARAM_MAP = {
@@ -52,56 +53,27 @@ function TopIPPairsMenuItems({ onSaveView, onLoadView, savedViews, onDeleteView,
   )
 }
 
-// onIpClick(ip, rowIndex) — rowIndex is used by FlowView's toggle logic:
+// onIpClick(ip, rowIndex): rowIndex is used by FlowView's toggle logic:
 // clicking the same IP in the same row closes the panel, different row keeps it open.
 export default function TopIPPairs({ filters, refreshKey, sankeyFilter, onClearSankeyFilter, zoneFilter, onClearZoneFilter, onIpClick, onSaveView, onLoadView, savedViews, onDeleteView, onRefreshViews, deferFetch }) {
-  const [pairs, setPairs] = useState([])
-  const [loading, setLoading] = useState(true)
-  const [limit, setLimit] = useState(25)
-  const refreshKeyRef = useRef(refreshKey)
-
-  // Build stable dependency key for cross-filters
-  const sankeyKey = sankeyFilter ? `${sankeyFilter.type}:${sankeyFilter.value}` : ''
-  const zoneKey = zoneFilter ? `${zoneFilter.interface_in}:${zoneFilter.interface_out}` : ''
-
-  useEffect(() => {
-    if (deferFetch) return
-
-    const disc = [filters.time_range, filters.time_from, filters.time_to, filters.rule_action, filters.direction, sankeyKey, zoneKey, limit].join('|')
-    const cached = readCache('ip-pairs', disc)
-    if (cached && refreshKey === refreshKeyRef.current) {
-      setPairs(cached)
-      setLoading(false)
-      return
-    }
-    refreshKeyRef.current = refreshKey
-
-    let cancelled = false
-    setLoading(true)
-    const params = { ...filters, limit }
-    if (sankeyFilter) {
-      const paramKey = SANKEY_PARAM_MAP[sankeyFilter.type] || sankeyFilter.type
-      params[paramKey] = sankeyFilter.value
-    }
-    if (zoneFilter) {
-      params.interface_in = zoneFilter.interface_in
-      params.interface_out = zoneFilter.interface_out
-    }
-    fetchIPPairs(params)
-      .then(data => {
-        if (!cancelled) { setPairs(data.pairs || []); writeCache('ip-pairs', disc, data.pairs || []) }
-      })
-      .catch(err => console.error('IP pairs fetch failed:', err))
-      .finally(() => { if (!cancelled) setLoading(false) })
-    return () => { cancelled = true }
-  }, [deferFetch, filters.time_range, filters.time_from, filters.time_to, filters.rule_action, filters.direction, sankeyKey, zoneKey, limit, refreshKey])
+  const [limit, setLimit] = usePreference(FLOW_PAIR_LIMIT_KEY, 25, value => [10, 25, 50, 100].includes(value))
+  const params = { ...filters }
+  if (sankeyFilter) params[SANKEY_PARAM_MAP[sankeyFilter.type] || sankeyFilter.type] = sankeyFilter.value
+  if (zoneFilter) {
+    params.interface_in = zoneFilter.interface_in
+    params.interface_out = zoneFilter.interface_out
+  }
+  const { data, loading, error } = useFlowQuery('ip-pairs', { ...params, limit }, fetchIPPairs, refreshKey, !deferFetch)
+  const pairs = data?.pairs || []
 
   const drillToLogs = (pair) => {
     window.dispatchEvent(new CustomEvent('drillToLogs', {
       detail: {
+        ...params,
         src_ip: pair.src_ip,
         dst_ip: pair.dst_ip,
         dst_port: pair.dst_port,
+        protocol: pair.protocol,
         service: pair.service_name,
         time_range: filters.time_range,
         time_from: filters.time_from || undefined,
@@ -123,6 +95,7 @@ export default function TopIPPairs({ filters, refreshKey, sankeyFilter, onClearS
         <div className="flex items-center gap-2">
           <label className="text-xs text-gray-500">Show</label>
           <select
+            aria-label="Number of IP pairs"
             value={limit}
             onChange={e => setLimit(Number(e.target.value))}
             className="bg-black text-gray-300 text-xs rounded px-1.5 py-0.5 border border-gray-700 focus:outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20"
@@ -165,7 +138,7 @@ export default function TopIPPairs({ filters, refreshKey, sankeyFilter, onClearS
         </div>
       )}
 
-      {loading ? (
+      {error ? <p role="alert" className="p-4 text-sm text-red-400">{error.status === 400 ? error.message : 'Could not load IP pairs for the current filters. Refresh to try again.'}</p> : loading ? (
         <div className="overflow-y-auto overflow-x-hidden min-h-0 flex-1 animate-pulse">
           <table className="w-full table-fixed">
             <thead>

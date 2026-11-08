@@ -1,18 +1,23 @@
 import { useState } from 'react'
 import { formatNumber } from '../utils'
 import ReleaseNotesModal, { isNewerVersion } from './ReleaseNotesModal'
+import { LOG_PAGE_SIZES } from '../lib/pageSizes'
 
-export default function Pagination({ page, pages, total, perPage, onChange, version, latestRelease }) {
+export default function Pagination({ page, pages, total, perPage, onChange, onPerPageChange, version, latestRelease, rowCount, hasMore, cursorMode = false, loading = false }) {
   const start = (page - 1) * perPage + 1
-  const end = Math.min(page * perPage, total)
+  const knownTotal = typeof total === 'number'
+  const end = knownTotal ? Math.min(page * perPage, total) : start + (rowCount || 0) - 1
+  const canNext = hasMore ?? (pages != null && page < pages)
   const outdated = latestRelease && isNewerVersion(latestRelease.tag, version)
   const [showNotes, setShowNotes] = useState(false)
 
   return (
     <>
-      <div className="flex items-center justify-between px-3 py-2 border-t border-gray-800">
+      <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 border-t border-gray-800">
         <span className="text-[11px] text-gray-400">
-          {total > 0 ? `${formatNumber(start)}–${formatNumber(end)} of ${formatNumber(total)}` : 'No results'}
+          {loading ? 'Loading events…' : knownTotal
+            ? total > 0 ? `${formatNumber(start)}–${formatNumber(end)} of ${formatNumber(total)}` : 'No results'
+            : rowCount > 0 ? `${formatNumber(start)}–${formatNumber(end)} · total not counted` : 'No events on this page · total not counted'}
         </span>
         {version && (
           <div className="flex items-center gap-1.5">
@@ -39,37 +44,48 @@ export default function Pagination({ page, pages, total, perPage, onChange, vers
           </div>
         )}
         <div className="flex items-center gap-1">
+          {onPerPageChange && <label className="flex items-center gap-2 mr-2 text-[11px] text-gray-400">
+            Rows per page
+            <select value={perPage} onChange={event => onPerPageChange(Number(event.target.value))}
+              className="bg-gray-950 border border-gray-700 rounded px-1.5 py-1 text-xs text-gray-200 focus:outline-none focus:ring-2 focus:ring-teal-500/40">
+              {LOG_PAGE_SIZES.map(size => <option key={size} value={size}>{size.toLocaleString()}</option>)}
+            </select>
+          </label>}
           <button
-            disabled={page <= 1}
+            aria-label="First page"
+            disabled={loading || page <= 1}
             onClick={() => onChange(1)}
             className="px-2 py-1 text-xs text-gray-400 hover:text-gray-200 disabled:text-gray-700 disabled:cursor-not-allowed"
           >
             ««
           </button>
           <button
-            disabled={page <= 1}
+            aria-label="Previous page"
+            disabled={loading || page <= 1}
             onClick={() => onChange(page - 1)}
             className="px-2 py-1 text-xs text-gray-400 hover:text-gray-200 disabled:text-gray-700 disabled:cursor-not-allowed"
           >
             «
           </button>
           <span className="px-3 py-1 text-xs text-gray-300">
-            {page} / {pages || 1}
+            {pages == null ? `Page ${page}` : `${page} / ${pages || 1}`}
           </span>
           <button
-            disabled={page >= pages}
+            aria-label="Next page"
+            disabled={loading || !canNext}
             onClick={() => onChange(page + 1)}
             className="px-2 py-1 text-xs text-gray-400 hover:text-gray-200 disabled:text-gray-700 disabled:cursor-not-allowed"
           >
             »
           </button>
-          <button
-            disabled={page >= pages}
+          {!cursorMode && pages != null && <button
+            aria-label="Last page"
+            disabled={loading || !canNext}
             onClick={() => onChange(pages)}
             className="px-2 py-1 text-xs text-gray-400 hover:text-gray-200 disabled:text-gray-700 disabled:cursor-not-allowed"
           >
             »»
-          </button>
+          </button>}
         </div>
       </div>
 

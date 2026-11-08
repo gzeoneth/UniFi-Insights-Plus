@@ -1,6 +1,6 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect } from 'react'
 import { fetchZoneMatrix } from '../api'
-import { readCache, writeCache } from '../lib/sessionCache'
+import useFlowQuery from '../hooks/useFlowQuery'
 import { formatNumber, ACTION_STYLES } from '../utils'
 import FullscreenToggle from './FullscreenToggle'
 import InfoTooltip from './InfoTooltip'
@@ -65,9 +65,7 @@ function Shell({ children, headerContent, isFullscreen, onToggleFullscreen }) {
 }
 
 export default function ZoneMatrix({ filters, refreshKey, onCellClick, activeCell }) {
-  const [data, setData] = useState(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(null)
+  const { data, loading, error } = useFlowQuery('zone-matrix', filters, fetchZoneMatrix, refreshKey)
   const [tooltip, setTooltip] = useState(null)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const toggleFullscreen = () => setIsFullscreen(f => !f)
@@ -76,28 +74,6 @@ export default function ZoneMatrix({ filters, refreshKey, onCellClick, activeCel
     return document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark'
   })
   const theme = themeMode === 'light' ? THEMES.light : THEMES.dark
-  const refreshKeyRef = useRef(refreshKey)
-
-  useEffect(() => {
-    const disc = [filters.time_range, filters.time_from, filters.time_to, filters.rule_action, filters.direction].join('|')
-    const cached = readCache('zone-matrix', disc)
-    if (cached && refreshKey === refreshKeyRef.current) {
-      setData(cached)
-      setLoading(false)
-      return
-    }
-    refreshKeyRef.current = refreshKey
-
-    let cancelled = false
-    setLoading(true)
-    setError(null)
-    fetchZoneMatrix(filters)
-      .then(d => { if (!cancelled) { setData(d); writeCache('zone-matrix', disc, d) } })
-      .catch(err => { if (!cancelled) setError(err.message) })
-      .finally(() => { if (!cancelled) setLoading(false) })
-    return () => { cancelled = true }
-  }, [filters.time_range, filters.time_from, filters.time_to, filters.rule_action, filters.direction, refreshKey])
-
   useEffect(() => {
     const root = document.documentElement
     const onThemeChange = () => {
@@ -109,7 +85,7 @@ export default function ZoneMatrix({ filters, refreshKey, onCellClick, activeCel
   }, [])
 
   if (loading) return <Shell isFullscreen={isFullscreen} onToggleFullscreen={toggleFullscreen}><div className="animate-pulse p-4 space-y-3"><div className="h-4 w-32 bg-gray-800 rounded" /><div className="grid grid-cols-4 gap-2">{[...Array(16)].map((_, i) => <div key={i} className="h-8 bg-gray-800 rounded" />)}</div></div></Shell>
-  if (error) return <Shell isFullscreen={isFullscreen} onToggleFullscreen={toggleFullscreen}><div className="flex items-center justify-center h-48 text-xs text-red-400">{error}</div></Shell>
+  if (error) return <Shell isFullscreen={isFullscreen} onToggleFullscreen={toggleFullscreen}><div className="flex items-center justify-center h-48 text-xs text-red-400">{error?.message || String(error)}</div></Shell>
   if (!data?.cells?.length) return <Shell isFullscreen={isFullscreen} onToggleFullscreen={toggleFullscreen}><div className="flex items-center justify-center h-48 text-xs text-gray-500">No zone traffic data for this time range</div></Shell>
 
   const { cells, interfaces, labels } = data
@@ -138,6 +114,7 @@ export default function ZoneMatrix({ filters, refreshKey, onCellClick, activeCel
 
   return (
     <Shell headerContent={<InfoTooltip><p>Click a zone pair cell to filter the Flow Graph and IP Pairs table by that source/destination zone.</p></InfoTooltip>} isFullscreen={isFullscreen} onToggleFullscreen={toggleFullscreen}>
+      {interfaces.some(iface => !iface) && <p className="px-4 pt-3 text-xs text-gray-400">Cells with an unnamed interface show event counts but cannot be selected as flow filters.</p>}
       <div className="overflow-auto flex-1 min-h-0 scroll-fade p-4">
         <table className="w-full border-separate text-[11px]" style={{ borderSpacing: 3 }}>
           <tbody>
@@ -214,8 +191,10 @@ export default function ZoneMatrix({ filters, refreshKey, onCellClick, activeCel
                   return (
                     <td key={iOut} className={`p-0 ${corner}`}>
                       <button
+                        disabled={!iIn || !iOut}
+                        title={!iIn || !iOut ? 'This cell has an unnamed interface and cannot be selected as a flow filter.' : undefined}
                         onClick={() => onCellClick?.({ interface_in: iIn, interface_out: iOut, in_label: labels[iIn] || iIn, out_label: labels[iOut] || iOut })}
-                        className={`block w-full px-3 py-2.5 text-center font-medium whitespace-nowrap transition-all cursor-pointer rounded-md ${
+                        className={`block w-full px-3 py-2.5 text-center font-medium whitespace-nowrap transition-all cursor-pointer disabled:cursor-default rounded-md ${
                           active
                             ? `border-chase border-chase-blue ${corner}`
                             : `border-2 border-transparent hover:border-blue-400/40 ${corner}`

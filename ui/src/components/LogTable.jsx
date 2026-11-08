@@ -1,3 +1,4 @@
+import { ruleExclusionGroup } from './ExclusionProfiles'
 import React from 'react'
 import {
   formatTime, formatDateShort, FlagIcon, countryName, getInterfaceName, formatServiceName, resolveIpSublines,
@@ -7,6 +8,7 @@ import {
 import { getThreatLevel } from '../lib/threatPresentation'
 import LogDetail from './LogDetail'
 import IPCell from './IPCell'
+import { PORT_SERVICE_DESCRIPTION } from '../lib/identityPresentation'
 
 // UniFi firewall icon (brick-wall pattern, fill-based)
 const UNIFI_FIREWALL_ICON = (
@@ -77,7 +79,7 @@ function NetworkPath({ ifaceIn, ifaceOut }) {
   )
 }
 
-function LogRow({ log, isExpanded, detailedLog, onToggle, hiddenColumns, colCount, uiSettings }) {
+function LogRow({ log, isExpanded, detailedLog, onToggle, hiddenColumns, colCount, uiSettings, onHideAllow }) {
   const actionStyle = ACTION_STYLES[log.rule_action || log.dhcp_event || log.wifi_event] || ''
   const typeStyle = LOG_TYPE_STYLES[log.log_type] || LOG_TYPE_STYLES.system
   const dirIcon = DIRECTION_ICONS[log.direction] || ''
@@ -186,7 +188,7 @@ function LogRow({ log, isExpanded, detailedLog, onToggle, hiddenColumns, colCoun
 
         {/* Source */}
         <td className="px-2 py-1.5 text-[13px] whitespace-nowrap max-w-[120px] sm:max-w-[180px] truncate">
-          <IPCell ip={log.src_ip} port={log.src_port} deviceName={log.src_device_name} vlan={log.src_device_vlan} networkLabel={log.src_device_network} subline={srcSubline} />
+          <IPCell ip={log.src_ip} port={log.src_port} deviceName={log.src_device_name} identitySource={log.src_identity_source} vlan={log.src_device_vlan} networkLabel={log.src_device_network} subline={srcSubline} />
         </td>
 
         {/* Direction */}
@@ -196,7 +198,7 @@ function LogRow({ log, isExpanded, detailedLog, onToggle, hiddenColumns, colCoun
 
         {/* Destination */}
         <td className="px-2 py-1.5 text-[13px] whitespace-nowrap max-w-[120px] sm:max-w-[180px] truncate">
-          <IPCell ip={log.dst_ip} port={log.dst_port} deviceName={log.dst_device_name} vlan={log.dst_device_vlan} networkLabel={log.dst_device_network} subline={dstSubline} />
+          <IPCell ip={log.dst_ip} port={log.dst_port} deviceName={log.dst_device_name} identitySource={log.dst_identity_source} vlan={log.dst_device_vlan} networkLabel={log.dst_device_network} subline={dstSubline} />
         </td>
 
         {/* Country */}
@@ -235,7 +237,7 @@ function LogRow({ log, isExpanded, detailedLog, onToggle, hiddenColumns, colCoun
         )}
 
         {/* Service */}
-        <td className="hidden sm:table-cell px-2 py-1.5 text-[12px] text-gray-400">
+        <td className="hidden sm:table-cell px-2 py-1.5 text-[12px] text-gray-400" title={PORT_SERVICE_DESCRIPTION}>
           {formatServiceName(log.service_name)}
         </td>
 
@@ -243,6 +245,7 @@ function LogRow({ log, isExpanded, detailedLog, onToggle, hiddenColumns, colCoun
         {show('rule') && (
           <td className="px-2 py-1.5 text-[12px] text-gray-400 whitespace-nowrap sm:max-w-[180px] sm:truncate" title={infoTitle}>
             {infoText}
+            {onHideAllow && ruleExclusionGroup(log) && <button className="block text-xs text-blue-300" onClick={e => { e.stopPropagation(); onHideAllow(log) }}>Hide matching allow events</button>}
           </td>
         )}
 
@@ -272,7 +275,7 @@ function LogRow({ log, isExpanded, detailedLog, onToggle, hiddenColumns, colCoun
   )
 }
 
-export default function LogTable({ logs, loading, expandedId, detailedLog, onToggleExpand, hiddenColumns = new Set(), uiSettings }) {
+export default function LogTable({ logs, loading, expandedId, detailedLog, onToggleExpand, hiddenColumns = new Set(), uiSettings, onHideAllow }) {
 
   // Auto-hide ASN column when IP subline is enabled
   const effectiveHidden = uiSettings?.ui_ip_subline === 'asn_or_abuse'
@@ -336,6 +339,7 @@ export default function LogTable({ logs, loading, expandedId, detailedLog, onTog
               <LogRow
                 key={log.id}
                 log={log}
+                onHideAllow={onHideAllow}
                 isExpanded={expandedId === log.id}
                 detailedLog={expandedId === log.id ? detailedLog : null}
                 onToggle={() => onToggleExpand(log.id)}

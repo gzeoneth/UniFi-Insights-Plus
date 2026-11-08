@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor, cleanup } from '@testing-library/react'
+import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
 
 const mockFetch = vi.fn()
 
@@ -22,6 +22,7 @@ vi.mock('../components/SyslogToggle', () => ({
 }))
 
 import FirewallRules from '../components/FirewallRules'
+import { patchFirewallPolicy, bulkUpdateFirewallLoggingStream } from '../api'
 
 const ZONES = [
   { id: 'z-int', name: 'Internal', networkIds: [], metadata: { origin: 'SYSTEM_DEFINED' } },
@@ -53,6 +54,8 @@ const IDLESS_TITLE = /^Logging cannot be toggled here: the UniFi controller retu
 describe('FirewallRules id-less policies', () => {
   let consoleError
   beforeEach(() => {
+    vi.clearAllMocks()
+    localStorage.clear(); sessionStorage.clear()
     mockFetch.mockReset()
     consoleError = vi.spyOn(console, 'error')
   })
@@ -118,4 +121,35 @@ describe('FirewallRules id-less policies', () => {
     await waitFor(() => expect(screen.getAllByTestId('toggle').length).toBeGreaterThan(0))
     expect(screen.queryByText(/without an id/)).toBeNull()
   })
+  it('restores zone and visibility filters without replaying any firewall operation', async () => {
+    mockFetch.mockResolvedValue(payload([
+      policy({ id: 'example-id', name: 'Example rule' }),
+      policy({ id: 'builtin-id', name: 'Example built-in', metadata: { origin: 'SYSTEM_DEFINED' } }),
+    ]))
+    const first = render(<FirewallRules />)
+    await screen.findByText('Example rule')
+    fireEvent.click(screen.getByRole('button', { name: 'Allow All(2)' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Built-In' }))
+    expect(screen.queryByText('Example built-in')).toBeNull()
+    first.unmount(); sessionStorage.clear()
+    render(<FirewallRules />)
+    await screen.findByText('Example rule')
+    expect(screen.getByRole('checkbox', { name: 'Built-In' })).not.toBeChecked()
+    expect(screen.queryByText('Example built-in')).toBeNull()
+    expect(screen.getByText('Internal → External')).toBeInTheDocument()
+    expect(localStorage.getItem('unifi-log-insight:firewall-zone-pair')).toBe(JSON.stringify({ srcZoneId: 'z-int', dstZoneId: 'z-ext' }))
+    expect(patchFirewallPolicy).not.toHaveBeenCalled()
+    expect(bulkUpdateFirewallLoggingStream).not.toHaveBeenCalled()
+  })
+
+  it('clears a saved zone pair when the zones no longer exist', async () => {
+    localStorage.setItem('unifi-log-insight:firewall-zone-pair', JSON.stringify({ srcZoneId: 'removed', dstZoneId: 'z-ext' }))
+    localStorage.setItem('unifi-log-insight:firewall-filters', JSON.stringify({ ipv4: 'false' }))
+    mockFetch.mockResolvedValue(payload([policy({ id: 'example-id', name: 'Example rule' })]))
+    render(<FirewallRules />)
+    await screen.findByText('Example rule')
+    expect(screen.getByRole('checkbox', { name: 'IPv4' })).toBeChecked()
+    await waitFor(() => expect(localStorage.getItem('unifi-log-insight:firewall-zone-pair')).toBe('null'))
+  })
+
 })

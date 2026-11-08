@@ -1,19 +1,15 @@
-import { useState, useEffect, useMemo } from 'react'
-import { TR_KEY, timeRangeToDays, filterVisibleRanges } from '../utils'
-
-const TIME_RANGES = ['1h', '6h', '24h', '7d', '30d', '60d', '90d', '180d', '365d']
+import { useState, useEffect, useMemo, useCallback } from 'react'
+import { timeRangeToDays, filterVisibleRanges } from '../utils'
+import { TIME_RANGES, readTimeRange, writeTimeRange } from '../lib/preferences'
 
 export default function useTimeRange(maxFilterDays) {
-  const [timeRange, setTimeRangeState] = useState(() => {
-    try { return sessionStorage.getItem(TR_KEY) || '24h' }
-    catch { return '24h' }
-  })
+  const [timeRange, setTimeRangeState] = useState(readTimeRange)
 
-  const setTimeRange = (tr) => {
+  const setTimeRange = useCallback((tr) => {
+    if (!TIME_RANGES.includes(tr)) return
     setTimeRangeState(tr)
-    try { sessionStorage.setItem(TR_KEY, tr) }
-    catch { /* private browsing */ }
-  }
+    writeTimeRange(tr)
+  }, [])
 
   const visibleRanges = useMemo(() => filterVisibleRanges(TIME_RANGES, maxFilterDays), [maxFilterDays])
 

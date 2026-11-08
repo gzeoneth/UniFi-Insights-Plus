@@ -1053,21 +1053,12 @@ class UniFiAPI:
             if self.features.get('network_config', True):
                 try:
                     net_config = self.get_network_config()
-                    # Find gateway device name from polled devices
-                    gateway_name = None
-                    for d in devices:
-                        if d.get('device_type') in ('ugw', 'udm', 'uxg'):
-                            gateway_name = d.get('device_name') or d.get('model')
-                            break
-                    if gateway_name:
-                        wan_ip_names = {}
-                        for wan in net_config.get('wan_interfaces', []):
-                            wan_ip = wan.get('wan_ip')
-                            if wan_ip:
-                                ip_map[wan_ip] = gateway_name
-                                wan_ip_names[wan_ip] = gateway_name
-                        if wan_ip_names:
-                            self._db.set_config('wan_ip_names', wan_ip_names)
+                    # AP-mode consoles may share a gateway device type. Match
+                    # addresses instead of taking the first type in the list.
+                    wan_ip_names = self._wan_device_names(devices, net_config)
+                    ip_map.update(wan_ip_names)
+                    # A successful refresh replaces removed/changed WAN IPs.
+                    self._db.set_config('wan_ip_names', wan_ip_names)
                     # Persist WAN/gateway identity through shared helpers
                     wan_ip_by_iface, gateway_ip_vlans = (
                         self.extract_network_identity_from_net_config(net_config))
@@ -1203,11 +1194,42 @@ class UniFiAPI:
                     'serial': d.get('serial'),
                     'state': d.get('state'),
                     'uptime': d.get('uptime'),
+                    'wan_ips': [
+                        value['ip'] for key, value in d.items()
+                        if key.startswith('wan') and key[3:].isdigit()
+                        and isinstance(value, dict) and value.get('ip')
+                    ],
                 })
             return devices
         except Exception as e:
             logger.warning("Failed to fetch stat/device: %s", e)
             return []
+
+    @staticmethod
+    def _wan_device_names(devices: list[dict], net_config: dict) -> dict:
+        """Bind WAN names to a matching device address, or use a generic label.
+
+        Multiple matching devices are ambiguous. A model/type match alone does
+        not establish which device owns the site's WAN address.
+        """
+        gateway_ips = {
+            net['ip_subnet'].split('/')[0]
+            for net in net_config.get('networks', []) if net.get('ip_subnet')
+        }
+        gateways = [device for device in devices if device.get('ip') in gateway_ips]
+        names = {}
+        for wan in net_config.get('wan_interfaces', []):
+            wan_ip = wan.get('wan_ip')
+            if not wan_ip:
+                continue
+            owners = [device for device in devices
+                      if wan_ip in (device.get('wan_ips') or [])]
+            candidates = owners or gateways
+            name = None
+            if len(candidates) == 1:
+                name = candidates[0].get('device_name') or candidates[0].get('model')
+            names[wan_ip] = name or 'Gateway'
+        return names
 
     def stop_polling(self):
         """Stop the background polling thread if running."""
@@ -1264,19 +1286,18 @@ class UniFiAPI:
             return bool(self._ip_to_name)
 
     def resolve_name(self, ip: str | None = None, mac: str | None = None) -> str | None:
-        """Resolve device name by IP or MAC from in-memory cache.
+        """Resolve the logged IP; use a MAC only when no IP was supplied.
 
-        Returns None if client_names feature is disabled or no match found.
+        A routed packet's MAC can identify its next hop, not its IP endpoint.
+        An unknown IP therefore stays unnamed even when its MAC is cached.
         """
         if not self.features.get('client_names', True):
             return None
         with self._lock:
-            if mac:
-                name = self._mac_to_name.get(mac.lower())
-                if name:
-                    return name
             if ip:
                 return self._ip_to_name.get(ip)
+            if mac:
+                return self._mac_to_name.get(mac.lower())
         return None
 
 

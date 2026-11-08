@@ -11,6 +11,8 @@ from fastapi import APIRouter, Query, HTTPException
 from psycopg2.extras import RealDictCursor
 
 from db import get_config
+from dashboard_queries import zone_query
+from request_work import phase
 from deps import get_conn, put_conn, enricher_db
 from ip_identity import load_identity_config, annotate_ip
 from query_helpers import (build_log_query, validate_time_params, ALLOWED_DIMENSIONS,
@@ -162,7 +164,7 @@ def _lookup_ip_info(conn, nodes):
     cfg = load_identity_config(enricher_db)
     for ip_str in ip_set:
         name, vlan, vpn_badge = annotate_ip(cfg, ip_str, device_names.get(ip_str))
-        if name and not device_names.get(ip_str):
+        if name:
             device_names[ip_str] = name
         if vlan is not None:
             gateway_vlans[ip_str] = vlan
@@ -186,6 +188,8 @@ def get_flow_graph(
     direction: Optional[str] = Query(None),
     interface: Optional[str] = Query(None),
     ip: Optional[str] = Query(None),
+    filter_rules: Optional[str] = None,
+    exclude_groups: Optional[str] = None,
 ):
     # Validate dimensions
     dims = [d.strip() for d in dimensions.split(',')]
@@ -213,6 +217,7 @@ def get_flow_graph(
         src_ip=None, dst_ip=None, ip=None, direction=direction,
         rule_action=rule_action, rule_name=None, country=None, threat_min=None,
         search=None, service=None, interface=interface,
+        filter_rules=filter_rules, exclude_groups=exclude_groups,
     )
 
     dim_a_expr = DIMENSION_EXPRS[dims[0]]
@@ -240,8 +245,9 @@ def get_flow_graph(
     try:
         # Tuple cursor — ~288K groups at 30d fits in a few MB vs 30-50 MB with RealDictCursor
         with conn.cursor() as cur:
-            cur.execute(sql, base_params)
-            grouped_rows = cur.fetchall()
+            with phase('query'):
+                cur.execute(sql, base_params)
+                grouped_rows = cur.fetchall()
 
         # Remap with current top_n; retry with lower top_n if caps exceeded (no DB re-query)
         while top_n >= MIN_TOP_N:
@@ -297,6 +303,8 @@ def get_zone_matrix(
     log_type: Optional[str] = Query("firewall"),
     rule_action: Optional[str] = Query(None),
     direction: Optional[str] = Query(None),
+    filter_rules: Optional[str] = None,
+    exclude_groups: Optional[str] = None,
 ):
     time_range, time_from, time_to = validate_time_params(time_range, time_from, time_to)
 
@@ -305,30 +313,21 @@ def get_zone_matrix(
         src_ip=None, dst_ip=None, ip=None, direction=direction,
         rule_action=rule_action, rule_name=None, country=None, threat_min=None,
         search=None, service=None, interface=None,
+        filter_rules=filter_rules, exclude_groups=exclude_groups,
     )
 
-    sql = f"""
-    SELECT
-        interface_in, interface_out,
-        COUNT(*) AS total,
-        COUNT(*) FILTER (WHERE rule_action = 'allow') AS allow_count,
-        COUNT(*) FILTER (WHERE rule_action = 'block') AS block_count,
-        COUNT(DISTINCT (host(src_ip) || '-' || host(dst_ip))) AS unique_pairs
-    FROM logs
-    WHERE {where}
-      AND interface_in IS NOT NULL AND interface_out IS NOT NULL
-    GROUP BY interface_in, interface_out
-    ORDER BY total DESC
-    """
+    sql = zone_query(where)
 
     labels = get_config(enricher_db, 'interface_labels', {}) or {}
 
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
-        conn.commit()
+            with phase('query'):
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        with phase('commit'):
+            conn.commit()
 
         interfaces = sorted({r['interface_in'] for r in rows} | {r['interface_out'] for r in rows})
         cells = [
@@ -367,6 +366,8 @@ def get_host_detail(
     log_type: Optional[str] = Query("firewall"),
     rule_action: Optional[str] = Query(None),
     direction: Optional[str] = Query(None),
+    filter_rules: Optional[str] = None,
+    exclude_groups: Optional[str] = None,
 ):
     # Validate IP
     try:
@@ -381,6 +382,7 @@ def get_host_detail(
         src_ip=None, dst_ip=None, ip=None, direction=direction,
         rule_action=rule_action, rule_name=None, country=None, threat_min=None,
         search=None, service=None, interface=None,
+        filter_rules=filter_rules, exclude_groups=exclude_groups,
     )
 
     # All host queries use parenthesized OR to prevent precedence bugs with base filters
@@ -431,7 +433,7 @@ def get_host_detail(
             # Identity annotation (gateway/WAN/VPN) — identity vlan takes precedence; DB network preserved if set
             cfg = load_identity_config(enricher_db)
             name, vlan, vpn_badge = annotate_ip(cfg, ip, device.get('device_name'))
-            if name and not device.get('device_name'):
+            if name:
                 device['device_name'] = name
             if vlan is not None:
                 device['vlan'] = vlan

@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+# Validate or create TLS material before starting any services.
+/app/venv/bin/python /app/tls_config.py
+
 PGDATA="/var/lib/postgresql/data"
 
 # ── External database mode detection ─────────────────────────────────────────
@@ -18,6 +21,9 @@ if [ "$_external_db" = "true" ]; then
     # Disable PostgreSQL in supervisord (targeted: only [program:postgresql])
     sed -i '/\[program:postgresql\]/,/^\[/{s/autostart=true/autostart=false/; s/autorestart=true/autorestart=false/}' /etc/supervisor/conf.d/supervisord.conf
 else
+
+# Reject invalid opt-in settings before initializing or touching an existing cluster.
+/app/venv/bin/python /app/postgres_config.py --validate
 
 # Initialize PostgreSQL if data directory is empty
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
@@ -70,6 +76,10 @@ else
     chown -R postgres:postgres "$PGDATA"
 
 fi
+
+# Unlike init-only defaults, the optional profile also applies to existing clusters.
+# It validates effective settings without starting PostgreSQL and is reversible.
+/app/venv/bin/python /app/postgres_config.py "$PGDATA"
 fi  # end external_db else block
 
 echo "[entrypoint] Starting services via supervisord..."

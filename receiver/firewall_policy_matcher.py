@@ -148,7 +148,7 @@ def _vpn_cache_key(vpn_networks):
     return tuple(sorted(vpn_networks.items(), key=lambda kv: kv[0]))
 
 
-def _get_snapshot(unifi_api, vpn_networks=None):
+def _get_snapshot(unifi_api, vpn_networks=None, cached_only=False):
     """Return cached snapshot or build a fresh one.
 
     Thread-safe. The snapshot contains zone_data (zone map) and policies
@@ -165,6 +165,9 @@ def _get_snapshot(unifi_api, vpn_networks=None):
                 and time.monotonic() < _cached_snapshot['expires_at']
                 and _cached_snapshot.get('vpn_key') == vpn_key):
             return _cached_snapshot
+
+    if cached_only:
+        return None
 
     # Build outside the lock to avoid blocking other threads during API calls.
     # Multiple threads may race to build; the last write wins (safe — all produce
@@ -212,7 +215,7 @@ def _resolve_zone_pair(zone_data, interface_in, interface_out):
 # ── Action resolution ─────────────────────────────────────────────────────────
 
 def resolve_rule_action(parsed_rule, unifi_api, interface_in, interface_out,
-                        vpn_networks=None):
+                        vpn_networks=None, cached_only=False):
     """Resolve rule_action from policy metadata for zone_index format rules.
 
     Resolution order:
@@ -230,7 +233,9 @@ def resolve_rule_action(parsed_rule, unifi_api, interface_in, interface_out,
     # Try authoritative policy metadata lookup first
     if unifi_api:
         try:
-            snapshot = _get_snapshot(unifi_api, vpn_networks=vpn_networks)
+            snapshot = _get_snapshot(unifi_api, vpn_networks=vpn_networks, cached_only=cached_only)
+            if snapshot is None:
+                return parsed_rule.get('desc_hint')
             zone_data = snapshot['zone_data']
             src_zone_id, dst_zone_id = _resolve_zone_pair(zone_data, interface_in, interface_out)
             if src_zone_id and dst_zone_id:

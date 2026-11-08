@@ -88,9 +88,8 @@ CREATE INDEX IF NOT EXISTS idx_logs_fw_block_missing_abuse_dst
     ON logs (dst_ip)
     WHERE log_type = 'firewall' AND rule_action = 'block'
       AND threat_score IS NOT NULL AND abuse_usage_type IS NULL AND dst_ip IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_logs_fw_service_name_null_id
-    ON logs (id)
-    WHERE log_type = 'firewall' AND service_name IS NULL AND dst_port IS NOT NULL;
+-- The one-shot service-name index is created concurrently after boot while
+-- its migration is unfinished, and retired after its JSON true done marker.
 
 -- SP-GiST index for WAN IP detection queries (Issue 72 fallback)
 CREATE INDEX IF NOT EXISTS idx_logs_spgist_dst_ip_firewall

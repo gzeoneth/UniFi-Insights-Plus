@@ -41,8 +41,8 @@ export default function Login({ onSuccess, isHttps, proxyTrusted, isEmbedded, th
             {proxyTrusted === false
               ? isEmbedded
                 ? 'Unable to verify a secure connection. Your browser extension may still be configured to use HTTP. Update the extension\'s server URL to use HTTPS, or check your reverse proxy configuration.'
-                : 'Unable to verify a secure connection. Your reverse proxy may not be sending the required X-ULI-Proxy-Auth header. Check the authentication docs for proxy configuration.'
-              : 'Authentication requires HTTPS. Please access the app through a reverse proxy with TLS enabled.'}
+                : 'Authentication requires HTTPS. Use the app\'s HTTPS address or a TLS reverse proxy. If you already use a reverse proxy, check its X-ULI-Proxy-Auth header.'
+              : 'Authentication requires HTTPS. Use the app\'s HTTPS address or enable TLS on your reverse proxy.'}
           </div>
         )}
 

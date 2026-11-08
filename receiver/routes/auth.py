@@ -14,6 +14,8 @@ from psycopg2.extras import RealDictCursor
 
 from db import get_config, set_config
 from deps import get_conn, put_conn, enricher_db
+from request_auth import remember_bearer_context
+from request_work import phase, timed_phase
 
 logger = logging.getLogger('api.auth')
 router = APIRouter()
@@ -94,8 +96,8 @@ def get_forwarded_proto(request: Request) -> str:
 def _require_https(request: Request):
     if get_forwarded_proto(request) != 'https':
         if not _is_trusted_proxy(request):
-            raise HTTPException(403, "Unable to verify a secure connection. Your reverse proxy may not be sending the required X-ULI-Proxy-Auth header. See the authentication docs for proxy configuration.")
-        raise HTTPException(403, "Authentication requires HTTPS. Please access the app through a reverse proxy with TLS enabled.")
+            raise HTTPException(403, "Authentication requires HTTPS. Use the app's HTTPS listener or a TLS reverse proxy. If you already use a reverse proxy, configure its X-ULI-Proxy-Auth header.")
+        raise HTTPException(403, "Authentication requires HTTPS. Use the app's HTTPS listener or enable TLS on your reverse proxy.")
 
 
 def _auth_enabled() -> bool:
@@ -184,6 +186,7 @@ def _clear_attempts(ip: str):
 
 # ── Audit helper ─────────────────────────────────────────────────────────────
 
+@timed_phase('audit')
 def _write_audit(user_id, token_id, action, detail, ip, user_agent):
     conn = get_conn()
     try:
@@ -195,7 +198,8 @@ def _write_audit(user_id, token_id, action, detail, ip, user_agent):
                  json.dumps(detail) if detail else None,
                  ip, user_agent]
             )
-        conn.commit()
+        with phase('commit'):
+            conn.commit()
     except Exception:
         conn.rollback()
         logger.exception("Failed to write audit log")
@@ -222,7 +226,8 @@ def _create_session(user_id: int, request: Request) -> str:
                    VALUES (%s, %s, %s, %s::inet, %s)""",
                 [user_id, token_hash, expires_at, ip, ua]
             )
-        conn.commit()
+        with phase('commit'):
+            conn.commit()
     except Exception:
         conn.rollback()
         raise
@@ -232,6 +237,7 @@ def _create_session(user_id: int, request: Request) -> str:
     return token
 
 
+@timed_phase('session')
 def _validate_session(token: str) -> dict | None:
     """Validate session token. Returns user dict or None."""
     if not token:
@@ -251,7 +257,8 @@ def _validate_session(token: str) -> dict | None:
             row = cur.fetchone()
         # Won't Fix: commit() on read-only SELECT closes the transaction cleanly,
         # preventing idle-in-transaction on long-lived connections from the pool.
-        conn.commit()
+        with phase('commit'):
+            conn.commit()
         if row:
             return dict(row)
         return None
@@ -264,6 +271,7 @@ def _validate_session(token: str) -> dict | None:
 
 # ── API Token validation ────────────────────────────────────────────────────
 
+@timed_phase('token')
 def _validate_api_token(token: str) -> dict | None:
     """Validate Bearer API token. Returns token+user dict or None."""
     if not token:
@@ -291,11 +299,17 @@ def _validate_api_token(token: str) -> dict | None:
                 if expected and salt:
                     computed = _hmac.new(salt.encode(), token.encode(), 'sha256').hexdigest()
                     if _hmac.compare_digest(computed, expected):
-                        # Update last_used_at
-                        cur.execute("UPDATE api_tokens SET last_used_at = NOW() WHERE id = %s", [row['token_id']])
-                        conn.commit()
+                        # Authorization is always read afresh. Only this
+                        # informational timestamp is coalesced across requests.
+                        cur.execute("""UPDATE api_tokens SET last_used_at = NOW()
+                            WHERE id = %s AND (last_used_at IS NULL
+                                OR last_used_at < NOW() - INTERVAL '60 seconds')""",
+                                    [row['token_id']])
+                        with phase('commit'):
+                            conn.commit()
                         return dict(row)
-        conn.commit()
+        with phase('commit'):
+            conn.commit()
         return None
     except Exception:
         conn.rollback()
@@ -317,7 +331,7 @@ def validate_token_with_effective_scopes(token: str) -> dict | None:
         return None
     token_scopes = set(info.get('scopes') or [])
     owner_perms = set(info.get('user_permissions') or [])
-    if info.get('owner_user_id') and owner_perms and '*' not in owner_perms:
+    if info.get('owner_user_id') and '*' not in owner_perms:
         effective = token_scopes & owner_perms
     else:
         effective = token_scopes
@@ -330,6 +344,7 @@ def validate_token_with_effective_scopes(token: str) -> dict | None:
 # Paths that never require auth
 PUBLIC_PATHS = {
     '/api/health',
+    '/api/health/ingest',
     '/api/auth/status',
     '/api/auth/login',
     '/api/auth/logout',
@@ -355,11 +370,11 @@ AUTH_SESSION_PATHS = {
 def require_auth(request: Request) -> dict | None:
     """Auth dependency. Returns user/token info or None if auth disabled.
     Raises 401 if auth enabled and no valid credentials."""
-    if not _auth_enabled():
-        return None
-
     path = request.url.path
     if path in PUBLIC_PATHS or any(path.startswith(p) for p in PUBLIC_PREFIXES):
+        return None
+
+    if not _auth_enabled():
         return None
 
     # Check Bearer token first
@@ -368,6 +383,7 @@ def require_auth(request: Request) -> dict | None:
         token = auth_header[7:].strip()
         info = validate_token_with_effective_scopes(token)
         if info:
+            remember_bearer_context(request, token, info)
             return info
         raise HTTPException(401, "Invalid or expired API token")
 

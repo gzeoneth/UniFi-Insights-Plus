@@ -14,7 +14,7 @@ function buildQS(params) {
 let onAuthExpired = null
 export function setAuthExpiredHandler(handler) { onAuthExpired = handler }
 
-async function apiFetch(url, options = {}) {
+export async function apiFetch(url, options = {}) {
   const resp = await fetch(url, { credentials: 'include', ...options })
   if (resp.status === 401 && onAuthExpired) {
     onAuthExpired()
@@ -44,32 +44,40 @@ async function apiFetchRaw(url, options = {}) {
   return resp
 }
 
-export async function fetchLogs(params = {}) {
-  return apiFetch(`${BASE}/logs?${buildQS(params)}`)
+export async function fetchLogs(params = {}, options = {}) {
+  return apiFetch(`${BASE}/logs?${buildQS(params)}`, options)
 }
 
 export async function fetchLog(id) {
   return apiFetch(`${BASE}/logs/${id}`)
 }
 
-export async function fetchStats(timeRange = '24h') {
-  return apiFetch(`${BASE}/stats?time_range=${timeRange}`)
+export async function fetchExclusionPreview(params = {}, options = {}) {
+  return apiFetch(`${BASE}/logs/exclusion-preview?${buildQS(params)}`, options)
 }
 
-export async function fetchStatsOverview(timeRange = '24h') {
-  return apiFetch(`${BASE}/stats/overview?time_range=${timeRange}`)
+export async function fetchStats(timeRange = '24h', params = {}) {
+  return apiFetch(`${BASE}/stats?${buildQS({ time_range: timeRange, ...params })}`)
 }
 
-export async function fetchStatsCharts(timeRange = '24h') {
-  return apiFetch(`${BASE}/stats/charts?time_range=${timeRange}`)
+export async function fetchStatsOverview(timeRange = '24h', params = {}, options = {}) {
+  return apiFetch(`${BASE}/stats/overview?${buildQS({ time_range: timeRange, ...params })}`, options)
 }
 
-export async function fetchStatsTables(timeRange = '24h') {
-  return apiFetch(`${BASE}/stats/tables?time_range=${timeRange}`)
+export async function fetchStatsCharts(timeRange = '24h', params = {}, options = {}) {
+  return apiFetch(`${BASE}/stats/charts?${buildQS({ time_range: timeRange, ...params })}`, options)
 }
 
-export async function fetchHealth() {
-  return apiFetch(`${BASE}/health`)
+export async function fetchStatsTables(timeRange = '24h', params = {}, options = {}) {
+  return apiFetch(`${BASE}/stats/tables?${buildQS({ time_range: timeRange, ...params })}`, options)
+}
+
+export async function fetchSecuritySummary(params = {}, options = {}) {
+  return apiFetch(`${BASE}/security/summary?${buildQS(params)}`, options)
+}
+
+export async function fetchHealth(options = {}) {
+  return apiFetch(`${BASE}/health`, options)
 }
 
 export async function fetchAbuseIPDBStatus() {
@@ -94,20 +102,20 @@ export function getExportUrl(params = {}) {
 
 // ── Flow View API ───────────────────────────────────────────────────────────
 
-export async function fetchIPPairs(params = {}) {
-  return apiFetch(`${BASE}/stats/ip-pairs?${buildQS(params)}`)
+export async function fetchIPPairs(params = {}, options = {}) {
+  return apiFetch(`${BASE}/stats/ip-pairs?${buildQS(params)}`, options)
 }
 
-export async function fetchFlowGraph(params = {}) {
-  return apiFetch(`${BASE}/flows/graph?${buildQS(params)}`)
+export async function fetchFlowGraph(params = {}, options = {}) {
+  return apiFetch(`${BASE}/flows/graph?${buildQS(params)}`, options)
 }
 
-export async function fetchZoneMatrix(params = {}) {
-  return apiFetch(`${BASE}/flows/zone-matrix?${buildQS(params)}`)
+export async function fetchZoneMatrix(params = {}, options = {}) {
+  return apiFetch(`${BASE}/flows/zone-matrix?${buildQS(params)}`, options)
 }
 
-export async function fetchHostDetail(params = {}) {
-  return apiFetch(`${BASE}/flows/host-detail?${buildQS(params)}`)
+export async function fetchHostDetail(params = {}, options = {}) {
+  return apiFetch(`${BASE}/flows/host-detail?${buildQS(params)}`, options)
 }
 
 // ── Saved Views API ─────────────────────────────────────────────────────────
@@ -138,8 +146,8 @@ export async function fetchLogsBatch(ids) {
   })
 }
 
-export async function fetchThreatGeo(params = {}) {
-  return apiFetch(`${BASE}/threats/geo?${buildQS(params)}`)
+export async function fetchThreatGeo(params = {}, options = {}) {
+  return apiFetch(`${BASE}/threats/geo?${buildQS(params)}`, options)
 }
 
 // ── Setup Wizard API ──────────────────────────────────────────────────────────

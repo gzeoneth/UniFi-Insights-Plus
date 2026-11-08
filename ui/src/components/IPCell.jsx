@@ -1,11 +1,12 @@
 import NetworkBadge from './NetworkBadge'
+import { identityDescription } from '../lib/identityPresentation'
 
 /**
  * Shared IP address cell renderer.
  * Used by LogTable (log stream) and TopIPPairs (flow view).
  * Shows device name, IP, optional VLAN/network badge, and optional subline (ASN).
  */
-export default function IPCell({ ip, port, deviceName, vlan, networkLabel, subline }) {
+export default function IPCell({ ip, port, deviceName, identitySource, vlan, networkLabel, subline }) {
   if (!ip) return <span className="text-gray-700">—</span>
 
   const hasBadge = vlan != null || !!networkLabel
@@ -15,7 +16,7 @@ export default function IPCell({ ip, port, deviceName, vlan, networkLabel, subli
       <div className="min-w-0 leading-tight">
         {(deviceName || hasBadge) && (
           <div className="flex items-center gap-1">
-            {deviceName && <span className="text-gray-200 text-[12px] truncate" title={deviceName}>{deviceName}</span>}
+            {deviceName && <span className="text-gray-200 text-[12px] truncate" title={`${deviceName}: ${identityDescription(identitySource)}`}>{deviceName}</span>}
             <NetworkBadge vlan={vlan} vpnBadge={networkLabel} />
           </div>
         )}

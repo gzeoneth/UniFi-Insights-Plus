@@ -23,6 +23,8 @@ permissions:
 
 jobs:
   build:
+    # Keep upstream publishing/integrations disabled in forks.
+    if: github.repository == 'jmasarweh/UniFi-Insights-Plus'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}

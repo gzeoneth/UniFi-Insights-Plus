@@ -4,7 +4,6 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from db import get_config
 from parsers import build_vpn_cidr_map, match_vpn_ip
 
 logger = logging.getLogger(__name__)
@@ -24,15 +23,16 @@ def load_identity_config(db) -> IdentityConfig:
 
     Returns a frozen snapshot safe to pass across function boundaries.
     """
-    gateway_vlans = get_config(db, 'gateway_ip_vlans') or {}
+    values = db.get_display_config()
+    gateway_vlans = values.get('gateway_ip_vlans') or {}
     if not isinstance(gateway_vlans, dict):
         logger.warning("Expected dict for gateway_ip_vlans, got %s — using empty", type(gateway_vlans).__name__)
         gateway_vlans = {}
-    wan_ip_names = get_config(db, 'wan_ip_names') or {}
+    wan_ip_names = values.get('wan_ip_names') or {}
     if not isinstance(wan_ip_names, dict):
         logger.warning("Expected dict for wan_ip_names, got %s — using empty", type(wan_ip_names).__name__)
         wan_ip_names = {}
-    vpn_networks = get_config(db, 'vpn_networks') or {}
+    vpn_networks = values.get('vpn_networks') or {}
     if not isinstance(vpn_networks, dict):
         logger.warning("Expected dict for vpn_networks, got %s — using empty", type(vpn_networks).__name__)
         vpn_networks = {}
@@ -49,7 +49,7 @@ def load_identity_config(db) -> IdentityConfig:
 def annotate_ip(cfg: IdentityConfig, ip_str: str, existing_name: Optional[str] = None):
     """Resolve identity for a single IP.
 
-    Precedence: existing device name > gateway > WAN > VPN inferred type.
+    Current WAN ownership overrides saved labels. Other names are preserved.
 
     Returns (name, vlan, vpn_badge) tuple. Any field may be None.
     """
@@ -62,7 +62,7 @@ def annotate_ip(cfg: IdentityConfig, ip_str: str, existing_name: Optional[str] =
         if not name:
             name = 'Gateway'
         vlan = cfg.gateway_vlans[ip_clean].get('vlan')
-    elif not name and ip_clean in cfg.wan_ip_names:
+    elif ip_clean in cfg.wan_ip_names:
         name = cfg.wan_ip_names[ip_clean]
 
     if cfg.vpn_cidrs and not name:
@@ -87,11 +87,21 @@ def annotate_record(cfg: IdentityConfig, record: dict):
             continue
 
         ip_str = str(record.get(f'{prefix}_ip', '') or '')
+        ip_clean = ip_str.split('/')[0]
         existing = record.get(f'{prefix}_device_name')
         name, vlan, vpn_badge = annotate_ip(cfg, ip_str, existing)
 
-        if name and not existing:
+        if name:
             record[f'{prefix}_device_name'] = name
+            source = 'inventory_or_log'
+            if ip_clean in cfg.gateway_vlans:
+                if not existing:
+                    source = 'gateway_configuration'
+            elif ip_clean in cfg.wan_ip_names:
+                source = 'wan_configuration'
+            elif vpn_badge:
+                source = 'vpn_network'
+            record[f'{prefix}_identity_source'] = source
         if vlan is not None:
             record[f'{prefix}_device_vlan'] = vlan
         if vpn_badge and name == 'Gateway':

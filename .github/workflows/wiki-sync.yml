@@ -9,6 +9,8 @@ on:
 
 jobs:
   sync:
+    # Keep upstream publishing/integrations disabled in forks.
+    if: github.repository == 'jmasarweh/UniFi-Insights-Plus'
     runs-on: ubuntu-latest
     permissions:
       contents: write

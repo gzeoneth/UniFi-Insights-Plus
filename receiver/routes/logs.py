@@ -3,6 +3,7 @@
 import csv
 import io
 import logging
+from time import perf_counter
 from datetime import datetime
 from typing import Optional
 
@@ -17,7 +18,11 @@ from ip_identity import load_identity_config, annotate_record, annotate_ip
 from query_helpers import (build_log_query, validate_time_params,
                           device_name_client_lateral, device_name_device_lateral,
                           device_name_coalesce, sanitize_csv_cell)
+from log_pagination import (filter_fingerprint, new_window, encode_cursor, decode_cursor,
+                            next_cursor as make_next_cursor)
 from services import get_service_description
+from parsers import cef_reported_context
+from field_filters import append_exclusions, compile_exclusions, query_view_counts
 
 
 
@@ -26,15 +31,36 @@ logger = logging.getLogger('api.logs')
 router = APIRouter()
 
 
+def _source_device_name_select(row_alias, client_alias='c1', device_alias='d1'):
+    """Prefer the actual IP and suppress provably misattributed old MAC names.
+
+    All aliases are internal SQL fragments. Existing names remain available
+    when no controller row demonstrates that they came from a different IP.
+    """
+    stored = f'{row_alias}.src_device_name'
+    safe_stored = f"""CASE WHEN {row_alias}.src_ip IS NOT NULL AND (
+        EXISTS (SELECT 1 FROM unifi_clients bad_client
+                WHERE bad_client.mac = {row_alias}.mac_address
+                  AND bad_client.ip IS NOT NULL AND bad_client.ip != {row_alias}.src_ip
+                  AND {stored} IN (bad_client.device_name, bad_client.hostname, bad_client.oui))
+        OR EXISTS (SELECT 1 FROM unifi_devices bad_device
+                   WHERE bad_device.mac = {row_alias}.mac_address
+                     AND bad_device.ip IS NOT NULL AND bad_device.ip != {row_alias}.src_ip
+                     AND {stored} IN (bad_device.device_name, bad_device.model))
+        ) THEN NULL ELSE {stored} END"""
+    return (f'COALESCE({client_alias}.device_name, {client_alias}.hostname, {client_alias}.oui, '
+            f'{device_alias}.device_name, {device_alias}.model, {safe_stored}) AS src_device_name')
+
+
 @router.get("/api/logs")
 def get_logs(
     log_type: Optional[str] = Query(None, description="Comma-separated: firewall,dns,dhcp,wifi,system"),
     time_range: Optional[str] = Query(None, description="1h,6h,24h,7d,30d,60d"),
     time_from: Optional[str] = Query(None, description="ISO datetime"),
     time_to: Optional[str] = Query(None, description="ISO datetime"),
-    src_ip: Optional[str] = Query(None, description="Source IP search (prefix with ! to negate)"),
-    dst_ip: Optional[str] = Query(None, description="Dest IP search (prefix with ! to negate)"),
-    ip: Optional[str] = Query(None, description="Search both src and dst (prefix with ! to negate)"),
+    src_ip: Optional[str] = Query(None, description="Source IP/CIDR; partial text supported, contains: forces substring, ! negates"),
+    dst_ip: Optional[str] = Query(None, description="Destination IP/CIDR; partial text supported, contains: forces substring, ! negates"),
+    ip: Optional[str] = Query(None, description="Both endpoint IPs/CIDRs; contains: forces substring, ! negates"),
     direction: Optional[str] = Query(None, description="Comma-separated: inbound,outbound,inter_vlan,nat"),
     rule_action: Optional[str] = Query(None, description="Comma-separated: allow,block,redirect (prefix with ! to negate)"),
     rule_name: Optional[str] = Query(None, description="Rule name search (prefix with ! to negate)"),
@@ -48,21 +74,46 @@ def get_logs(
     dst_port: Optional[str] = Query(None, description="Destination port (prefix with ! to negate)"),
     src_port: Optional[str] = Query(None, description="Source port (prefix with ! to negate)"),
     protocol: Optional[str] = Query(None, description="Comma-separated: TCP,UDP,ICMP (prefix with ! to negate)"),
+    filter_rules: Optional[str] = None,
+    exclude_groups: Optional[str] = None,
     sort: str = Query("timestamp", description="Sort field"),
     order: str = Query("desc", description="asc or desc"),
     page: int = Query(1, ge=1),
-    per_page: int = Query(50, ge=1, le=200),
+    per_page: int = Query(50, ge=1, le=1000),
+    count_mode: str = "exact",
+    pagination: str = "offset",
+    cursor: Optional[str] = None,
 ):
-    time_range, time_from, time_to = validate_time_params(time_range, time_from, time_to)
-    where, params = build_log_query(
-        log_type, time_range, time_from, time_to,
-        src_ip, dst_ip, ip, direction, rule_action,
-        rule_name, country, threat_min, search, service,
-        interface, vpn_only, asn=asn,
-        dst_port=dst_port, src_port=src_port, protocol=protocol,
-    )
+    if count_mode not in ('exact', 'none') or pagination not in ('offset', 'cursor'):
+        raise HTTPException(400, detail='Use count_mode exact/none and pagination offset/cursor')
+    if cursor and pagination != 'cursor':
+        raise HTTPException(400, detail='cursor requires pagination=cursor')
+    if pagination == 'cursor' and (sort != 'timestamp' or order.lower() not in ('asc', 'desc')):
+        raise HTTPException(400, detail='Cursor pagination requires timestamp sort and asc/desc order')
+    if page < 1 or not 1 <= per_page <= 1000:
+        raise HTTPException(400, detail='Invalid page or per_page')
+    if pagination == 'cursor' and page != 1 and not cursor:
+        raise HTTPException(400, detail='Use next_cursor to advance cursor pages')
 
-    # Whitelist sort columns
+    time_range, time_from, time_to = validate_time_params(time_range, time_from, time_to)
+    query_filters = dict(
+        log_type=log_type, time_range=time_range, time_from=time_from, time_to=time_to,
+        src_ip=src_ip, dst_ip=dst_ip, ip=ip, direction=direction, rule_action=rule_action,
+        rule_name=rule_name, country=country, threat_min=threat_min, search=search,
+        service=service, interface=interface, vpn_only=vpn_only, asn=asn,
+        dst_port=dst_port, src_port=src_port, protocol=protocol, filter_rules=filter_rules,
+    )
+    state = None
+    if pagination == 'cursor':
+        fingerprint = filter_fingerprint({**query_filters, 'exclude_groups': exclude_groups,
+                                          'sort': sort, 'order': order.lower()})
+        state = decode_cursor(cursor, fingerprint) if cursor else new_window(
+            fingerprint, time_range, time_from, time_to)
+        query_filters.update(time_range=None, time_from=state['from'], time_to=state['to'])
+    base_where, base_params = build_log_query(**query_filters)
+    # Validate exclusions before checking out a pooled connection.
+    append_exclusions(base_where, base_params, exclude_groups)
+
     allowed_sorts = {
         'timestamp', 'log_type', 'src_ip', 'dst_ip', 'src_port', 'dst_port',
         'protocol', 'service_name', 'direction', 'rule_action', 'rule_name',
@@ -70,44 +121,68 @@ def get_logs(
     }
     sort_col = sort if sort in allowed_sorts else 'timestamp'
     sort_dir = 'ASC' if order.lower() == 'asc' else 'DESC'
-    offset = (page - 1) * per_page
-
+    offset = (page - 1) * per_page if pagination == 'offset' else 0
+    view_counts = total = count_ms = None
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Count total
-            cur.execute(f"SELECT COUNT(*) as total FROM logs WHERE {where}", params)
-            total = cur.fetchone()['total']
+            started = perf_counter()
+            if state is not None:
+                if state['max_id'] is None:
+                    cur.execute('SELECT COALESCE(MAX(id), 0) AS max_id FROM logs')
+                    state['max_id'] = cur.fetchone()['max_id']
+                base_where += ' AND id <= %s'
+                base_params = base_params + [state['max_id']]
+            setup_ms = (perf_counter() - started) * 1000
+            if count_mode == 'exact':
+                started = perf_counter()
+                view_counts = query_view_counts(cur, base_where, base_params, exclude_groups)
+                count_ms = (perf_counter() - started) * 1000
+                total = view_counts['visible']
+            where, params = append_exclusions(base_where, base_params, exclude_groups)
+            if state is not None and state['after'] is not None:
+                comparator = '>' if sort_dir == 'ASC' else '<'
+                where += f' AND (timestamp, id) {comparator} (%s::timestamptz, %s)'
+                params += state['after']
 
-            # Fetch page, enriching with live device names from unifi_clients + unifi_devices
+            started = perf_counter()
+            # Bound joins to one page. The id tiebreaker makes timestamp ties
+            # deterministic in both directions, including legacy offset mode.
             cur.execute(
                 f"""WITH page AS (
                         SELECT * FROM logs WHERE {where}
-                        ORDER BY {sort_col} {sort_dir} LIMIT %s OFFSET %s
+                        ORDER BY {sort_col} {sort_dir}, id {sort_dir} LIMIT %s OFFSET %s
                     )
                     SELECT page.*,
-                        {device_name_coalesce('c1', 'd1', 'src_device_name', 'page.src_device_name')},
+                        {_source_device_name_select('page')},
                         {device_name_coalesce('c2', 'd2', 'dst_device_name', 'page.dst_device_name')}
                     FROM page
-                    LEFT JOIN unifi_clients c1 ON c1.mac = page.mac_address
+                    {device_name_client_lateral('page.src_ip', 'c1')}
                     {device_name_client_lateral('page.dst_ip', 'c2')}
-                    LEFT JOIN unifi_devices d1 ON d1.mac = page.mac_address
+                    {device_name_device_lateral('page.src_ip', 'd1')}
                     {device_name_device_lateral('page.dst_ip', 'd2')}
-                    ORDER BY page.{sort_col} {sort_dir}""",
-                params + [per_page, offset]
+                    ORDER BY page.{sort_col} {sort_dir}, page.id {sort_dir}""",
+                params + [per_page + 1, offset]
             )
             rows = cur.fetchall()
+            query_ms = setup_ms + (perf_counter() - started) * 1000
 
+        has_more = len(rows) > per_page
+        rows = rows[:per_page]
+        following = make_next_cursor(state, rows[-1]) if state is not None and has_more else None
         logs = [_serialize_log(row) for row in rows]
         _annotate_logs(logs)
-
         conn.commit()
         return {
-            'data': logs,
-            'total': total,
-            'page': page,
-            'per_page': per_page,
-            'pages': (total + per_page - 1) // per_page if per_page else 0,
+            'data': logs, 'total': total, 'view_counts': view_counts,
+            'page': page, 'per_page': per_page,
+            'pages': (total + per_page - 1) // per_page if total is not None else None,
+            'has_more': has_more, 'pagination': pagination,
+            'page_cursor': encode_cursor(state) if state is not None else None,
+            'next_cursor': following,
+            'window': {'time_from': state['from'], 'time_to': state['to']} if state is not None else None,
+            'timings': {'query_ms': round(query_ms, 3),
+                        'count_ms': round(count_ms, 3) if count_ms is not None else None},
         }
     except Exception as e:
         conn.rollback()
@@ -163,6 +238,8 @@ def get_logs_aggregate(
     dst_port: Optional[str] = Query(None, description="Destination port (prefix with ! to negate)"),
     src_port: Optional[str] = Query(None, description="Source port (prefix with ! to negate)"),
     protocol: Optional[str] = Query(None, description="Comma-separated: TCP,UDP,ICMP (prefix with ! to negate)"),
+    filter_rules: Optional[str] = None,
+    exclude_groups: Optional[str] = None,
 ):
     """Aggregate logs by a dimension, returning grouped counts and optional metrics."""
     if group_by not in _GROUP_BY_MAP:
@@ -191,8 +268,11 @@ def get_logs_aggregate(
         src_ip, dst_ip, ip, direction, rule_action,
         rule_name, country, threat_min, search, service,
         interface, vpn_only, asn=asn,
-        dst_port=dst_port, src_port=src_port, protocol=protocol,
+        dst_port=dst_port, src_port=src_port, protocol=protocol, filter_rules=filter_rules,
     )
+
+    base_where, base_params = where, params
+    where, params = append_exclusions(where, params, exclude_groups)
 
     # Build GROUP BY expression and per-clause param lists
     sql_expr, alias = _GROUP_BY_MAP[group_by]
@@ -254,11 +334,13 @@ def get_logs_aggregate(
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            view_counts = query_view_counts(cur, base_where, base_params, exclude_groups) if exclude_groups else None
             cur.execute(sql, final_params)
             rows = [dict(r) for r in cur.fetchall()]
         conn.commit()
         return {
             'group_by': group_by,
+            'view_counts': view_counts,
             'prefix_length': prefix_length,
             'count': len(rows),
             'data': rows,
@@ -319,16 +401,16 @@ _LOG_DETAIL_SQL = """
                      CASE WHEN array_length(t2.threat_categories, 1) > 0 THEN t2.threat_categories END
             END
         ) as threat_categories,
-        """ + device_name_coalesce('c1', 'd1', 'src_device_name', 'l.src_device_name') + """,
+        """ + _source_device_name_select('l') + """,
         """ + device_name_coalesce('c2', 'd2', 'dst_device_name', 'l.dst_device_name') + """
     FROM logs l
     LEFT JOIN ip_threats t1 ON t1.ip = l.src_ip
         AND NOT (l.src_ip = ANY(%s::inet[]))
     LEFT JOIN ip_threats t2 ON t2.ip = l.dst_ip
         AND NOT (l.dst_ip = ANY(%s::inet[]))
-    LEFT JOIN unifi_clients c1 ON c1.mac = l.mac_address
+    """ + device_name_client_lateral('l.src_ip', 'c1') + """
     """ + device_name_client_lateral('l.dst_ip', 'c2') + """
-    LEFT JOIN unifi_devices d1 ON d1.mac = l.mac_address
+    """ + device_name_device_lateral('l.src_ip', 'd1') + """
     """ + device_name_device_lateral('l.dst_ip', 'd2') + """
 """
 
@@ -354,6 +436,8 @@ def _annotate_logs(logs):
     cfg = load_identity_config(enricher_db)
     for log in logs:
         annotate_record(cfg, log)
+        if log.get('event_source') == 'unifi_ips':
+            log.update(cef_reported_context(log.get('raw_log')))
         desc = get_service_description(log.get('dst_port'), log.get('protocol'))
         if desc:
             log['service_description'] = desc
@@ -362,13 +446,14 @@ def _annotate_logs(logs):
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
 @router.get("/api/logs/counts-by-type")
-def get_log_counts_by_type():
-    """Return record counts for wifi and system log types."""
+def get_log_counts_by_type(exclude_groups: Optional[str] = None):
+    """Return all-time wifi/system counts within the requested view."""
+    where, params = append_exclusions("log_type IN ('wifi', 'system')", [], exclude_groups)
     conn = get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT log_type, COUNT(*) FROM logs WHERE log_type IN ('wifi', 'system') GROUP BY log_type"
+                f"SELECT log_type, COUNT(*) FROM logs WHERE {where} GROUP BY log_type", params
             )
             rows = cur.fetchall()
         conn.commit()
@@ -380,6 +465,66 @@ def get_log_counts_by_type():
         put_conn(conn)
     counts = {r[0]: r[1] for r in rows}
     return {"wifi": counts.get("wifi", 0), "system": counts.get("system", 0)}
+
+
+@router.get("/api/logs/exclusion-preview")
+def preview_exclusions(
+    log_type: Optional[str] = Query(None, description="Comma-separated: firewall,dns,dhcp,wifi,system"),
+    time_range: Optional[str] = Query(None, description="1h,6h,24h,7d,30d,60d"),
+    time_from: Optional[str] = Query(None, description="ISO datetime"),
+    time_to: Optional[str] = Query(None, description="ISO datetime"),
+    src_ip: Optional[str] = Query(None, description="Source IP/CIDR; partial text supported, contains: forces substring, ! negates"),
+    dst_ip: Optional[str] = Query(None, description="Destination IP/CIDR; partial text supported, contains: forces substring, ! negates"),
+    ip: Optional[str] = Query(None, description="Both endpoint IPs/CIDRs; contains: forces substring, ! negates"),
+    direction: Optional[str] = Query(None, description="Comma-separated: inbound,outbound,inter_vlan,nat"),
+    rule_action: Optional[str] = Query(None, description="Comma-separated: allow,block,redirect (prefix with ! to negate)"),
+    rule_name: Optional[str] = Query(None, description="Rule name search (prefix with ! to negate)"),
+    country: Optional[str] = Query(None, description="Comma-separated country codes (prefix with ! to negate)"),
+    threat_min: Optional[int] = Query(None, description="Minimum threat score"),
+    search: Optional[str] = Query(None, description="Full-text search in raw_log (prefix with ! to negate)"),
+    service: Optional[str] = Query(None, description="Comma-separated service names (prefix with ! to negate)"),
+    interface: Optional[str] = Query(None, description="Comma-separated interface names"),
+    vpn_only: bool = Query(False, description="Show only VPN traffic"),
+    asn: Optional[str] = Query(None, description="ASN name search"),
+    dst_port: Optional[str] = Query(None, description="Destination port (prefix with ! to negate)"),
+    src_port: Optional[str] = Query(None, description="Source port (prefix with ! to negate)"),
+    protocol: Optional[str] = Query(None, description="Comma-separated: TCP,UDP,ICMP (prefix with ! to negate)"),
+    filter_rules: Optional[str] = None,
+    exclude_groups: Optional[str] = None,
+):
+    """Preview how many current-scope events would be hidden, without writing."""
+    time_range, time_from, time_to = validate_time_params(time_range, time_from, time_to)
+    base_where, base_params = build_log_query(
+        log_type, time_range, time_from, time_to,
+        src_ip, dst_ip, ip, direction, rule_action,
+        rule_name, country, threat_min, search, service,
+        interface, vpn_only, asn=asn, dst_port=dst_port, src_port=src_port,
+        protocol=protocol, filter_rules=filter_rules,
+    )
+    conditions, params = compile_exclusions(exclude_groups)
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            view_counts = query_view_counts(cur, base_where, base_params, exclude_groups)
+            examples = []
+            if conditions and view_counts['hidden']:
+                cur.execute(
+                    f"SELECT id, timestamp, hostname, rule_name, rule_desc, rule_action, "
+                    f"host(src_ip) AS src_ip, host(dst_ip) AS dst_ip, protocol, src_port, dst_port "
+                    f"FROM logs WHERE ({base_where}) AND NOT ({' AND '.join(conditions)}) "
+                    "ORDER BY timestamp DESC, id DESC LIMIT 5",
+                    list(base_params) + params,
+                )
+                examples = [_serialize_log(row) for row in cur.fetchall()]
+        conn.commit()
+        return {'view_counts': view_counts, 'examples': examples,
+                'notice': 'Preview only. Raw records are retained; IPS and unparsed CEF threat events stay visible.'}
+    except Exception as e:
+        conn.rollback()
+        logger.exception('Error previewing exclusions')
+        raise HTTPException(status_code=500, detail='Internal server error') from e
+    finally:
+        put_conn(conn)
 
 
 @router.get("/api/logs/{log_id}")
@@ -460,6 +605,8 @@ def export_csv_endpoint(
     dst_port: Optional[str] = Query(None),
     src_port: Optional[str] = Query(None),
     protocol: Optional[str] = Query(None),
+    filter_rules: Optional[str] = Query(None),
+    exclude_groups: Optional[str] = None,
     limit: int = Query(10000, ge=1, le=100000),
 ):
     time_range, time_from, time_to = validate_time_params(time_range, time_from, time_to)
@@ -467,8 +614,10 @@ def export_csv_endpoint(
         log_type, time_range, time_from, time_to,
         src_ip, dst_ip, ip, direction, rule_action,
         rule_name, country, threat_min, search, service, interface, vpn_only, asn=asn,
-        dst_port=dst_port, src_port=src_port, protocol=protocol,
+        dst_port=dst_port, src_port=src_port, protocol=protocol, filter_rules=filter_rules,
     )
+
+    where, params = append_exclusions(where, params, exclude_groups)
 
     export_columns = [
         'timestamp', 'log_type', 'direction', 'src_ip', 'src_port',
@@ -479,6 +628,8 @@ def export_csv_endpoint(
         'threat_categories', 'rdns',
         'abuse_usage_type', 'abuse_total_reports', 'abuse_last_reported',
         'abuse_is_tor', 'remote_ip',
+        'source', 'event_source', 'event_id', 'event_name',
+        'ips_signature', 'ips_signature_id', 'ips_severity', 'ips_risk',
     ]
 
     if get_config(enricher_db, 'ui_csv_export_unifi_raw_log', 'off') == 'on':
@@ -500,12 +651,12 @@ def export_csv_endpoint(
                         ORDER BY timestamp DESC LIMIT %s
                     )
                     SELECT {', '.join('f.' + c for c in export_columns)},
-                        {device_name_coalesce('c1', 'd1', 'src_device_name', 'f.src_device_name')},
+                        {_source_device_name_select('f')},
                         {device_name_coalesce('c2', 'd2', 'dst_device_name', 'f.dst_device_name')}
                     FROM filtered f
-                    LEFT JOIN unifi_clients c1 ON c1.mac = f.mac_address
+                    {device_name_client_lateral('f.src_ip', 'c1')}
                     {device_name_client_lateral('f.dst_ip', 'c2')}
-                    LEFT JOIN unifi_devices d1 ON d1.mac = f.mac_address
+                    {device_name_device_lateral('f.src_ip', 'd1')}
                     {device_name_device_lateral('f.dst_ip', 'd2')}
                     ORDER BY f.timestamp DESC""",
                 params + [limit]
@@ -535,7 +686,7 @@ def export_csv_endpoint(
             ]:
                 ip_str = str(row[ip_idx] or '').split('/')[0]
                 name, vlan, vpn_badge = annotate_ip(cfg, ip_str, row[name_idx])
-                if name and not row[name_idx]:
+                if name:
                     row[name_idx] = name
                 if vlan is not None:
                     row[vlan_idx] = vlan

@@ -1,18 +1,24 @@
+import ExclusionProfiles, { ExclusionProfileProvider } from './components/ExclusionProfiles'
 import React, { Suspense, useState, useEffect, useLayoutEffect, useMemo, useCallback, useRef } from 'react'
 import LogStream from './components/LogStream'
 import SetupWizard from './components/SetupWizard'
 import SettingsOverlay from './components/SettingsOverlay'
-import { DashboardSkeleton } from './components/Dashboard'
-import { ThreatMapSkeleton } from './components/ThreatMap'
+import { DashboardSkeleton, ThreatMapSkeleton } from './components/PanelSkeletons'
 import FlowViewSkeleton from './components/FlowViewSkeleton'
 
 const Dashboard = React.lazy(() => import('./components/Dashboard'))
+const Operations = React.lazy(() => import('./components/Operations'))
 const ThreatMap = React.lazy(() => import('./components/ThreatMap'))
 const FlowView = React.lazy(() => import('./components/FlowView'))
 import Login from './components/Login'
 import { fetchHealth, fetchConfig, fetchLatestRelease, dismissUpgradeModal, dismissVpnToast, fetchInterfaces, fetchUiSettings, updateUiSettings, fetchUniFiSettings, fetchAuthStatus, fetchAuthMe, authLogout, setAuthExpiredHandler } from './api'
 import { loadInterfaceLabels } from './utils'
 import { isVpnInterface } from './vpnUtils'
+import useSerializedPoll from './hooks/useSerializedPoll'
+import { collectionStatus } from './lib/collectionStatus'
+import { readPreference, writePreference, writeTextPreference } from './lib/preferences'
+
+const fetchStatusHealth = (_params, options) => fetchHealth(options)
 
 function LoadingSplash() {
   return (
@@ -70,6 +76,7 @@ const TABS = [
   { id: 'flow-view', label: 'Flow View', shortLabel: 'Flow' },
   { id: 'threat-map', label: 'Threat Map', shortLabel: 'Map' },
   { id: 'dashboard', label: 'Dashboard', shortLabel: 'Dashboard' },
+  { id: 'operations', label: 'Operations', shortLabel: 'Operations' },
 ]
 
 function formatShortDate(isoStr) {
@@ -114,9 +121,12 @@ export default function App() {
   const [activeTab, setActiveTab] = useState(() => {
     const hash = window.location.hash.replace('#', '').split('?')[0]
     const valid = TABS.map(t => t.id)
-    return valid.includes(hash) ? hash : 'logs'
+    return valid.includes(hash) ? hash : readPreference('unifi-log-insight:active-tab', 'logs', value => valid.includes(value))
   })
-  const [health, setHealth] = useState(null)
+  useEffect(() => { writePreference('unifi-log-insight:active-tab', activeTab) }, [activeTab])
+  const healthPoll = useSerializedPoll({ params: {}, fetcher: fetchStatusHealth, intervalMs: 15000 })
+  const health = healthPoll.data
+  const collection = collectionStatus(health?.ingestion)
   const [latestRelease, setLatestRelease] = useState(null)
   const [showWizard, setShowWizard] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
@@ -145,7 +155,7 @@ export default function App() {
   const [theme, setTheme] = useState(() => {
     const urlTheme = new URLSearchParams(window.location.search).get('theme')
     if (urlTheme === 'light' || urlTheme === 'dark') return urlTheme
-    return localStorage.getItem('ui_theme') || 'dark'
+    return readPreference('ui_theme', 'dark', value => ['light', 'dark'].includes(value))
   })
   const initialThemeRef = useRef(theme)
   const [showStatusTooltip, setShowStatusTooltip] = useState(false)
@@ -159,8 +169,8 @@ export default function App() {
   // Persist URL-derived theme to localStorage so Settings reads the correct value
   useEffect(() => {
     const urlTheme = new URLSearchParams(window.location.search).get('theme')
-    if ((urlTheme === 'light' || urlTheme === 'dark') && localStorage.getItem('ui_theme') !== urlTheme) {
-      localStorage.setItem('ui_theme', urlTheme)
+    if (urlTheme === 'light' || urlTheme === 'dark') {
+      writeTextPreference('ui_theme', urlTheme)
     }
   }, [])
 
@@ -169,9 +179,9 @@ export default function App() {
     if (authState === 'loading' || authState === 'login') return
     fetchUiSettings().then(data => {
       setUiSettings(data)
-      if (!localStorage.getItem('ui_theme') && data.ui_theme && data.ui_theme !== initialThemeRef.current) {
+      if (!readPreference('ui_theme', null, value => ['light', 'dark'].includes(value)) && ['light', 'dark'].includes(data.ui_theme) && data.ui_theme !== initialThemeRef.current) {
         setTheme(data.ui_theme)
-        localStorage.setItem('ui_theme', data.ui_theme)
+        writeTextPreference('ui_theme', data.ui_theme)
       }
     }).catch(() => {})
   }, [authState]) // eslint-disable-line react-hooks/exhaustive-deps
@@ -224,7 +234,7 @@ export default function App() {
   const toggleTheme = () => {
     const next = theme === 'dark' ? 'light' : 'dark'
     setTheme(next)
-    localStorage.setItem('ui_theme', next)
+    writeTextPreference('ui_theme', next)
     updateUiSettings({ ui_theme: next }).catch(() => {})
   }
 
@@ -277,8 +287,8 @@ export default function App() {
           if (me.authenticated) {
             bootstrapDoneRef.current = true
             setAuthState('authenticated')
-            // Warn if reverse proxy isn't sending X-ULI-Proxy-Auth
-            if (!status.proxy_trusted && !sessionStorage.getItem('proxy_toast_dismissed')) {
+            // Direct HTTPS does not need the reverse proxy trust header.
+            if (!status.is_https && !status.proxy_trusted && !sessionStorage.getItem('proxy_toast_dismissed')) {
               setShowProxyToast(true)
             }
           } else {
@@ -335,21 +345,14 @@ export default function App() {
     return () => { mounted = false }
   }, [authState]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => {
-    const checkHealth = () => fetchHealth().then(setHealth).catch(() => {})
-    checkHealth()
-    const interval = setInterval(checkHealth, 15000)
-    return () => clearInterval(interval)
-  }, [])
-
-  // Auto-dismiss proxy toast once reverse proxy starts sending X-ULI-Proxy-Auth
+  // Auto-dismiss once HTTPS is verified or the proxy trust header is configured.
   useEffect(() => {
     if (!showProxyToast) return
     const interval = setInterval(() => {
       fetchAuthStatus().then(status => {
-        if (status.proxy_trusted) {
+        if (status.is_https || status.proxy_trusted) {
           setShowProxyToast(false)
-          setAuthStatus(prev => ({ ...prev, proxy_trusted: true, is_https: status.is_https }))
+          setAuthStatus(prev => ({ ...prev, proxy_trusted: status.proxy_trusted, is_https: status.is_https }))
         }
       }).catch(() => {})
     }, 10000)
@@ -537,10 +540,10 @@ export default function App() {
 
   // Show settings overlay (also hosts reconfigure wizard)
   if (showSettings) {
-    return <SettingsOverlay
+    return <ExclusionProfileProvider><SettingsOverlay
       onClose={() => {
         reloadConfig().catch(() => {})
-        setTheme(localStorage.getItem('ui_theme') || 'dark')
+        setTheme(readPreference('ui_theme', 'dark', value => ['light', 'dark'].includes(value)))
         setShowSettings(false)
         setSettingsReconfig(false)
         setSettingsInitialSection(null)
@@ -555,10 +558,11 @@ export default function App() {
       storage={health?.storage}
       onAuthEnabled={() => { bootstrapDoneRef.current = true; setAuthState('authenticated') }}
       onUiSettingsChanged={setUiSettings}
-    />
+    /></ExclusionProfileProvider>
   }
 
   return (
+    <ExclusionProfileProvider>
     <div className={`h-dvh flex flex-col bg-gray-950${logsPaused && activeTab === 'logs' ? ' paused-glow' : ''}`}>
       {/* Log-detection deprecation modal — Phase 1 transition, removal target: phase 2 */}
       {showUpgradeModal && (
@@ -793,21 +797,43 @@ export default function App() {
                   {health.total_logs?.toLocaleString()} logs
                 </span>
               </div>
+              {health.ingestion?.stats?.dropped > 0 && <button type="button"
+                onClick={() => setActiveTab('operations')}
+                className="text-xs text-amber-300 hover:text-amber-200"
+                title="The receiver snapshot reports cumulative collection loss in its session. Open Collection health for current status and details.">
+                Collection loss: {health.ingestion.stats.dropped.toLocaleString()}
+              </button>}
+              {collection.attentionRequired && !(health.ingestion?.stats?.dropped > 0) && <button type="button"
+                onClick={() => setActiveTab('operations')}
+                className="text-xs text-amber-300 hover:text-amber-200"
+                title="Collection delay, errors, missing events or an unavailable snapshot need attention. Open Collection health.">
+                Collection needs attention
+              </button>}
+              {collection.processing && !collection.attentionRequired && <button type="button"
+                onClick={() => setActiveTab('operations')}
+                className="hidden sm:inline text-xs text-gray-400 hover:text-gray-200"
+                title="Recent events are being collected and written. This is normal processing. Open Collection health.">
+                Processing recent events
+              </button>}
               <div className="relative" ref={statusRef}>
                 <button
                   type="button"
                   onClick={() => setShowStatusTooltip(v => !v)}
                   className="flex items-center justify-center w-6 h-6 -m-1"
                   aria-label="System status"
+                  title={health.status !== 'ok' ? 'API/database health is not OK.' : health.ingestion?.stats?.dropped > 0 ? 'API/database reachable. Known collection loss was reported during this receiver session; this does not establish a current outage.' : collection.attentionRequired ? 'API/database reachable. Collection needs attention; open Collection health for details.' : 'API/database reachable. This does not confirm complete log collection.'}
                 >
                   <span className={`w-1.5 h-1.5 rounded-full ${
-                    health.status === 'ok' ? 'bg-emerald-400' : 'bg-red-400'
+                    health.status !== 'ok' ? 'bg-red-400' : collection.attentionRequired ? 'bg-amber-400' : 'bg-emerald-400'
                   }`} />
                 </button>
                 {showStatusTooltip && (
                   <div className="md:hidden absolute right-0 top-full mt-1 w-52 bg-gray-950 border border-gray-700 rounded-lg shadow-lg z-30 p-3">
                     <div className="text-xs text-gray-300 font-medium mb-2">System Status</div>
                     <div className="text-xs text-gray-400 space-y-1">
+                      <div>{health.status === 'ok' ? 'API/database reachable' : 'API/database health not OK'}</div>
+                      <div>Collection completeness is separate from API/database availability.</div>
+                      {health.ingestion?.stats?.dropped > 0 && <div className="text-amber-300">{health.ingestion.stats.dropped.toLocaleString()} cumulative dropped rows/packets reported this receiver session.</div>}
                       <div>AbuseIPDB: {formatAbuseIPDB(health.abuseipdb)}</div>
                       <div>MaxMind: {formatShortDate(health.maxmind_last_update)}</div>
                       <div>Next pull: {formatShortDate(health.maxmind_next_update)}</div>
@@ -862,10 +888,12 @@ export default function App() {
       </header>
 
       {/* Content */}
+      <ExclusionProfiles activeTab={activeTab} />
       <main className="flex-1 overflow-hidden">
         {activeTab === 'logs' && <LogStream version={health?.version} latestRelease={latestRelease} maxFilterDays={maxFilterDays} drillFilters={logsDrill} onDrillConsumed={clearLogsDrill} interfaces={allInterfaces} onPauseChange={onLogsPauseChange} uiSettings={uiSettings} />}
         <Suspense fallback={<DashboardSkeleton />}>
           {activeTab === 'dashboard' && <Dashboard maxFilterDays={maxFilterDays} />}
+          {activeTab === 'operations' && <Operations />}
         </Suspense>
         <Suspense fallback={<FlowViewSkeleton />}>
           {(activeTab === 'flow-view' || drillSource === 'flow-view') && (
@@ -879,5 +907,6 @@ export default function App() {
         </Suspense>
       </main>
     </div>
+    </ExclusionProfileProvider>
   )
 }

@@ -6,6 +6,10 @@ import { fetchThreatGeo } from '../api'
 import { formatNumber } from '../utils'
 import { THREAT_LEVELS } from '../lib/threatPresentation'
 import useTimeRange from '../hooks/useTimeRange'
+import usePreference from '../hooks/usePreference'
+import { readPreference, writePreference } from '../lib/preferences'
+import { isBoolean, isDateWindow, isMapCamera } from '../lib/viewPreferences'
+import useSerializedPoll from '../hooks/useSerializedPoll'
 import ThreatSidebar from './ThreatSidebar'
 import DateRangePicker from './DateRangePicker'
 
@@ -199,43 +203,24 @@ function applyLayers(map, geoData, view, _retry) {
   }
 }
 
-export function ThreatMapSkeleton() {
-  return (
-    <div className="h-full flex flex-col animate-pulse">
-      <div className="flex items-center gap-2 px-4 py-2 border-b border-gray-800">
-        <div className="h-7 w-10 bg-gray-800 rounded" />
-        <div className="h-7 w-10 bg-gray-800 rounded" />
-        <div className="h-7 w-10 bg-gray-800 rounded" />
-      </div>
-      <div className="flex-1 bg-black" />
-    </div>
-  )
-}
 
 export default function ThreatMap({ maxFilterDays, flyTo, onFlyToDone }) {
   const mapContainer = useRef(null)
   const mapRef = useRef(null)
   const flyToMarkerRef = useRef(null)
   const [timeRange, setTimeRange, visibleRanges] = useTimeRange(maxFilterDays)
-  const [mode, setMode] = useState('threats')
-  const [view, setView] = useState('heatmap')
-  const [filtersExpanded, setFiltersExpanded] = useState(false)
-  const [geoData, setGeoData] = useState(null)
-  const [loading, setLoading] = useState(true)
+  const [mode, setMode] = usePreference('unifi-log-insight:map-mode', 'threats', value => MODES.some(mode => mode.id === value))
+  const [view, setView] = usePreference('unifi-log-insight:map-view', 'heatmap', value => VIEWS.some(view => view.id === value))
+  const [filtersExpanded, setFiltersExpanded] = usePreference('unifi-log-insight:map-filters-expanded', false, isBoolean)
   const [sidebarLocation, setSidebarLocation] = useState(null)
   const [hasFlyToMarker, setHasFlyToMarker] = useState(false)
-  const [timeFrom, setTimeFrom] = useState(null)
-  const [timeTo, setTimeTo] = useState(null)
+  const [dateWindow, setDateWindow] = usePreference('unifi-log-insight:map-date-window', { from: null, to: null }, isDateWindow)
+  const { from: timeFrom, to: timeTo } = dateWindow
+  const [initialCamera] = useState(() => readPreference('unifi-log-insight:map-camera', { center: [20, 20], zoom: 1.5, bearing: 0, pitch: 0 }, isMapCamera))
 
   const isCustomTime = !!(timeFrom || timeTo)
 
   const closeSidebar = useCallback(() => setSidebarLocation(null), [])
-
-  // Keep refs in sync so applyLayers always has latest values
-  const viewRef = useRef(view)
-  const geoDataRef = useRef(geoData)
-  viewRef.current = view
-  geoDataRef.current = geoData
 
   const geoParams = {
     time_range: isCustomTime ? null : timeRange,
@@ -244,28 +229,16 @@ export default function ThreatMap({ maxFilterDays, flyTo, onFlyToDone }) {
     mode,
   }
 
-  // Fetch geo data
-  useEffect(() => {
-    let mounted = true
-    setLoading(true)
-    setSidebarLocation(null)
-    fetchThreatGeo(geoParams)
-      .then(data => { if (mounted) setGeoData(data) })
-      .catch(() => {})
-      .finally(() => { if (mounted) setLoading(false) })
-    return () => { mounted = false }
-  }, [timeRange, timeFrom, timeTo, mode])
+  const { data: geoData, loading, error: geoError, refresh: refreshGeo } = useSerializedPoll({
+    params: geoParams, fetcher: fetchThreatGeo, intervalMs: 60000,
+  })
+  useEffect(() => { setSidebarLocation(null) }, [timeRange, timeFrom, timeTo, mode])
 
-  // Auto-refresh every 60s
-  useEffect(() => {
-    let mounted = true
-    const interval = setInterval(() => {
-      fetchThreatGeo(geoParams)
-        .then(data => { if (mounted) setGeoData(data) })
-        .catch(() => {})
-    }, 60000)
-    return () => { mounted = false; clearInterval(interval) }
-  }, [timeRange, timeFrom, timeTo, mode])
+  // Keep refs in sync so applyLayers always has latest values
+  const viewRef = useRef(view)
+  const geoDataRef = useRef(geoData)
+  viewRef.current = view
+  geoDataRef.current = geoData
 
   // Initialize map
   useEffect(() => {
@@ -274,9 +247,17 @@ export default function ThreatMap({ maxFilterDays, flyTo, onFlyToDone }) {
     const map = new maplibregl.Map({
       container: mapContainer.current,
       style: getTheme() === 'dark' ? TILE_DARK : TILE_LIGHT,
-      center: [20, 20],
-      zoom: 1.5,
+      ...initialCamera,
       attributionControl: false,
+    })
+
+    map.on('moveend', () => {
+      const center = map.getCenter()
+      const camera = {
+        center: [((center.lng + 180) % 360 + 360) % 360 - 180, center.lat],
+        zoom: map.getZoom(), bearing: map.getBearing(), pitch: map.getPitch(),
+      }
+      if (isMapCamera(camera)) writePreference('unifi-log-insight:map-camera', camera)
     })
 
     map.addControl(new maplibregl.NavigationControl(), 'top-right')
@@ -375,7 +356,7 @@ export default function ThreatMap({ maxFilterDays, flyTo, onFlyToDone }) {
   // Re-apply layers when geoData or view changes
   useEffect(() => {
     const map = mapRef.current
-    if (!map || !geoData) return
+    if (!map) return
 
     // If style isn't ready yet, wait for idle then apply
     if (!map.isStyleLoaded()) {
@@ -555,7 +536,7 @@ export default function ThreatMap({ maxFilterDays, flyTo, onFlyToDone }) {
               <button
                 type="button"
                 key={tr}
-                onClick={() => { setTimeRange(tr); setTimeFrom(null); setTimeTo(null) }}
+                onClick={() => { setTimeRange(tr); setDateWindow({ from: null, to: null }) }}
                 aria-pressed={!isCustomTime && timeRange === tr}
                 className={`px-2.5 py-1 rounded text-xs font-medium transition-all ${
                   !isCustomTime && timeRange === tr ? 'bg-black text-white border border-gray-600' : 'text-gray-400 hover:text-gray-300 border border-transparent'
@@ -570,12 +551,10 @@ export default function ThreatMap({ maxFilterDays, flyTo, onFlyToDone }) {
               timeTo={timeTo}
               maxFilterDays={maxFilterDays}
               onApply={({ time_from, time_to }) => {
-                setTimeFrom(time_from)
-                setTimeTo(time_to)
+                setDateWindow({ from: time_from, to: time_to })
               }}
               onClear={() => {
-                setTimeFrom(null)
-                setTimeTo(null)
+                setDateWindow({ from: null, to: null })
                 setTimeRange('24h')
               }}
             />
@@ -586,8 +565,7 @@ export default function ThreatMap({ maxFilterDays, flyTo, onFlyToDone }) {
               type="button"
               onClick={() => {
                 setTimeRange('24h')
-                setTimeFrom(null)
-                setTimeTo(null)
+                setDateWindow({ from: null, to: null })
                 setMode('threats')
                 setView('heatmap')
               }}
@@ -611,6 +589,11 @@ export default function ThreatMap({ maxFilterDays, flyTo, onFlyToDone }) {
         </div>
       </div>
 
+      {geoError && <div role="alert" className="text-amber-400 text-xs px-4 py-2 flex gap-2">
+        <span>Map data could not be refreshed. {geoData ? 'Showing the previous result.' : 'Results are unavailable.'}</span>
+        <button type="button" className="underline" onClick={() => refreshGeo()}>Retry</button>
+      </div>}
+
       {/* Map + sidebar row */}
       <div className="flex-1 flex min-h-0">
         {/* Map container */}
@@ -618,7 +601,7 @@ export default function ThreatMap({ maxFilterDays, flyTo, onFlyToDone }) {
           <div ref={mapContainer} className="absolute inset-0" />
 
           {/* Empty state */}
-          {!loading && geoData?.features?.length === 0 && !hasFlyToMarker && (
+          {!loading && !geoError && geoData?.features?.length === 0 && !hasFlyToMarker && (
             <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-10">
               <div className="bg-gray-950/80 border border-gray-800 rounded-lg px-6 py-4 text-center">
                 <div className="text-gray-400 text-sm">No geo data available</div>

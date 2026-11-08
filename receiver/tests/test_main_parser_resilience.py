@@ -18,7 +18,7 @@ import pytest
 
 
 @pytest.fixture
-def receiver(monkeypatch):
+def receiver(monkeypatch, tmp_path):
     """Build a SyslogReceiver with heavy deps stubbed.
 
     Mirrors test_main_retention_scheduler.py's main_module fixture: deps.py
@@ -35,14 +35,21 @@ def receiver(monkeypatch):
     monkeypatch.delitem(sys.modules, 'main', raising=False)
     from main import SyslogReceiver
 
+    monkeypatch.setenv('INGEST_SPOOL_PATH', str(tmp_path / 'spool.sqlite3'))
+    monkeypatch.setenv('INGEST_STATUS_PATH', str(tmp_path / 'health.json'))
+    from types import SimpleNamespace
     db = MagicMock()
+    db.insert_logs_batch.side_effect = lambda rows: SimpleNamespace(
+        inserted=len(rows), dropped=0, retryable=[], duplicates=0)
     db.get_config = MagicMock(return_value=True)
     enricher = MagicMock()
-    enricher.enrich = MagicMock(side_effect=lambda p: p)
+    enricher.enrich = MagicMock(side_effect=lambda p, **_kwargs: p)
 
     r = SyslogReceiver(db, enricher)
     r._disabled_log_types = set()
-    return r
+    yield r
+    if r._spool is not None:
+        r._spool.close()
 
 
 class TestHandleMessageResilience:
@@ -86,7 +93,7 @@ class TestHandleMessageResilience:
         # If enricher.enrich raises, the packet must not be dropped: the parsed
         # row is batched un-enriched and counted as enrich_exceptions, not
         # parse_exceptions.
-        def _partial_then_raise(p):
+        def _partial_then_raise(p, **_kwargs):
             p['country'] = 'XX'  # partial mutation must not leak into the row
             raise RuntimeError("simulated enricher bug")
 
