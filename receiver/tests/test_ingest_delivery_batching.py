@@ -206,7 +206,8 @@ def test_delivery_worker_flushes_sparse_durable_rows_after_bounded_hold(receiver
         wait_until(lambda: receiver.stats['staged'] == 1)
         assert len(committed_payloads(receiver)) == 1
         receiver.db.insert_logs_batch.assert_not_called()
-        wait_until(lambda: receiver.stats['inserted'] == 1)
+        # PostgreSQL confirmation and spool cleanup are separate worker steps.
+        wait_until(lambda: receiver.stats['inserted'] == 1 and receiver._spool.rows == 0)
         assert receiver.db.insert_logs_batch.call_count == 1
         assert receiver._spool.rows == 0
     finally:

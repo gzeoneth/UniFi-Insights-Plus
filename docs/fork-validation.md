@@ -2,6 +2,17 @@
 
 The changes were tested against the upstream v3.7.2 base using synthetic events and disposable local databases. No live collector, gateway or production database was modified for these checks.
 
+## Long time ranges: 3.7.2-gzeon.12
+
+- The backend suite passed 1,569 tests with disposable PostgreSQL 16 integration and all eleven upgrade/restore tests enabled. Five optional query-benchmark variants passed separately, as did the Linux embedded-profile test. All 343 UI tests and the production UI build passed.
+- Exact before/after comparisons cover Overview, charts, all ten dashboard tables and zone matrices, including exclusions, protected security events, NULL values, IPv4/IPv6 masks and inventory metadata. Alternating 500,000-event benchmarks measured fewer scans and lower median latency for normal dimensions. High-cardinality zone and adversarial Overview fixtures also record their regressions and temporary I/O. See [performance](performance.md) for results and limits.
+- Sixteen map checks, including three benchmarks with 1.02–1.36 million events, preserve counts, scores, distinct peers and timestamp-ordered ID samples. Tests use the production numeric coordinate type and cover snapshot consistency during insertion, pool-default restoration, NULL/empty text, custom text collations, numeric precision and cancellation. At most 25,000 IDs are retained; driver fetches contain at most 4,096 narrow tuples. Equal-timestamp boundary ordering remains unspecified, as before.
+- Real PostgreSQL cancellation tests stop an abandoned read, discard its connection and verify that a replacement borrower is unaffected. Race tests protect existing leases during commits and authentication/audit phases, including nested critical phases. FIFO admission tests cover overload, disconnects, fresh authorization, MCP body delivery and lightweight-route exceptions. Dashboard tests include background refreshes, obsolete queued filters, hidden tabs, failures, unmount and StrictMode replay.
+- ARM64 and AMD64 images built and started successfully; fifteen critical source files matched the tested checkout in both images. The ARM64 image stored all 2,000 synthetic UDP events with unique ingest IDs, an empty pending spool and no reported drops, parse failures or database errors. Eleven API paths passed, including the 24-hour dashboard, Flow, rules, Security and both map modes. Authenticated responses supplied numeric timing headers; invalid tokens were denied and all three MCP audit calls were retained.
+- A packaged `.11` to `.12` upgrade preserved all 200 fixture events, token identities and an encrypted configuration value. Authenticated browsing, invalid-token rejection and decryption worked afterward. PostgreSQL durability settings remained enabled. This validates the disposable fixture, not a production backup or deployment.
+
+No production index retirement, statistics maintenance or memory change is implied by these tests. Large time windows still inspect many events; local warmed fixtures do not predict production latency or continuous UDP delivery.
+
 ## Import and request efficiency: 3.7.2-gzeon.11
 
 - The backend suite passed 1,501 tests with disposable PostgreSQL 16 integration enabled. The Linux-only embedded-profile test passed separately in the built image. All 332 UI tests and the production UI build passed.

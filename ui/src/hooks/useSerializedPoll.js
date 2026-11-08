@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 // A changed filter invalidates the response, but waits for the request to settle
 // before starting another. Aborting fetch alone does not cancel a database query.
-export default function useSerializedPoll({ params, fetcher, enabled = true, ready = true, intervalMs = 5000 }) {
+export default function useSerializedPoll({ params, fetcher, enabled = true, ready = true, intervalMs = 5000,
+  cancelObsolete = false }) {
   const key = JSON.stringify(params)
   const latest = useRef(null)
   latest.current = { params, fetcher, enabled, ready, intervalMs, key }
@@ -57,9 +58,16 @@ export default function useSerializedPoll({ params, fetcher, enabled = true, rea
       const nextVisible = document.visibilityState !== 'hidden'
       setVisible(nextVisible)
       clearTimeout(s.timer)
+      if (!nextVisible && s.inflight) {
+        // The API now cancels owned read leases on disconnect. Do not leave
+        // a hidden wide-window view competing with the newly opened page.
+        s.revision++
+        s.inflight.abort()
+      }
       if (nextVisible) {
         if (s.pending) pump.current()
-        else if (latest.current.enabled && latest.current.ready && !s.inflight) request({}, { background: true })
+        else if (latest.current.enabled && latest.current.ready &&
+          (!s.inflight || s.inflight.signal.aborted)) request({}, { background: true })
       }
     }
     document.addEventListener('visibilitychange', onVisibility)
@@ -74,13 +82,14 @@ export default function useSerializedPoll({ params, fetcher, enabled = true, rea
   }, [request])
 
   useEffect(() => {
+    if (cancelObsolete) state.current.inflight?.abort()
     if (ready) request()
     else {
       state.current.revision++
       state.current.pending = null
       clearTimeout(state.current.timer)
     }
-  }, [key, ready, request])
+  }, [key, ready, request, cancelObsolete])
   useEffect(() => {
     const s = state.current
     clearTimeout(s.timer)

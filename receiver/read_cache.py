@@ -8,6 +8,8 @@ import sys
 import threading
 import time
 
+from request_work import current_work, RequestGone
+
 
 def _size(value, seen=None):
     """Estimate retained Python memory, counting shared objects only once."""
@@ -59,6 +61,9 @@ class ReadCache:
         hit = False
         with self._condition:
             while True:
+                work = current_work()
+                if work is not None and work.disconnected.is_set():
+                    raise RequestGone()
                 now = time.monotonic()
                 entry = self._entries.get(key)
                 if entry is not None:
@@ -75,7 +80,9 @@ class ReadCache:
                     self._pending.add(pending_key)
                     generation = self._generation
                     break
-                self._condition.wait()
+                # An abandoned request must not occupy a worker while another
+                # request's metadata query is still running.
+                self._condition.wait(timeout=0.1)
 
         if hit:
             # Cached objects are owned exclusively by this cache and immutable

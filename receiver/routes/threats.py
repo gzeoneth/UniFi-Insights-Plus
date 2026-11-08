@@ -4,13 +4,16 @@ import ipaddress
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
+from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from psycopg2.extras import RealDictCursor
+from psycopg2.extensions import cursor as TupleCursor
 
 from deps import get_conn, put_conn
 from query_helpers import build_time_conditions, validate_time_params
+from request_work import current_work, phase, RequestGone
 
 logger = logging.getLogger('api.threats')
 
@@ -205,15 +208,91 @@ def list_threats(
         put_conn(conn)
 
 
-_GEO_SELECT = (
-    "SELECT geo_lat as lat, geo_lon as lon, geo_country as country, "
-    "geo_city as city, COUNT(*) as count, "
-    "MAX(threat_score) as max_score, "
-    "AVG(threat_score)::int as avg_score, "
-    "COUNT(DISTINCT COALESCE(host(src_ip), host(dst_ip))) as unique_ips, "
-    "(array_agg(id ORDER BY timestamp DESC))[1:50] as log_ids "
-    "FROM logs "
-)
+_MAP_ID_LIMIT = 50
+_MAP_FETCH_ROWS = 4096
+
+
+def _geo_query(where):
+    """Compute exact group metrics without accumulating every event ID.
+
+    host(inet) produces canonical ASCII addresses. Byte-wise ordering avoids
+    locale sort cost without changing their distinct identity or mask handling.
+    """
+    return f'''SELECT geo_lat AS lat, geo_lon AS lon, geo_country AS country,
+        geo_city AS city, COUNT(*) AS count, MAX(threat_score) AS max_score,
+        AVG(threat_score)::int AS avg_score,
+        COUNT(DISTINCT COALESCE(host(src_ip), host(dst_ip)) COLLATE "C") AS unique_ips
+        FROM logs WHERE {where}
+        GROUP BY geo_lat, geo_lon, geo_country, geo_city
+        ORDER BY count DESC LIMIT 500'''
+
+
+def _map_id_query(groups, where):
+    values = ','.join(['(%s::int,%s::numeric,%s::numeric,%s::text,%s::text)'] * len(groups))
+    params = []
+    for group_id, group in enumerate(groups):
+        params.extend([group_id, group['lat'], group['lon'], group['country'], group['city']])
+    # PostgreSQL performs group matching, including custom text collations,
+    # NaNs and NULL/empty distinctions. No Python equality approximation or
+    # per-group log scan is needed, and no log payload is projected.
+    return f'''WITH selected_groups(group_id, lat, lon, country, city) AS (VALUES {values})
+        SELECT g.group_id, l.id
+        FROM logs l JOIN selected_groups g
+          ON l.geo_lat = g.lat AND l.geo_lon = g.lon
+         AND COALESCE(l.geo_country, '') = COALESCE(g.country, '')
+         AND (l.geo_country IS NULL) = (g.country IS NULL)
+         AND COALESCE(l.geo_city, '') = COALESCE(g.city, '')
+         AND (l.geo_city IS NULL) = (g.city IS NULL)
+        WHERE {where}
+        ORDER BY l.timestamp DESC''', params
+
+
+def _check_map_cancelled():
+    work = current_work()
+    if work is not None and work.disconnected.is_set():
+        raise RequestGone()
+
+
+def _load_geo_rows(conn, where, params):
+    """Share one read-only snapshot and retain at most 500 * 50 IDs.
+
+    A named cursor bounds driver buffering and can close early once every
+    selected group has its sample. Sorts remain subject to server work_mem;
+    the query never materializes raw payloads or unbounded ID arrays.
+    """
+    _check_map_cancelled()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # Transaction-local only: put_conn rolls back the read transaction,
+        # restoring the pool connection's original defaults for its next user.
+        with phase('query'):
+            cur.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+            cur.execute(_geo_query(where), params)
+            groups = cur.fetchall()
+    if not groups:
+        return groups
+    targets = [min(_MAP_ID_LIMIT, group['count']) for group in groups]
+    remaining = sum(targets)
+    for group in groups:
+        group['log_ids'] = []
+    sql, group_params = _map_id_query(groups, where)
+    with conn.cursor(name='map_ids_' + uuid4().hex, cursor_factory=TupleCursor,
+                     scrollable=False) as stream:
+        with phase('query'):
+            stream.execute(sql, group_params + params)
+        while remaining:
+            _check_map_cancelled()
+            with phase('query'):
+                batch = stream.fetchmany(_MAP_FETCH_ROWS)
+            if not batch:
+                raise RuntimeError('Map ID stream ended before the counted samples were complete')
+            for group_id, log_id in batch:
+                sample = groups[group_id]['log_ids']
+                if len(sample) < targets[group_id]:
+                    sample.append(log_id)
+                    remaining -= 1
+                if not remaining:
+                    break
+    return groups
 
 
 @router.get("/api/threats/geo")
@@ -240,14 +319,9 @@ def get_threats_geo(
     ]
 
     where = " AND ".join(all_conds)
-    sql = _GEO_SELECT + "WHERE " + where + " GROUP BY geo_lat, geo_lon, geo_country, geo_city ORDER BY count DESC LIMIT 500"
-
     conn = get_conn()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, params)
-
-            rows = cur.fetchall()
+        rows = _load_geo_rows(conn, where, params)
 
         features = []
         total_events = 0
@@ -280,6 +354,9 @@ def get_threats_geo(
                 'mode': mode,
             },
         }
+    except RequestGone:
+        conn.rollback()
+        raise HTTPException(status_code=499, detail="Client disconnected") from None
     except Exception as e:
         conn.rollback()
         logger.exception("Error fetching threat geo data")

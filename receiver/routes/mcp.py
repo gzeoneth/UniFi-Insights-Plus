@@ -24,6 +24,7 @@ from routes import health as health_routes
 from routes import threats as threats_routes
 from routes.auth import get_forwarded_proto, validate_token_with_effective_scopes
 from request_auth import validated_bearer_context
+from request_work import phase, timed_phase
 
 logger = logging.getLogger('api.mcp')
 
@@ -162,6 +163,7 @@ def _sanitize_params(params: dict | None) -> dict:
     return {k: ('***' if _is_sensitive(k) else v) for k, v in params.items()}
 
 
+@timed_phase('audit')
 def _write_audit(token_info: dict, tool_name: str, scope: str, params: dict | None,
                  success: bool, error: str | None = None) -> None:
     # Won't Fix: raw error logged intentionally — audit entries are admin-only
@@ -181,7 +183,8 @@ def _write_audit(token_info: dict, tool_name: str, scope: str, params: dict | No
                                         'success': success, 'error': error,
                                         'params': _sanitize_params(params)}, default=str)]
             )
-        conn.commit()
+        with phase('commit'):
+            conn.commit()
     except Exception:
         # Intentionally swallowed: audit is non-critical and must not break MCP tool calls.
         # The exception is still logged for observability.

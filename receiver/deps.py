@@ -17,6 +17,8 @@ from enrichment import AbuseIPDBEnricher
 from unifi_api import UniFiAPI
 from pihole_api import PiHolePoller
 from read_cache import ttl_cache
+from request_work import (current_work, observe, track_connection, detach_connection,
+                          returned_connection, RequestGone)
 
 logger = logging.getLogger('api')
 
@@ -47,7 +49,11 @@ def get_conn(retries=3, wait=0.5):
     Retries briefly on pool exhaustion instead of failing immediately.
     """
     last_err = None
+    started = time.monotonic()
     for attempt in range(retries):
+        work = current_work()
+        if work is not None and work.disconnected.is_set():
+            raise RequestGone()
         try:
             conn = db_pool.getconn()
         except pool.PoolError as e:
@@ -56,13 +62,21 @@ def get_conn(retries=3, wait=0.5):
                 logger.warning("Connection pool exhausted, retrying (%d/%d)", attempt + 1, retries)
                 time.sleep(wait * (attempt + 1))
                 continue
+            observe('pool_wait', time.monotonic() - started)
             raise
+        observe('pool_wait', time.monotonic() - started)
+        setup = time.monotonic()
         try:
+            if work is not None and work.disconnected.is_set():
+                raise RequestGone()
             with conn.cursor() as cur:
                 cur.execute("SET statement_timeout = '30s'")
+            track_connection(conn)
         except Exception:
             db_pool.putconn(conn, close=True)
             raise
+        finally:
+            observe('db_setup', time.monotonic() - setup)
         return conn
     raise last_err
 
@@ -74,21 +88,25 @@ def put_conn(conn):
     returning them to the pool.  If rollback fails or the connection is
     still not IDLE afterward, the connection is discarded instead.
     """
-    if conn.closed:
-        db_pool.putconn(conn, close=True)
-        return
-
-    close_conn = False
+    lease, discard = detach_connection(conn)
     try:
-        status = conn.info.transaction_status
-        if status != extensions.TRANSACTION_STATUS_IDLE:
-            conn.rollback()
-            status = conn.info.transaction_status
-        close_conn = status != extensions.TRANSACTION_STATUS_IDLE
-    except Exception:
-        close_conn = True
+        if conn.closed:
+            db_pool.putconn(conn, close=True)
+            return
 
-    db_pool.putconn(conn, close=close_conn)
+        close_conn = discard
+        try:
+            status = conn.info.transaction_status
+            if status != extensions.TRANSACTION_STATUS_IDLE:
+                conn.rollback()
+                status = conn.info.transaction_status
+                close_conn = close_conn or status != extensions.TRANSACTION_STATUS_IDLE
+        except Exception:
+            close_conn = True
+
+        db_pool.putconn(conn, close=close_conn)
+    finally:
+        returned_connection(lease)
 
 
 # ── AbuseIPDB Enricher (for manual enrich endpoint) ─────────────────────────

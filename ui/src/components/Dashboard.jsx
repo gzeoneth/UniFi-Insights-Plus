@@ -1,10 +1,10 @@
 import { DashboardSkeleton } from './PanelSkeletons'
 import { useExclusionProfile, ExclusionCounts } from './ExclusionProfiles'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
-import { fetchStatsOverview, fetchStatsCharts, fetchStatsTables } from '../api'
 import { formatNumber, FlagIcon, countryName, decodeThreatCategories, LOG_TYPE_STYLES, ACTION_STYLES, formatServiceName, DIRECTION_ICONS, DIRECTION_COLORS } from '../utils'
 import { getThreatLevel } from '../lib/threatPresentation'
 import useDashboardTier from '../hooks/useDashboardTier'
+import useDashboardFetchers from '../hooks/useDashboardFetchers'
 import NetworkBadge from './NetworkBadge'
 import SecuritySummary from './SecuritySummary'
 import useTimeRange from '../hooks/useTimeRange'
@@ -213,9 +213,14 @@ function TopList({ title, items, renderItem }) {
 export default function Dashboard({ maxFilterDays }) {
   const { excludeGroups } = useExclusionProfile()
   const [timeRange, setTimeRange, visibleRanges] = useTimeRange(maxFilterDays)
-  const overview = useDashboardTier('overview', timeRange, excludeGroups, fetchStatsOverview)
-  const charts = useDashboardTier('charts', timeRange, excludeGroups, fetchStatsCharts)
-  const tables = useDashboardTier('tables', timeRange, excludeGroups, fetchStatsTables)
+  const fetchers = useDashboardFetchers()
+  const overview = useDashboardTier('overview', timeRange, excludeGroups, fetchers.overview)
+  // Render the summary first; all tier fetches share a queue, including refreshes.
+  // A failed earlier tier still settles, allowing the remaining sections to load.
+  const charts = useDashboardTier('charts', timeRange, excludeGroups, fetchers.charts,
+    { ready: !overview.loading })
+  const tables = useDashboardTier('tables', timeRange, excludeGroups, fetchers.tables,
+    { ready: !overview.loading && !charts.loading })
   const stats = { ...overview.data, ...charts.data, ...tables.data }
   const tierStatus = { overview: overview.status, charts: charts.status, tables: tables.status }
 

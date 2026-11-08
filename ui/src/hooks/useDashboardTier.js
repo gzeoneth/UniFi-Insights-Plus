@@ -3,11 +3,13 @@ import { readCache, writeCache, CACHE_TTL_MS } from '../lib/sessionCache'
 
 // Each tier has one request at a time, including across filter changes.
 // Independent tiers still render as soon as their own result is available.
-export default function useDashboardTier(tier, timeRange, excludeGroups, fetcher) {
+export default function useDashboardTier(tier, timeRange, excludeGroups, fetcher, { ready = true } = {}) {
   const discriminator = `${tier}:${timeRange}:${excludeGroups || ''}`
   const cached = readCache('dashboard', discriminator)
   const poll = useSerializedPoll({
     params: { timeRange, excludeGroups, discriminator },
+    ready,
+    cancelObsolete: true,
     intervalMs: CACHE_TTL_MS,
     fetcher: async (params, options) => {
       const hit = readCache('dashboard', params.discriminator)
@@ -18,5 +20,6 @@ export default function useDashboardTier(tier, timeRange, excludeGroups, fetcher
     },
   })
   const data = poll.data || cached
-  return { data, status: poll.error ? (data ? 'stale' : 'error') : data ? 'loaded' : 'loading' }
+  return { data, loading: poll.loading,
+    status: poll.error ? (data ? 'stale' : 'error') : data ? 'loaded' : 'loading' }
 }

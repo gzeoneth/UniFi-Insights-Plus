@@ -13,6 +13,20 @@ beforeEach(() => { vi.useFakeTimers(); sessionStorage.clear(); visible('visible'
 afterEach(() => { cleanup(); vi.useRealTimers() })
 
 describe('dashboard tier scheduling', () => {
+  it('waits for the earlier tier to settle before starting its wide query', async () => {
+    const fetcher = vi.fn().mockResolvedValue({ total: 5 })
+    const { result, rerender } = renderHook(({ ready }) =>
+      useDashboardTier('tables', '24h', null, fetcher, { ready }),
+    { initialProps: { ready: false } })
+    await advance(CACHE_TTL_MS * 2)
+    expect(fetcher).not.toHaveBeenCalled()
+    rerender({ ready: true })
+    await flush()
+    expect(fetcher).toHaveBeenCalledTimes(1)
+    expect(result.current.data.total).toBe(5)
+    expect(result.current.loading).toBe(false)
+  })
+
   it('reuses fresh cache then refreshes without overlapping a slow query', async () => {
     writeCache('dashboard', 'overview:1h:', { total: 5 })
     let finish
@@ -55,5 +69,24 @@ describe('dashboard tier scheduling', () => {
     await advance(CACHE_TTL_MS + 1)
     expect(result.current.status).toBe('stale')
     expect(result.current.data.total).toBe(7)
+  })
+
+  it('aborts a hidden query and immediately resumes after a quick return', async () => {
+    let signal
+    const fetcher = vi.fn().mockImplementationOnce((_, __, options) => {
+      signal = options.signal
+      return new Promise((resolve, reject) => signal.addEventListener('abort', () => {
+        reject(new DOMException('Stopped', 'AbortError'))
+      }))
+    }).mockResolvedValue({ total: 9 })
+    const { result } = renderHook(() => useDashboardTier('overview', '24h', null, fetcher))
+    await flush()
+    visible('hidden')
+    expect(signal.aborted).toBe(true)
+    visible('visible')
+    await flush()
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    expect(result.current.data.total).toBe(9)
+    expect(result.current.status).toBe('loaded')
   })
 })

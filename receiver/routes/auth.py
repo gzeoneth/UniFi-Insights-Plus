@@ -15,6 +15,7 @@ from psycopg2.extras import RealDictCursor
 from db import get_config, set_config
 from deps import get_conn, put_conn, enricher_db
 from request_auth import remember_bearer_context
+from request_work import phase, timed_phase
 
 logger = logging.getLogger('api.auth')
 router = APIRouter()
@@ -185,6 +186,7 @@ def _clear_attempts(ip: str):
 
 # ── Audit helper ─────────────────────────────────────────────────────────────
 
+@timed_phase('audit')
 def _write_audit(user_id, token_id, action, detail, ip, user_agent):
     conn = get_conn()
     try:
@@ -196,7 +198,8 @@ def _write_audit(user_id, token_id, action, detail, ip, user_agent):
                  json.dumps(detail) if detail else None,
                  ip, user_agent]
             )
-        conn.commit()
+        with phase('commit'):
+            conn.commit()
     except Exception:
         conn.rollback()
         logger.exception("Failed to write audit log")
@@ -223,7 +226,8 @@ def _create_session(user_id: int, request: Request) -> str:
                    VALUES (%s, %s, %s, %s::inet, %s)""",
                 [user_id, token_hash, expires_at, ip, ua]
             )
-        conn.commit()
+        with phase('commit'):
+            conn.commit()
     except Exception:
         conn.rollback()
         raise
@@ -233,6 +237,7 @@ def _create_session(user_id: int, request: Request) -> str:
     return token
 
 
+@timed_phase('session')
 def _validate_session(token: str) -> dict | None:
     """Validate session token. Returns user dict or None."""
     if not token:
@@ -252,7 +257,8 @@ def _validate_session(token: str) -> dict | None:
             row = cur.fetchone()
         # Won't Fix: commit() on read-only SELECT closes the transaction cleanly,
         # preventing idle-in-transaction on long-lived connections from the pool.
-        conn.commit()
+        with phase('commit'):
+            conn.commit()
         if row:
             return dict(row)
         return None
@@ -265,6 +271,7 @@ def _validate_session(token: str) -> dict | None:
 
 # ── API Token validation ────────────────────────────────────────────────────
 
+@timed_phase('token')
 def _validate_api_token(token: str) -> dict | None:
     """Validate Bearer API token. Returns token+user dict or None."""
     if not token:
@@ -298,9 +305,11 @@ def _validate_api_token(token: str) -> dict | None:
                             WHERE id = %s AND (last_used_at IS NULL
                                 OR last_used_at < NOW() - INTERVAL '60 seconds')""",
                                     [row['token_id']])
-                        conn.commit()
+                        with phase('commit'):
+                            conn.commit()
                         return dict(row)
-        conn.commit()
+        with phase('commit'):
+            conn.commit()
         return None
     except Exception:
         conn.rollback()

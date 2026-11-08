@@ -21,6 +21,8 @@ from starlette.responses import Response as StarletteResponse
 
 from deps import APP_VERSION
 from request_auth import clear_bearer_context
+from request_work import (APIWorkMiddleware, current_work, expensive_request,
+                          phase, AdmissionBusy, RequestGone)
 from routes.logs import router as logs_router
 from routes.security import router as security_router
 from routes.retention import router as retention_router
@@ -200,15 +202,21 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         # Delegate to require_auth which knows about public paths, auth state, etc.
         try:
-            auth_info = await run_in_threadpool(require_auth, request)
+            with phase('auth'):
+                auth_info = await run_in_threadpool(require_auth, request)
         except HTTPException as exc:
             return JSONResponse(
                 status_code=exc.status_code,
                 content={"detail": exc.detail},
             )
+        except RequestGone:
+            return JSONResponse(status_code=499, content={'detail': 'Client disconnected'})
 
         # Store auth result so route handlers never need to call require_auth again
         request.state.auth_info = auth_info
+        work = current_work()
+        if work is not None:
+            work.authenticated = bool(auth_info)
 
         # Authorization: enforce role/scope restrictions
         if auth_info:
@@ -235,13 +243,26 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 if denied:
                     return JSONResponse(status_code=403, content={"detail": denied})
 
-        return await call_next(request)
+        if work is not None:
+            if work.disconnected.is_set():
+                return JSONResponse(status_code=499, content={'detail': 'Client disconnected'})
+            if await expensive_request(request):
+                try:
+                    await work.admit()
+                except AdmissionBusy:
+                    return JSONResponse(status_code=503, headers={'Retry-After': '1'},
+                                        content={'detail': 'Expensive views are busy; retry shortly'})
+                except RequestGone:
+                    return JSONResponse(status_code=499, content={'detail': 'Client disconnected'})
+        with phase('handler'):
+            return await call_next(request)
 
 # Order matters: AuthMiddleware first, then CORS. Starlette is LIFO, so
 # CORS (added second) wraps Auth (added first). This ensures 401 responses
 # from auth always get CORS headers applied.
 app.add_middleware(AuthMiddleware)
 app.add_middleware(DualCORSMiddleware)
+app.add_middleware(APIWorkMiddleware)
 
 
 # ── Uvicorn access log filter ────────────────────────────────────────────────

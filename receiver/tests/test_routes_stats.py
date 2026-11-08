@@ -89,12 +89,11 @@ class TestStatsOverview:
     def test_overview_returns_expected_keys(self, client):
         test_client, mock_deps, _ = client
 
-        # overview runs: 1) scalar counts (fetchone), 2) by_direction (fetchall), 3) by_type (fetchall)
-        _mock_cursor_results(mock_deps, [
-            {'total': 1000, 'allowed': 500, 'blocked': 300, 'threats': 10},  # fetchone
-            [{'direction': 'inbound', 'count': 600}, {'direction': 'outbound', 'count': 400}],  # fetchall
-            [{'log_type': 'firewall', 'count': 800}, {'log_type': 'dns', 'count': 200}],  # fetchall
-        ])
+        _mock_cursor_results(mock_deps, [[
+            {'visible': True, 'log_type': 'firewall', 'direction': 'inbound', 'total': 600, 'allowed': 400, 'blocked': 200, 'threats': 8},
+            {'visible': True, 'log_type': 'firewall', 'direction': 'outbound', 'total': 200, 'allowed': 100, 'blocked': 100, 'threats': 2},
+            {'visible': True, 'log_type': 'dns', 'direction': 'outbound', 'total': 200, 'allowed': 0, 'blocked': 0, 'threats': 0},
+        ]])
 
         resp = test_client.get('/api/stats/overview?time_range=24h')
         assert resp.status_code == 200
@@ -109,11 +108,7 @@ class TestStatsOverview:
 
     def test_overview_default_time_range(self, client):
         test_client, mock_deps, _ = client
-        _mock_cursor_results(mock_deps, [
-            {'total': 0, 'allowed': 0, 'blocked': 0, 'threats': 0},
-            [],
-            [],
-        ])
+        _mock_cursor_results(mock_deps, [[]])
 
         resp = test_client.get('/api/stats/overview')
         assert resp.status_code == 200
@@ -139,13 +134,10 @@ class TestStatsCharts:
         test_client, mock_deps, _ = client
 
         ts = datetime(2026, 3, 20, 12, 0, 0, tzinfo=timezone.utc)
-        _mock_cursor_results(mock_deps, [
-            # logs_over_time (fetchall)
-            [{'period': ts, 'count': 100}],
-            # traffic_by_action (fetchall)
-            [{'period': ts, 'rule_action': 'allow', 'count': 80},
-             {'period': ts, 'rule_action': 'block', 'count': 20}],
-        ])
+        _mock_cursor_results(mock_deps, [[
+            {'period': ts, 'total': 100, 'action_events': 100,
+             'allow': 80, 'block': 20, 'redirect': 0},
+        ]])
 
         resp = test_client.get('/api/stats/charts?time_range=24h')
         assert resp.status_code == 200
@@ -177,27 +169,23 @@ class TestStatsTables:
     def test_tables_returns_expected_keys(self, client):
         test_client, mock_deps, _ = client
 
-        # tables runs many queries — we need to provide results for each fetchall
+        # Two shared aggregation passes, followed by the selective threat list.
         _mock_cursor_results(mock_deps, [
-            # consolidated countries (fetchall)
-            [{'country': 'US', 'rule_action': 'block', 'count': 50},
-             {'country': 'CN', 'rule_action': 'allow', 'count': 30}],
-            # consolidated services (fetchall)
-            [{'service_name': 'SSH', 'rule_action': 'block', 'count': 40}],
-            # top_blocked_ips (fetchall)
-            [{'ip': '1.2.3.4', 'count': 100, 'country': 'US', 'asn': 'AS1234', 'threat_score': 90}],
-            # top_blocked_internal_ips (fetchall)
-            [{'ip': '192.168.1.10', 'count': 50, 'device_name': 'PC1'}],
-            # top_threat_ips (fetchall)
-            [{'ip': '5.6.7.8', 'count': 25, 'country': 'RU', 'asn': 'AS5678',
+            [{'category': 'top_blocked_countries', 'label': 'US', 'count': 50},
+             {'category': 'top_allowed_countries', 'label': 'CN', 'count': 30},
+             {'category': 'top_blocked_services', 'label': 'SSH', 'count': 40},
+             {'category': 'top_dns', 'label': 'example.test', 'count': 150}],
+            [{'category': 'top_blocked_ips', 'ip': '198.51.100.10', 'count': 100,
+              'country': 'US', 'asn': 'AS1234', 'threat_score': 90},
+             {'category': 'top_blocked_internal_ips', 'ip': '10.20.0.10', 'count': 50,
+              'device_name': 'Example workstation'},
+             {'category': 'top_allowed_destinations', 'ip': '203.0.113.20', 'count': 200,
+              'country': 'US', 'asn': 'Example ASN'},
+             {'category': 'top_active_internal_ips', 'ip': '10.20.0.20', 'count': 300,
+              'device_name': 'Example server'}],
+            [{'ip': '198.51.100.20', 'count': 25, 'country': 'RU', 'asn': 'AS5678',
               'city': 'Moscow', 'rdns': None, 'threat_score': 95,
               'threat_categories': None, 'last_seen': datetime(2026, 3, 20, tzinfo=timezone.utc)}],
-            # top_allowed_destinations (fetchall)
-            [{'ip': '8.8.8.8', 'count': 200, 'country': 'US', 'asn': 'Google'}],
-            # top_dns (fetchall)
-            [{'dns_query': 'example.com', 'count': 150}],
-            # top_active_internal_ips (fetchall)
-            [{'ip': '192.168.1.20', 'count': 300, 'device_name': 'Server1'}],
         ])
 
         resp = test_client.get('/api/stats/tables?time_range=7d')
@@ -215,8 +203,8 @@ class TestStatsTables:
 
         assert data['top_blocked_countries'] == [{'country': 'US', 'count': 50}]
         assert data['top_allowed_countries'] == [{'country': 'CN', 'count': 30}]
-        assert data['top_blocked_ips'][0]['ip'] == '1.2.3.4'
-        assert data['top_dns'][0]['dns_query'] == 'example.com'
+        assert data['top_blocked_ips'][0]['ip'] == '198.51.100.10'
+        assert data['top_dns'][0]['dns_query'] == 'example.test'
 
     def test_tables_db_failure(self, client):
         test_client, mock_deps, _ = client

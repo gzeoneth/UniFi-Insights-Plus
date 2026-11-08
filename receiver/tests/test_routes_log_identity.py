@@ -86,12 +86,13 @@ def test_threats_join_and_group_the_scored_remote_endpoint(identity_routes):
     cur.fetchall.return_value = [{'ip': '203.0.113.50', 'count': 3, 'last_seen': stamp}]
     rows = stats._query_top_threat_ips(cur, stamp, ['0.0.0.0'])
     sql, params = cur.execute.call_args.args
-    assert 'host(l.remote_ip) as ip' in sql
-    assert 'LEFT JOIN ip_threats t ON l.remote_ip = t.ip' in sql
-    assert 'GROUP BY l.remote_ip' in sql
-    assert 'host(l.remote_ip) != ALL(%s)' in sql
+    assert 'host(s.remote_ip) as ip' in sql.lower()
+    assert 'LEFT JOIN ip_threats t ON s.remote_ip=t.ip' in sql
+    assert 'GROUP BY remote_ip' in sql
+    assert 'host(remote_ip)!=ALL(%s)' in sql
     assert 'LIMIT 10' in sql
-    assert 'l.src_ip' not in sql
+    assert sql.index('LIMIT 10') < sql.index('LEFT JOIN ip_threats')
+    assert 'src_ip' not in sql
     assert params == [stamp, ['0.0.0.0']]
     assert rows[0]['last_seen'] == stamp.isoformat()
 

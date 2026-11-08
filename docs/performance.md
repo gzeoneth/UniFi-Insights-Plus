@@ -6,7 +6,7 @@ Choose 50, 100, 200, 500 or 1,000 rows per page. The default remains 50; larger 
 
 Timestamp sorting uses a cursor containing the last timestamp and row ID. The ID makes equal timestamps deterministic. Each traversal fixes its time window so moving to the next page does not slide a relative time filter forward. Refresh to start a new traversal and see newer records. Other sorts retain offset pagination. Cursor traversal is not a database snapshot: retention, backfill or edits can still change the records between requests.
 
-Pausing Log Stream stops its automatic row requests. Hidden tabs also suspend polling. Refreshes run serially, with the next scheduled after the current request finishes. Changing filters cancels or discards obsolete browser responses. A browser abort does not guarantee that an already submitted database statement stopped immediately; database statement timeouts still bound that work.
+Pausing Log Stream stops its automatic row requests. Hidden tabs also suspend polling and abort obsolete requests. Refreshes run serially, with the next scheduled after the current request finishes. Changing filters cancels or discards obsolete browser responses. The API attempts to cancel an active read after a GET client disconnects and discards the affected database connection. Cancellation is best effort; database statement timeouts remain in place.
 
 API and MCP callers retain exact counts and offset pagination by default. Opt into `count_mode=none` and `pagination=cursor` for timestamp browsing. Use `next_cursor` to advance and `page_cursor` to repeat or count the current page, keeping the original filters. `total`, `pages` and `view_counts` are null when counts are skipped. `timings.query_ms` measures page-query work and the initial cursor boundary lookup; `timings.count_ms` measures the optional count. Neither includes HTTP transit or serialization.
 
@@ -30,7 +30,7 @@ Flow View has the same advanced include/exclude conditions as Log Stream. For ex
 
 Flow panels serialize changes, defer endpoint aggregation until the matching graph query finishes, and reuse identical results for at most 30 seconds. Manual Refresh bypasses the cache. The cache key includes advanced conditions and view exclusions. A changed filter cannot display data from the previous scope as a current result.
 
-Dashboard tiers, Security and Threat Map serialize their own requests across filter changes and stop starting work while the tab is hidden. Old-scope responses are discarded. Map failures show an error and a Retry button; an unsuccessful new filter cannot leave old-scope points on the map. A browser abort alone does not establish that a database query stopped.
+Dashboard tiers, Security and Threat Map serialize their own requests across filter changes and stop starting work while the tab is hidden. Each Dashboard shares one fetch queue across Overview, Charts and Tables, including background refreshes. Initial and changed-filter loads finish Overview before starting Charts, then Tables. An aborted active fetch retains its queue slot until the underlying operation settles; obsolete queued jobs are removed. The API admission limit also bounds expensive reads across panels and clients. Old-scope responses are discarded. Map failures show an error and a Retry button; an unsuccessful new filter cannot leave old-scope points on the map.
 
 Map and chart dependencies load when their panels are opened. Their loading placeholders no longer import those dependencies into the initial bundle.
 
@@ -123,6 +123,36 @@ Pi-hole import has one receiver-owned worker and deterministic event identities 
 The service-name migration index now has a lifecycle. Background maintenance retains or rebuilds it while the backfill marker is missing, false or malformed. Only a strictly true completion marker allows concurrent retirement. Resetting that marker allows the index to be rebuilt. Startup does not recreate an already retired index for a completed migration. Other event indexes and historical rows remain intact.
 
 These changes target repeated work rather than adding an index for every filter. The diagnostic script now includes changes since ANALYZE and both global analyze settings and table overrides. Inaccurate row estimates should prompt a statistics check and comparable plans before index or memory changes. This release does not automatically run ANALYZE or change autovacuum thresholds.
+
+## Long time ranges: 3.7.2-gzeon.12
+
+Dashboard Overview combines its totals and dimensions in one event scan. Charts combines total and action buckets in one scan. Tables shares narrow grouped scans across related top lists, reducing eight event scans to three. These remain exact queries over the selected window: exclusions, security retention, NULL values and IP masks retain their existing meanings. No event indexes, raw fields or exact counts are removed by this release.
+
+The zone matrix first combines repeated endpoint pairs, then counts pairs and events per zone. This reduces sorting work when many events share endpoints. A window full of distinct pairs can cost slightly more. A totals-only index scan is not a substitute for the matrix's exact endpoint-pair count.
+
+Threat Map computes exact metrics for its top 500 groups, then samples IDs through one forward database cursor in the same read-only snapshot. It retains at most 50 IDs per group and fetches at most 4,096 narrow ID tuples at a time. The cursor closes when all selected groups have their samples. PostgreSQL still performs the matching and ordering; sorts can spill according to `work_mem`. A rare group can require reading far back through the selected window. The previous query accumulated every group's full ID array before slicing it to 50.
+
+Expensive authenticated API and MCP reads share a FIFO admission limit. Defaults allow two active reads and eight waiting requests, with a two-second admission wait. A full or expired queue returns HTTP 503 and `Retry-After: 1`, rather than starting another wide scan. `API_HEAVY_REQUEST_LIMIT` accepts 1–6, `API_HEAVY_WAITING_LIMIT` accepts 0–32, and `API_HEAVY_WAIT_SECONDS` accepts 0–5 seconds. Increase these only after measuring database and storage headroom. The limits apply within one API process; separate workers each have their own limit.
+
+Fresh authentication and permission checks run before admission. Health, individual-event lookups and the first small, unfiltered cursor page remain outside the expensive-read queue. MCP discovery and lightweight tools also stay available. Arbitrary filters, subsequent cursor pages and exact counts do not receive that exception. GET disconnect cancellation applies only to owned handler-read connections; authentication, audit writes, commits and POST/MCP work are not cancelled. A permit is retained until both the request and its database leases finish.
+
+Authenticated responses include numeric `Server-Timing` measurements for authentication, admission, database checkout/setup, connection hold, handler work and instrumented SQL/fetch/commit phases. They contain no SQL, parameters or identities. Timings are nested and must not be added together. `db_hold` is connection lease time, not SQL execution time; `headers` ends when response headers are sent and does not measure the full streamed response. Browser/network delay is outside these server measurements.
+
+Synthetic PostgreSQL 16 comparisons used 500,000 events, exact before/after result checks and alternating warm-cache runs. They are development measurements, not production latency guarantees:
+
+| Workload | Before | After | Limit |
+| --- | ---: | ---: | --- |
+| Overview | 188 ms | 93 ms | One scan instead of three |
+| Overview with exclusions | 898 ms | 287 ms | One scan instead of four |
+| Charts | 163 ms | 117 ms | One scan instead of two |
+| Tables, repeated dimensions | 727 ms | 347 ms | Three scans instead of eight |
+| Tables, many distinct dimensions | 845 ms | 751 ms | More temporary I/O despite less elapsed time |
+| Zones, repeated endpoint pairs | 545 ms | 156 ms | No temporary spill in the new plan |
+| Zones, every pair distinct | 611 ms | 646 ms | About 6% slower |
+
+An adversarial Overview fixture with a large cross-product of type and direction labels was about 23% slower without exclusions; normal parser dimensions are much smaller. Profiled Overview still improved in that fixture but spilled to temporary storage. These changes reduce repeated work, not the underlying cost of inspecting a large history. They do not raise global `work_mem`, enlarge the pool, install a statistics extension or change autovacuum settings automatically.
+
+Separate end-to-end map tests used the production numeric coordinate types and 1.36 million events. Median latency fell from 2,191 to 1,932 ms with repeated peers and from 2,306 to 2,005 ms with distinct peers. A 1.02-million-event fixture with many small, rare groups cost 1,300 to 1,364 ms, about 5% more. All results matched; the loader retained at most 25,000 IDs and its largest driver fetch was 4,096 narrow tuples. These are warm local comparisons, not a claim that every map filter or storage device improves.
 
 ## Upgrade verification
 

@@ -11,6 +11,8 @@ from fastapi import APIRouter, Query, HTTPException
 from psycopg2.extras import RealDictCursor
 
 from db import get_config
+from dashboard_queries import zone_query
+from request_work import phase
 from deps import get_conn, put_conn, enricher_db
 from ip_identity import load_identity_config, annotate_ip
 from query_helpers import (build_log_query, validate_time_params, ALLOWED_DIMENSIONS,
@@ -243,8 +245,9 @@ def get_flow_graph(
     try:
         # Tuple cursor — ~288K groups at 30d fits in a few MB vs 30-50 MB with RealDictCursor
         with conn.cursor() as cur:
-            cur.execute(sql, base_params)
-            grouped_rows = cur.fetchall()
+            with phase('query'):
+                cur.execute(sql, base_params)
+                grouped_rows = cur.fetchall()
 
         # Remap with current top_n; retry with lower top_n if caps exceeded (no DB re-query)
         while top_n >= MIN_TOP_N:
@@ -313,29 +316,18 @@ def get_zone_matrix(
         filter_rules=filter_rules, exclude_groups=exclude_groups,
     )
 
-    sql = f"""
-    SELECT
-        interface_in, interface_out,
-        COUNT(*) AS total,
-        COUNT(*) FILTER (WHERE rule_action = 'allow') AS allow_count,
-        COUNT(*) FILTER (WHERE rule_action = 'block') AS block_count,
-        COUNT(DISTINCT (set_masklen(src_ip, -1), set_masklen(dst_ip, -1)))
-            FILTER (WHERE src_ip IS NOT NULL AND dst_ip IS NOT NULL) AS unique_pairs
-    FROM logs
-    WHERE {where}
-      AND interface_in IS NOT NULL AND interface_out IS NOT NULL
-    GROUP BY interface_in, interface_out
-    ORDER BY total DESC
-    """
+    sql = zone_query(where)
 
     labels = get_config(enricher_db, 'interface_labels', {}) or {}
 
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
-        conn.commit()
+            with phase('query'):
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        with phase('commit'):
+            conn.commit()
 
         interfaces = sorted({r['interface_in'] for r in rows} | {r['interface_out'] for r in rows})
         cells = [
