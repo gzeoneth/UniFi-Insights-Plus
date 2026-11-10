@@ -23,6 +23,22 @@ Initial setup creates empty derived tables, two indexes and four statement trigg
 
 All retained events are eventually copied, so disk usage continues growing until backfill completes. The extra table is not a retention policy. Existing raw retention deletes corresponding derived rows transactionally. Normal PostgreSQL vacuum and disk-capacity planning still apply.
 
+## Pause older-history preparation
+
+Version `.14` can pause historical copying independently of analytics capture and reads:
+
+```yaml
+environment:
+  DASHBOARD_ANALYTICS_ENABLED: "true"
+  DASHBOARD_ANALYTICS_BACKFILL_ENABLED: "false"
+```
+
+Recreate the application container after changing these variables. Existing facts, published coverage, cursor position and capture triggers remain intact. New events and changes to existing events continue synchronizing transactionally. Covered Dashboard ranges still use analytics; unprepared older ranges use raw queries. Collection Health reports that older-history preparation is paused. No migration, index rebuild or historical restart is required.
+
+This control is useful when historical copying competes with foreground queries or current ingestion. It does not establish that copying caused a slowdown, eliminate live capture's write cost or override other query limits. Compare the same range and profile after pending ingestion drains; change cache settings separately so their effects are distinguishable.
+
+Set `DASHBOARD_ANALYTICS_BACKFILL_ENABLED=true` and recreate to resume from the saved cursor. The default is `true`, preserving existing behavior. Pausing before any historical coverage is prepared does not create coverage. The original `DASHBOARD_ANALYTICS_ENABLED=false` still disables the whole feature and invalidates coverage; use it for full disable/downgrade, not for this comparison.
+
 ## Exactness and fallback
 
 Actual inserts, projected-field changes, deletes and truncations synchronize in the raw writer's transaction using PostgreSQL statement-level transition triggers. Ingest duplicates do not create additional facts. Enrichment changes, backdated events, changed timestamps and retention are included. Security classifications preserve both parsed IPS events and historical raw CEF threat candidates.

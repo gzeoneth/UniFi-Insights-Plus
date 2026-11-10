@@ -47,6 +47,14 @@ def enabled(environ=None):
     }
 
 
+def backfill_enabled(environ=None):
+    """Pause historical copying without disabling capture or prepared reads."""
+    values = os.environ if environ is None else environ
+    return str(values.get('DASHBOARD_ANALYTICS_BACKFILL_ENABLED', 'true')).strip().lower() in {
+        '1', 'true', 'yes', 'on',
+    }
+
+
 def _quote(name):
     return '"' + name.replace('"', '""') + '"'
 
@@ -606,7 +614,7 @@ def run_dashboard_store_worker(conn_params, stop_event, connection_callback=None
                                pause_callback=None):
     """Resume bounded time-band copying after intake is available."""
     connection = None
-    paused = False
+    pause_reason = None
 
     def close_connection():
         nonlocal connection
@@ -626,14 +634,11 @@ def run_dashboard_store_worker(conn_params, stop_event, connection_callback=None
                 stop_event.wait(2)
                 continue
             if _pause_requested(pause_callback):
-                if not paused:
+                if pause_reason != 'collection':
                     logger.info('Dashboard analytics copy paused while collection or index maintenance is busy')
-                paused = True
+                pause_reason = 'collection'
                 stop_event.wait(2)
                 continue
-            if paused:
-                logger.info('Dashboard analytics copy resumed')
-                paused = False
             try:
                 if connection is None:
                     if not ensure_dashboard_store(conn_params, connection_callback=connection_callback,
@@ -653,6 +658,18 @@ def run_dashboard_store_worker(conn_params, stop_event, connection_callback=None
                         close_connection()
                         stop_event.wait(5)
                         continue
+                if not backfill_enabled():
+                    # Keep capture installed and retain the idle advisory owner.
+                    # Existing coverage and cursors remain valid while new
+                    # writes continue through the transactional triggers.
+                    if pause_reason != 'configuration':
+                        logger.info('Dashboard analytics historical copy paused by configuration; capture remains active')
+                    pause_reason = 'configuration'
+                    stop_event.wait(2)
+                    continue
+                if pause_reason:
+                    logger.info('Dashboard analytics copy resumed after %s pause', pause_reason)
+                    pause_reason = None
                 result = backfill_step(connection)
                 if result['status'] in ('ready', 'unsupported'):
                     # Keep a cheap idle owner so a later TRUNCATE or explicit

@@ -2,6 +2,15 @@
 
 The changes were tested against the upstream v3.7.2 base using synthetic events and disposable local databases. No live collector, gateway or production database was modified for these checks.
 
+## Independent historical-copy control: 3.7.2-gzeon.14
+
+- All 1,682 backend tests passed with disposable PostgreSQL integration and eleven upgrade/restore tests enabled; six optional platform/benchmark checks were skipped. All 349 UI tests and the production UI build passed.
+- The store's 78 PostgreSQL cases include six new checks for default behavior, fresh installation with copying paused, transactional live capture during a pause, preserved partial coverage and source eligibility, cursor resume without an epoch reset/rebuild, overall-disable precedence and interruptible shutdown with owner cleanup.
+- A packaged `.13 → .14` upgrade preserved a 2,000-event raw table, partially prepared facts, nonempty copy cursor, coverage, epoch and token hashes. With copying disabled, 100 synthetic UDP events reached both raw and derived storage; the historical facts/cursor stayed unchanged and authenticated 24-hour statistics worked. Recreating with copying enabled resumed the same epoch and finished at exactly 2,100 raw and derived rows. No existing facts were cleared or raw indexes changed.
+- The new environment variable defaults to true. It pauses only historical work after capture setup and ownership; it does not change query SQL, database memory, storage bindings, ingestion durability or overall enablement. The public health response adds the boolean `backfill_enabled`, and Collection Health distinguishes a paused historical copy from disabled analytics or missing coverage.
+
+These checks establish control/state behavior, not a production speedup or proof that historical copying caused a particular I/O wait. See [pause and resume instructions](dashboard-analytics.md#pause-older-history-preparation).
+
 ## Narrow Dashboard analytics: 3.7.2-gzeon.13
 
 - The backend suite passed 1,674 tests with disposable PostgreSQL 16 integration and all eleven upgrade/restore tests enabled; six optional platform/benchmark checks were skipped. All 346 UI tests and the production UI build passed. The new store has 72 PostgreSQL cases, including deterministic concurrent timestamp/update/delete/truncate races, interrupted copying, damaged catalog shapes, re-enablement and 108 raw/projection exclusion comparisons.

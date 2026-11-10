@@ -16,6 +16,8 @@ Version `.13` can maintain a narrow, transactionally synchronized event table fo
 
 Server-Timing also reports the Overview, dimensions, addresses, threats and Charts stages separately, alongside total SQL time. These values identify the expensive stage; they do not include browser rendering or network transit.
 
+Version `.14` adds `DASHBOARD_ANALYTICS_BACKFILL_ENABLED=false` to pause older-history copying while preserving capture, covered analytics reads and the saved cursor. See [the separate copy control](dashboard-analytics.md#pause-older-history-preparation). It defaults to true and does not tune database memory or storage.
+
 ## Address filters
 
 Complete addresses use PostgreSQL's native IP equality, and CIDRs use subnet containment. For example, `203.0.113.7` matches that address and `203.0.113.0/24` matches that subnet. Both IPv4 and IPv6 are supported. Use `contains:203.0.113.` for an explicit partial text search; incomplete legacy address searches remain supported. Text searches can require more work than exact addresses or CIDRs.

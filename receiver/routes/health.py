@@ -38,8 +38,9 @@ _WORKER_PHASES = {'idle', 'spool_open', 'parse_enrich', 'spool_stage', 'spool_re
 
 def dashboard_analytics_status(conn):
     """Small allowlisted progress snapshot; never count or scan event rows."""
-    from dashboard_store import enabled, snapshot_state
+    from dashboard_store import backfill_enabled, enabled, snapshot_state
     result = {'enabled': enabled(), 'status': 'disabled' if not enabled() else 'pending',
+              'backfill_enabled': backfill_enabled(),
               'healthy': False, 'complete': False, 'coverage_from': None,
               'rows_backfilled': 0, 'updated_at': None, 'last_error': None}
     if not result['enabled']:

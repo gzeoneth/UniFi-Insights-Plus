@@ -43,6 +43,41 @@ describe('Dashboard acceleration readiness', () => {
     expect(await screen.findByLabelText('Dashboard acceleration')).toHaveTextContent('Using standard queries')
   })
 
+  it('retains prepared coverage when older copying is paused', async () => {
+    apiFetch.mockImplementation(url => Promise.resolve(url.endsWith('/ingest') ? ingestion : {
+      dashboard_analytics: { enabled: true, healthy: true, complete: false,
+        backfill_enabled: false, coverage_from: '2026-01-01T00:00:00Z', rows_backfilled: 1200 },
+    }))
+    render(<CollectionHealth />)
+    const panel = await screen.findByLabelText('Dashboard acceleration')
+    expect(panel).toHaveTextContent('Recent history ready')
+    expect(panel).toHaveTextContent('Older history preparation is paused')
+    expect(panel).toHaveTextContent('New events continue updating analytics')
+    expect(panel).not.toHaveTextContent('Using standard queries')
+  })
+
+  it('does not claim coverage when copying was paused before history preparation', async () => {
+    apiFetch.mockImplementation(url => Promise.resolve(url.endsWith('/ingest') ? ingestion : {
+      dashboard_analytics: { enabled: true, healthy: true, complete: false,
+        backfill_enabled: false, coverage_from: null, rows_backfilled: 0 },
+    }))
+    render(<CollectionHealth />)
+    const panel = await screen.findByLabelText('Dashboard acceleration')
+    expect(panel).toHaveTextContent('Historical preparation paused')
+    expect(panel).not.toHaveTextContent('Recent history ready')
+  })
+
+  it('keeps complete history ready when no further copying is needed', async () => {
+    apiFetch.mockImplementation(url => Promise.resolve(url.endsWith('/ingest') ? ingestion : {
+      dashboard_analytics: { enabled: true, healthy: true, complete: true,
+        backfill_enabled: false, coverage_from: '2026-01-01T00:00:00Z', rows_backfilled: 1200 },
+    }))
+    render(<CollectionHealth />)
+    const panel = await screen.findByLabelText('Dashboard acceleration')
+    expect(panel).toHaveTextContent('All retained history ready')
+    expect(panel).not.toHaveTextContent('preparation is paused')
+  })
+
   it('does not show a readiness claim for an older server', async () => {
     apiFetch.mockImplementation(url => Promise.resolve(url.endsWith('/ingest') ? ingestion : { total_logs: 10 }))
     render(<CollectionHealth />)

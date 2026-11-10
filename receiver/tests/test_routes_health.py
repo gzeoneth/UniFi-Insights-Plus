@@ -42,6 +42,23 @@ def test_analytics_failure_does_not_hide_other_health(client, monkeypatch):
     conn.rollback.assert_called_once()
 
 
+@pytest.mark.parametrize('copy_enabled', [False, True])
+def test_analytics_health_reports_copy_control_without_changing_coverage(client, monkeypatch, copy_enabled):
+    import dashboard_store
+    from routes.health import dashboard_analytics_status
+    monkeypatch.setattr(dashboard_store, 'enabled', lambda: True)
+    monkeypatch.setattr(dashboard_store, 'backfill_enabled', lambda: copy_enabled)
+    stamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(dashboard_store, 'snapshot_state', lambda _cur: dict(
+        status='backfill', healthy=True, complete=False, coverage_from=stamp,
+        updated_at=stamp, rows_scanned=123, last_error=None))
+    result = dashboard_analytics_status(MagicMock())
+    assert result['backfill_enabled'] is copy_enabled
+    assert result['enabled'] is True and result['healthy'] is True
+    assert result['coverage_from'] == stamp.isoformat()
+    assert result['rows_backfilled'] == 123
+
+
 @pytest.mark.parametrize('error', ['LockNotAvailable', 'nonfinite_timestamp', 'x' * 81,
                                   'connection string with private content'])
 def test_analytics_health_exposes_only_bounded_error_codes(client, monkeypatch, error):

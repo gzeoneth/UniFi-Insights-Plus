@@ -30,6 +30,7 @@ NOW = datetime(2026, 1, 12, 12, 34, 56, tzinfo=timezone.utc)
 @pytest.fixture(autouse=True)
 def _enable_dashboard_projection(monkeypatch):
     monkeypatch.setenv('DASHBOARD_ANALYTICS_ENABLED', 'true')
+    monkeypatch.setenv('DASHBOARD_ANALYTICS_BACKFILL_ENABLED', 'true')
 
 
 class StoreFixture:
@@ -165,6 +166,15 @@ def test_dashboard_store_can_be_explicitly_disabled(value):
 def test_dashboard_store_requires_explicit_opt_in():
     assert store.enabled({}) is False
     assert store.enabled({'DASHBOARD_ANALYTICS_ENABLED': 'true'}) is True
+
+
+def test_historical_copy_defaults_on_and_accepts_an_independent_pause():
+    assert store.backfill_enabled({}) is True
+    for value in ('0', 'false', 'no', 'off', ' FALSE '):
+        assert store.backfill_enabled({'DASHBOARD_ANALYTICS_BACKFILL_ENABLED': value}) is False
+    for value in ('1', 'true', 'yes', 'on', ' TRUE '):
+        assert store.backfill_enabled({'DASHBOARD_ANALYTICS_BACKFILL_ENABLED': value}) is True
+    assert store.backfill_enabled({'DASHBOARD_ANALYTICS_ENABLED': 'false'}) is True
 
 
 def test_worker_pauses_when_collection_health_cannot_be_read():
@@ -1010,6 +1020,196 @@ def _stop_worker(thread, stop, connections):
                     pass  # The worker may have closed it concurrently.
         thread.join(timeout=3)
     assert not thread.is_alive()
+
+
+def test_paused_historical_copy_installs_capture_without_advancing_history(
+        dashboard_store_db, monkeypatch):
+    fixture = dashboard_store_db
+    changed = fixture.add()
+    fixture.add(raw_log='History left for a later copy')
+    monkeypatch.setenv('DASHBOARD_ANALYTICS_BACKFILL_ENABLED', 'false')
+    stop, connections, copied = _FastStop(), [], []
+    original = store.backfill_step
+
+    def record_copy(*args, **kwargs):
+        copied.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, 'backfill_step', record_copy)
+    worker = threading.Thread(target=store.run_dashboard_store_worker,
+                              args=(fixture.params, stop),
+                              kwargs={'connection_callback': connections.append})
+    worker.start()
+    try:
+        _wait_until(lambda: stop.waited.count(2) >= 2)
+        before = fixture.state()
+        assert before['healthy'] and before['triggers_enabled']
+        assert before['status'] == 'pending' and not before['complete']
+        assert before['initial_max_id'] is None and before['cursor_id'] is None
+        assert fixture.execute('SELECT count(*) FROM dashboard_events')[0][0] == 0
+        assert not fixture.execute('SELECT pg_try_advisory_lock(%s,%s)',
+                                   list(store.WORKER_LOCK))[0][0]
+        live = fixture.add(timestamp=NOW - timedelta(days=30), raw_log='Live backdated capture')
+        assert fixture.execute('SELECT id FROM dashboard_events') == [(live,)]
+        fixture.execute('UPDATE logs SET threat_score=81 WHERE id=%s', [changed])
+        assert fixture.execute('SELECT threat_score FROM dashboard_events WHERE id=%s',
+                               [changed]) == [(81,)]
+        fixture.execute('DELETE FROM logs WHERE id=%s', [live])
+        assert fixture.execute('SELECT id FROM dashboard_events') == [(changed,)]
+        _wait_until(lambda: stop.waited.count(2) >= 3)
+        assert fixture.state() == before
+        assert not copied
+    finally:
+        _stop_worker(worker, stop, connections)
+    assert connections[-1] is None
+    assert all(connection is None or connection.closed for connection in connections)
+
+
+def test_paused_historical_copy_keeps_existing_covered_reads_on_projection(
+        dashboard_store_db, monkeypatch):
+    fixture = dashboard_store_db
+    current = fixture.add(timestamp=NOW - timedelta(minutes=5))
+    fixture.add(timestamp=NOW - timedelta(hours=4))
+    fixture.install()
+    fixture.backfill()
+    assert fixture.backfill()['status'] == 'band_complete'
+    before = fixture.state()
+    assert before['coverage_from'] is not None and not before['complete']
+    monkeypatch.setenv('DASHBOARD_ANALYTICS_BACKFILL_ENABLED', 'false')
+    stop, connections = _FastStop(), []
+    worker = threading.Thread(target=store.run_dashboard_store_worker,
+                              args=(fixture.params, stop),
+                              kwargs={'connection_callback': connections.append})
+    worker.start()
+    try:
+        _wait_until(lambda: stop.waited.count(2) >= 2)
+        assert fixture.state() == before
+        reader = fixture.connect()
+        with reader.cursor() as cursor:
+            relation, (where, params) = choose_dashboard_source(cursor, before['coverage_from'], None)
+            assert relation == 'dashboard_events'
+            cursor.execute(f'SELECT id FROM {relation} WHERE {where}', params)
+            assert cursor.fetchall() == [(current,)]
+        reader.rollback()
+        with reader.cursor() as cursor:
+            relation, _ = choose_dashboard_source(
+                cursor, before['coverage_from'] - timedelta(hours=1), None)
+            assert relation == 'logs'
+        reader.rollback()
+        assert fixture.state() == before
+    finally:
+        _stop_worker(worker, stop, connections)
+
+
+def test_historical_copy_resumes_the_saved_cursor_without_rebuilding(
+        dashboard_store_db, monkeypatch):
+    fixture = dashboard_store_db
+    anchor = datetime.now(timezone.utc)
+    for minute in (1, 2, 3, 4):
+        fixture.add(timestamp=anchor - timedelta(minutes=minute))
+    fixture.install()
+    fixture.backfill(batch_size=1)
+    fixture.backfill(batch_size=1)
+    before = fixture.state()
+    facts_before = fixture.execute('SELECT id FROM dashboard_events ORDER BY id')
+    assert before['cursor_id'] is not None and not before['complete']
+    monkeypatch.setenv('DASHBOARD_ANALYTICS_BACKFILL_ENABLED', 'false')
+    stop, connections = _FastStop(), []
+    worker = threading.Thread(target=store.run_dashboard_store_worker,
+                              args=(fixture.params, stop),
+                              kwargs={'connection_callback': connections.append})
+    worker.start()
+    try:
+        _wait_until(lambda: stop.waited.count(2) >= 2)
+        assert fixture.state() == before
+        assert fixture.execute('SELECT id FROM dashboard_events ORDER BY id') == facts_before
+    finally:
+        _stop_worker(worker, stop, connections)
+    # Model a container restart with the independent copy setting restored.
+    monkeypatch.setenv('DASHBOARD_ANALYTICS_BACKFILL_ENABLED', 'true')
+    original, first_state = store.backfill_step, []
+    observer = fixture.connect()
+
+    def record_first_state(connection, *args, **kwargs):
+        if not first_state:
+            first_state.append(fixture.state(connection=observer))
+        return original(connection, *args, **kwargs)
+
+    monkeypatch.setattr(store, 'backfill_step', record_first_state)
+    stop, connections = _FastStop(), []
+    worker = threading.Thread(target=store.run_dashboard_store_worker,
+                              args=(fixture.params, stop),
+                              kwargs={'connection_callback': connections.append})
+    worker.start()
+    try:
+        _wait_until(lambda: bool(fixture.state()['complete']))
+        assert first_state == [before]
+        assert fixture.state()['epoch'] == before['epoch']
+        fixture.assert_matches_raw()
+    finally:
+        _stop_worker(worker, stop, connections)
+
+
+def test_overall_disable_still_disables_capture_when_historical_copy_is_paused(
+        dashboard_store_db, monkeypatch):
+    fixture = dashboard_store_db
+    fixture.install()
+    fixture.add()
+    fixture.finish()
+    before = fixture.state()
+    monkeypatch.setenv('DASHBOARD_ANALYTICS_ENABLED', 'false')
+    monkeypatch.setenv('DASHBOARD_ANALYTICS_BACKFILL_ENABLED', 'false')
+    stop, connections = _FastStop(), []
+    worker = threading.Thread(target=store.run_dashboard_store_worker,
+                              args=(fixture.params, stop),
+                              kwargs={'connection_callback': connections.append,
+                                      'pause_callback': lambda: True})
+    worker.start()
+    try:
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        state = fixture.state()
+        assert state['status'] == 'disabled' and not state['triggers_enabled']
+        assert state['epoch'] > before['epoch']
+        assert state['coverage_from'] is None and not state['complete']
+        fixture.add(raw_log='Raw capture remains available after overall disable')
+        assert fixture.execute('SELECT count(*) FROM logs')[0][0] == 2
+        assert fixture.execute('SELECT count(*) FROM dashboard_events')[0][0] == 1
+    finally:
+        _stop_worker(worker, stop, connections)
+
+
+def test_stopping_paused_historical_copy_interrupts_wait_and_closes_owner(
+        dashboard_store_db, monkeypatch):
+    fixture = dashboard_store_db
+    fixture.add()
+    monkeypatch.setenv('DASHBOARD_ANALYTICS_BACKFILL_ENABLED', 'false')
+
+    class ObservedStop(threading.Event):
+        waiting = threading.Event()
+
+        def wait(self, timeout=None):
+            if timeout == 2:
+                self.waiting.set()
+            return super().wait(timeout)
+
+    stop, connections = ObservedStop(), []
+    worker = threading.Thread(target=store.run_dashboard_store_worker,
+                              args=(fixture.params, stop),
+                              kwargs={'connection_callback': connections.append})
+    worker.start()
+    try:
+        assert stop.waiting.wait(timeout=5)
+        assert not fixture.execute('SELECT pg_try_advisory_lock(%s,%s)',
+                                   list(store.WORKER_LOCK))[0][0]
+        stop.set()
+        worker.join(timeout=1)
+        assert not worker.is_alive()
+    finally:
+        _stop_worker(worker, stop, connections)
+    assert connections[-1] is None
+    assert all(connection is None or connection.closed for connection in connections)
+    assert fixture.execute('SELECT pg_try_advisory_lock(%s,%s)', list(store.WORKER_LOCK))[0][0]
 
 
 def test_worker_pauses_retries_setup_and_releases_its_connection(dashboard_store_db, monkeypatch):

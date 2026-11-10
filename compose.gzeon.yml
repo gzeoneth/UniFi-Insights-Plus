@@ -1,7 +1,7 @@
 name: unifi-insights-gzeon
 services:
   insights:
-    image: ${INSIGHTS_IMAGE:-ghcr.io/gzeoneth/unifi-insights-plus:3.7.2-gzeon.13}
+    image: ${INSIGHTS_IMAGE:-ghcr.io/gzeoneth/unifi-insights-plus:3.7.2-gzeon.14}
     pull_policy: ${INSIGHTS_PULL_POLICY:-missing}
     restart: unless-stopped
     stop_grace_period: 90s
@@ -19,6 +19,7 @@ services:
       INGEST_DELIVERY_BATCH_SIZE: '${INGEST_DELIVERY_BATCH_SIZE:-1000}'
       INGEST_DELIVERY_FLUSH_INTERVAL_SECONDS: '${INGEST_DELIVERY_FLUSH_INTERVAL_SECONDS:-2.0}'
       DASHBOARD_ANALYTICS_ENABLED: '${DASHBOARD_ANALYTICS_ENABLED:-false}'
+      DASHBOARD_ANALYTICS_BACKFILL_ENABLED: '${DASHBOARD_ANALYTICS_BACKFILL_ENABLED:-true}'
       EMBEDDED_PG_PROFILE: '${EMBEDDED_PG_PROFILE:-off}'
       ENRICHMENT_QUEUE_CAPACITY: '256'
     ports:

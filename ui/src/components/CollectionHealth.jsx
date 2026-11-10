@@ -76,9 +76,12 @@ export default function CollectionHealth() {
   const analytics = health?.dashboard_analytics
   const analyticsCoverage = analytics?.coverage_from ? new Date(analytics.coverage_from) : null
   const hasAnalyticsCoverage = analyticsCoverage && Number.isFinite(analyticsCoverage.getTime())
+  const historyPaused = analytics?.enabled && analytics?.healthy && !analytics.complete
+    && analytics.backfill_enabled === false
   const analyticsLabel = !analytics?.enabled ? 'Off' : !analytics?.healthy ? 'Using standard queries'
     : analytics.complete ? 'All retained history ready'
-      : hasAnalyticsCoverage ? 'Recent history ready' : 'Preparing history'
+      : hasAnalyticsCoverage ? 'Recent history ready'
+        : historyPaused ? 'Historical preparation paused' : 'Preparing history'
 
   return (
     <section aria-label="Collection health" className="border border-gray-800 rounded-lg p-4 space-y-4">
@@ -134,6 +137,7 @@ export default function CollectionHealth() {
               ? `History from ${analyticsCoverage.toLocaleString()} is ready. ` : ''}
             {analytics.enabled && !analytics.complete
               ? `${number(analytics.rows_backfilled)} historical rows checked. ` : ''}
+            {historyPaused ? 'Older history preparation is paused. New events continue updating analytics. ' : ''}
             Unprepared history and filters needing raw messages use standard queries with the full records.
           </p>
         </div>}
