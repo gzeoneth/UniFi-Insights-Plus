@@ -1,7 +1,14 @@
 """Exact dashboard summaries with one scoped event scan per response tier."""
 
 
-def overview_query(cutoff, scope=None):
+def dashboard_relation(source):
+    """Only fixed application relations may enter generated dashboard SQL."""
+    if source not in ('logs', 'dashboard_events'):
+        raise ValueError('unsupported dashboard source')
+    return source
+
+
+def overview_query(cutoff, scope=None, *, source='logs'):
     """Group visibility and dimensions together, including hidden-row totals.
 
     The optional scope is a trusted, compiled exclusion predicate and parameters.
@@ -17,7 +24,7 @@ def overview_query(cutoff, scope=None):
                COUNT(*) FILTER (WHERE log_type = 'firewall' AND rule_action = 'allow') AS allowed,
                COUNT(*) FILTER (WHERE rule_action = 'block') AS blocked,
                COUNT(*) FILTER (WHERE threat_score > 50) AS threats
-        FROM logs WHERE timestamp >= %s
+        FROM {dashboard_relation(source)} WHERE timestamp >= %s
         GROUP BY visible, log_type, direction
     """, [*params, cutoff]
 
@@ -46,7 +53,7 @@ def overview_result(rows):
     }
 
 
-def series_query(bucket, scope):
+def series_query(bucket, scope, *, source='logs'):
     if bucket not in ('hour', 'day', 'week', 'month'):
         raise ValueError('unsupported dashboard bucket')
     where, params = scope
@@ -56,7 +63,7 @@ def series_query(bucket, scope):
                COUNT(*) FILTER (WHERE log_type = 'firewall' AND rule_action = 'allow') AS allow,
                COUNT(*) FILTER (WHERE log_type = 'firewall' AND rule_action = 'block') AS block,
                COUNT(*) FILTER (WHERE log_type = 'firewall' AND rule_action = 'redirect') AS redirect
-        FROM logs WHERE {where}
+        FROM {dashboard_relation(source)} WHERE {where}
         GROUP BY period ORDER BY period
     """, params
 

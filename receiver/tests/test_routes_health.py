@@ -11,6 +11,49 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+def test_analytics_progress_is_allowlisted_and_does_not_scan_events(client, monkeypatch):
+    import dashboard_store
+    from routes.health import dashboard_analytics_status
+    monkeypatch.setattr(dashboard_store, 'enabled', lambda: True)
+    stamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    state = dict(status='backfill', healthy=True, complete=False, rows_scanned=123,
+                 coverage_from=stamp, updated_at=stamp, last_error=None,
+                 initial_max_id=900, epoch=4)
+    snapshot = MagicMock(return_value=state)
+    monkeypatch.setattr(dashboard_store, 'snapshot_state', snapshot)
+    conn = MagicMock()
+    actual = dashboard_analytics_status(conn)
+    assert actual['rows_backfilled'] == 123
+    assert actual['coverage_from'] == '2026-01-01T00:00:00+00:00'
+    assert actual['healthy'] is True and actual['complete'] is False
+    assert 'initial_max_id' not in actual and 'epoch' not in actual
+    snapshot.assert_called_once()
+    conn.commit.assert_called_once()
+
+
+def test_analytics_failure_does_not_hide_other_health(client, monkeypatch):
+    import dashboard_store
+    from routes.health import dashboard_analytics_status
+    monkeypatch.setattr(dashboard_store, 'enabled', lambda: True)
+    monkeypatch.setattr(dashboard_store, 'snapshot_state', MagicMock(side_effect=RuntimeError('unavailable')))
+    conn = MagicMock()
+    actual = dashboard_analytics_status(conn)
+    assert actual['status'] == 'unavailable' and actual['healthy'] is False
+    conn.rollback.assert_called_once()
+
+
+@pytest.mark.parametrize('error', ['LockNotAvailable', 'nonfinite_timestamp', 'x' * 81,
+                                  'connection string with private content'])
+def test_analytics_health_exposes_only_bounded_error_codes(client, monkeypatch, error):
+    import dashboard_store
+    from routes.health import dashboard_analytics_status
+    monkeypatch.setattr(dashboard_store, 'enabled', lambda: True)
+    monkeypatch.setattr(dashboard_store, 'snapshot_state', lambda _cur: dict(
+        status='backfill', healthy=True, complete=False, last_error=error))
+    actual = dashboard_analytics_status(MagicMock())
+    assert actual['last_error'] == (error if error in ('LockNotAvailable', 'nonfinite_timestamp') else None)
+
+
 @pytest.fixture
 def client(monkeypatch):
     """Create a FastAPI TestClient with mocked deps module.

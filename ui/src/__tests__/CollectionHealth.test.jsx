@@ -20,6 +20,37 @@ afterEach(() => {
   Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
 })
 
+describe('Dashboard acceleration readiness', () => {
+  it('distinguishes recent coverage from all retained history', async () => {
+    apiFetch.mockImplementation(url => Promise.resolve(url.endsWith('/ingest') ? ingestion : {
+      dashboard_analytics: { enabled: true, healthy: true, complete: false,
+        coverage_from: '2026-01-01T00:00:00Z', rows_backfilled: 1200 },
+    }))
+    render(<CollectionHealth />)
+    const panel = await screen.findByLabelText('Dashboard acceleration')
+    expect(panel).toHaveTextContent('Recent history ready')
+    expect(panel).toHaveTextContent('1,200 historical rows checked')
+    expect(panel).toHaveTextContent('Unprepared history and filters needing raw messages use standard queries')
+    expect(panel).not.toHaveTextContent('All retained history ready')
+  })
+
+  it('reports standard queries when the optional store is unavailable', async () => {
+    apiFetch.mockImplementation(url => Promise.resolve(url.endsWith('/ingest') ? ingestion : {
+      dashboard_analytics: { enabled: true, healthy: false, complete: false,
+        status: 'unavailable', coverage_from: null, rows_backfilled: 0 },
+    }))
+    render(<CollectionHealth />)
+    expect(await screen.findByLabelText('Dashboard acceleration')).toHaveTextContent('Using standard queries')
+  })
+
+  it('does not show a readiness claim for an older server', async () => {
+    apiFetch.mockImplementation(url => Promise.resolve(url.endsWith('/ingest') ? ingestion : { total_logs: 10 }))
+    render(<CollectionHealth />)
+    await screen.findByText('Packets received')
+    expect(screen.queryByLabelText('Dashboard acceleration')).toBeNull()
+  })
+})
+
 describe('CollectionHealth', () => {
   it('shows cumulative collection loss alongside a ready receiver and separates retries from delivery attempts', async () => {
     apiFetch.mockImplementation(url => Promise.resolve(url.endsWith('/ingest')

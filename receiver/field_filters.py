@@ -77,7 +77,7 @@ def parse_rules(value):
     return value
 
 
-def compile_filters(value, *, null_safe=False):
+def compile_filters(value, *, null_safe=False, security_predicates=None):
     """Rules AND together; comma-separated values OR within each rule.
 
     Excluding a value retains missing fields. Use present/missing explicitly
@@ -89,16 +89,19 @@ def compile_filters(value, *, null_safe=False):
     security_event selects the fixed categories ips and unparsed_cef; its
     present/missing operators mean any/no security classification.
     """
+    # Alternative expressions are application-owned constants for the exact
+    # stored analytics classifications, never fields supplied in a filter.
+    security = SECURITY_EVENT_PREDICATES if security_predicates is None else security_predicates
     conditions, params = [], []
     for rule in parse_rules(value):
         kind, columns = FIELDS[rule['field']]
         operator = rule['operator']
         if kind == 'security':
-            values = list(SECURITY_EVENT_PREDICATES) if operator in ('present', 'missing') else [
+            values = list(security) if operator in ('present', 'missing') else [
                 term.strip().lower() for term in rule['value'].split(',')]
-            if len(values) > MAX_VALUES or any(term not in SECURITY_EVENT_PREDICATES for term in values):
+            if len(values) > MAX_VALUES or any(term not in security for term in values):
                 _invalid('security_event accepts only ips or unparsed_cef')
-            predicate = '(' + ' OR '.join(SECURITY_EVENT_PREDICATES[term] for term in values) + ')'
+            predicate = '(' + ' OR '.join(security[term] for term in values) + ')'
             if operator in ('exclude', 'missing'):
                 predicate = f'NOT ({predicate})'
             conditions.append(predicate)
@@ -203,7 +206,7 @@ def parse_exclusion_groups(value):
     return value
 
 
-def compile_exclusions(value):
+def compile_exclusions(value, *, security_predicates=None):
     """Return a SQL predicate retaining rows outside every matching group.
 
     Standard field filters are independent. These exclusions do not delete
@@ -214,16 +217,19 @@ def compile_exclusions(value):
         return [], []
     matches, params = [], []
     for group in groups:
-        conditions, group_params = compile_filters(group['conditions'], null_safe=True)
+        conditions, group_params = compile_filters(
+            group['conditions'], null_safe=True, security_predicates=security_predicates)
         matches.append('(' + ' AND '.join(conditions) + ')')
         params.extend(group_params)
     predicate = '(' + ' OR '.join(matches) + ')'
-    return [f'(({_SECURITY_VISIBLE}) OR NOT ({predicate}))'], params
+    security_visible = (_SECURITY_VISIBLE if security_predicates is None
+                        else ' OR '.join(security_predicates.values()))
+    return [f'(({security_visible}) OR NOT ({predicate}))'], params
 
 
-def append_exclusions(where, params, value):
+def append_exclusions(where, params, value, *, security_predicates=None):
     """Append a profile to an existing base query without mutating its params."""
-    conditions, extra_params = compile_exclusions(value)
+    conditions, extra_params = compile_exclusions(value, security_predicates=security_predicates)
     if not conditions:
         return where, list(params)
     return f'({where}) AND ' + ' AND '.join(conditions), list(params) + extra_params

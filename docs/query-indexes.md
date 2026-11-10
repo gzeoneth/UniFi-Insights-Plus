@@ -21,6 +21,12 @@ Use exact IP/CIDR conditions for host investigations. Recorded device names may 
 
 The diagnostic script reports index definitions, validity, sizes, usage and selected column statistics without exposing event payloads. Before adding a large text or composite index, measure representative plans, insert throughput, memory and index size on a disposable copy. No production database is rewritten by the validation described below.
 
+## Optional narrow Dashboard access path
+
+Version `.13` adds an opt-in logged `dashboard_events` table with a primary-key index on `id` and a time index on `(timestamp DESC, id DESC)`. Covered Dashboard requests scan only the fields they need, while raw messages remain in `logs`. No existing raw index is dropped, and no text-bearing covering B-tree is added to the ingestion table. See [Dashboard analytics](dashboard-analytics.md) for exactness, measured tradeoffs and rollback.
+
+This reduces the amount read per broad scan; it does not make an exact count constant-time. Arbitrary raw-message filters and queries outside the Dashboard still require the raw access path.
+
 ## Release 3.7.2-gzeon.5 measurements
 
 Tests used PostgreSQL 16 and synthetic data. Figures are warm-cache medians on one development machine, not production latency or capacity guarantees. Results were checked for equivalence.

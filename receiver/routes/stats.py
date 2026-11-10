@@ -12,7 +12,9 @@ from fastapi.responses import StreamingResponse
 from psycopg2.extras import RealDictCursor
 
 from db import get_config, get_wan_ips_from_config
-from dashboard_queries import overview_query, overview_result, series_query, series_result
+from dashboard_queries import (overview_query, overview_result, series_query,
+                               series_result, dashboard_relation)
+from dashboard_source import choose_dashboard_source
 from request_work import phase
 from deps import get_conn, put_conn, enricher_db
 from ip_identity import load_identity_config, annotate_record, annotate_ip
@@ -122,7 +124,7 @@ def _query_top_blocked_internal_ips(cur, cutoff, scope=None):
     return [dict(r) for r in cur.fetchall()]
 
 
-def _query_top_threat_ips(cur, cutoff, exclude_ips, scope=None):
+def _query_top_threat_ips(cur, cutoff, exclude_ips, scope=None, *, source='logs'):
     """Top scored remote IPs; outbound scores belong to the destination."""
     from request_work import phase
     where, query_params = scope or ('timestamp >= %s', [cutoff])
@@ -132,7 +134,7 @@ def _query_top_threat_ips(cur, cutoff, exclude_ips, scope=None):
         " MAX(asn_name) AS asn, MAX(geo_city) AS city, MAX(rdns) AS rdns,"
         " MAX(threat_score) AS threat_score, MAX(threat_categories) AS threat_categories,"
         " MAX(timestamp) AS last_seen"
-        f" FROM logs WHERE {where} AND threat_score>50 AND remote_ip IS NOT NULL"
+        f" FROM {dashboard_relation(source)} WHERE {where} AND threat_score>50 AND remote_ip IS NOT NULL"
         " AND host(remote_ip)!=ALL(%s)"
         " GROUP BY remote_ip ORDER BY MAX(threat_score) DESC,count DESC,remote_ip LIMIT 10"
         ") SELECT host(s.remote_ip) AS ip,s.count,s.country,s.asn,s.city,s.rdns,"
@@ -140,7 +142,7 @@ def _query_top_threat_ips(cur, cutoff, exclude_ips, scope=None):
         " s.last_seen FROM top_ips s LEFT JOIN ip_threats t ON s.remote_ip=t.ip"
         " ORDER BY s.threat_score DESC,s.count DESC,s.remote_ip"
     )
-    with phase('query'):
+    with phase('query'), phase('stats_threats'):
         cur.execute(query, [*query_params, exclude_ips])
         rows = cur.fetchall()
     results = []
@@ -204,7 +206,7 @@ def _query_top_active_internal_ips(cur, cutoff, scope=None):
     return [dict(r) for r in cur.fetchall()]
 
 
-def _query_dashboard_tables(cur, cutoff, scope=None):
+def _query_dashboard_tables(cur, cutoff, scope=None, *, source='logs'):
     """Keep all top-N outputs with two broad scans and a selective threat scan."""
     from dashboard_tables import dimension_tables_sql, address_tables_sql
     from request_work import phase
@@ -222,8 +224,8 @@ def _query_dashboard_tables(cur, cutoff, scope=None):
         'top_allowed_destinations': ('ip', 'count', 'country', 'asn'),
     }
     result = {name: [] for name in (*dimension_fields, *address_fields, 'top_threat_ips')}
-    with phase('query'):
-        cur.execute(dimension_tables_sql(where), query_params)
+    with phase('query'), phase('stats_dimensions'):
+        cur.execute(dimension_tables_sql(where, source=source), query_params)
         dimensions = cur.fetchall()
     for row in dimensions:
         result[row['category']].append({dimension_fields[row['category']]: row['label'],
@@ -231,12 +233,14 @@ def _query_dashboard_tables(cur, cutoff, scope=None):
 
     exclude_ips = _build_exclude_ips()
     gateway_ips = get_config(enricher_db, 'gateway_ips') or []
-    with phase('query'):
-        cur.execute(address_tables_sql(where), [*query_params, exclude_ips, gateway_ips, exclude_ips, cutoff])
+    with phase('query'), phase('stats_addresses'):
+        cur.execute(address_tables_sql(where, source=source),
+                    [*query_params, exclude_ips, gateway_ips, exclude_ips, cutoff])
         addresses = cur.fetchall()
     for row in addresses:
         result[row['category']].append({field: row[field] for field in address_fields[row['category']]})
-    result['top_threat_ips'] = _query_top_threat_ips(cur, cutoff, exclude_ips, scope=scope)
+    result['top_threat_ips'] = _query_top_threat_ips(
+        cur, cutoff, exclude_ips, scope=scope, source=source)
     _annotate_internal_ips(result['top_blocked_internal_ips'], result['top_active_internal_ips'])
     return result
 
@@ -267,17 +271,17 @@ def _query_logs_over_time(cur, cutoff, bucket, scope=None):
     ]
 
 
-def _query_overview(cur, cutoff, scope=None):
-    sql, params = overview_query(cutoff, scope)
-    with phase('query'):
+def _query_overview(cur, cutoff, scope=None, *, source='logs'):
+    sql, params = overview_query(cutoff, scope, source=source)
+    with phase('query'), phase('stats_overview'):
         cur.execute(sql, params)
         rows = cur.fetchall()
     return overview_result(rows)
 
 
-def _query_timeseries(cur, cutoff, bucket, scope=None):
-    sql, params = series_query(bucket, scope or ('timestamp >= %s', [cutoff]))
-    with phase('query'):
+def _query_timeseries(cur, cutoff, bucket, scope=None, *, source='logs'):
+    sql, params = series_query(bucket, scope or ('timestamp >= %s', [cutoff]), source=source)
+    with phase('query'), phase('stats_charts'):
         cur.execute(sql, params)
         rows = cur.fetchall()
     return series_result(rows)
@@ -317,13 +321,15 @@ def get_stats(
     if not cutoff:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
     bucket = _get_bucket(time_range)
-    scope = _stats_scope(cutoff, exclude_groups)
+    _stats_scope(cutoff, exclude_groups)  # Reject malformed profiles before DB access.
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            summary = _query_overview(cur, cutoff, scope if exclude_groups else None)
-            tables = _query_dashboard_tables(cur, cutoff, scope=scope)
-            logs_over_time, traffic_by_action = _query_timeseries(cur, cutoff, bucket, scope=scope)
+            source, scope = choose_dashboard_source(cur, cutoff, exclude_groups)
+            summary = _query_overview(cur, cutoff, scope if exclude_groups else None, source=source)
+            tables = _query_dashboard_tables(cur, cutoff, scope=scope, source=source)
+            logs_over_time, traffic_by_action = _query_timeseries(
+                cur, cutoff, bucket, scope=scope, source=source)
         with phase('commit'):
             conn.commit()
         return {
@@ -352,12 +358,12 @@ def get_stats_overview(
     if not cutoff:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
 
-    scope = _stats_scope(cutoff, exclude_groups)
-    where, query_params = scope
+    _stats_scope(cutoff, exclude_groups)
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            summary = _query_overview(cur, cutoff, scope if exclude_groups else None)
+            source, scope = choose_dashboard_source(cur, cutoff, exclude_groups)
+            summary = _query_overview(cur, cutoff, scope if exclude_groups else None, source=source)
 
         with phase('commit'):
             conn.commit()
@@ -384,11 +390,12 @@ def get_stats_tables(
     if not cutoff:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
 
-    scope = _stats_scope(cutoff, exclude_groups)
+    _stats_scope(cutoff, exclude_groups)
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            result = _query_dashboard_tables(cur, cutoff, scope=scope)
+            source, scope = choose_dashboard_source(cur, cutoff, exclude_groups)
+            result = _query_dashboard_tables(cur, cutoff, scope=scope, source=source)
         with phase('commit'):
             conn.commit()
         return result
@@ -412,11 +419,13 @@ def get_stats_charts(
 
     bucket = _get_bucket(time_range)
 
-    scope = _stats_scope(cutoff, exclude_groups)
+    _stats_scope(cutoff, exclude_groups)
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            logs_over_time, traffic_by_action = _query_timeseries(cur, cutoff, bucket, scope=scope)
+            source, scope = choose_dashboard_source(cur, cutoff, exclude_groups)
+            logs_over_time, traffic_by_action = _query_timeseries(
+                cur, cutoff, bucket, scope=scope, source=source)
 
         with phase('commit'):
             conn.commit()

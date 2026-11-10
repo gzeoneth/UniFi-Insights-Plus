@@ -73,6 +73,12 @@ export default function CollectionHealth() {
   const parseLoss = stats.failed > 0 || stats.parse_exceptions > 0
   const timings = fresh ? ingestion?.timings || {} : {}
   const batch = fresh ? ingestion?.batch || {} : {}
+  const analytics = health?.dashboard_analytics
+  const analyticsCoverage = analytics?.coverage_from ? new Date(analytics.coverage_from) : null
+  const hasAnalyticsCoverage = analyticsCoverage && Number.isFinite(analyticsCoverage.getTime())
+  const analyticsLabel = !analytics?.enabled ? 'Off' : !analytics?.healthy ? 'Using standard queries'
+    : analytics.complete ? 'All retained history ready'
+      : hasAnalyticsCoverage ? 'Recent history ready' : 'Preparing history'
 
   return (
     <section aria-label="Collection health" className="border border-gray-800 rounded-lg p-4 space-y-4">
@@ -121,6 +127,16 @@ export default function CollectionHealth() {
           <Metric label="Rate window" value={rates.window_seconds == null ? 'Unknown' : `${Math.round(rates.window_seconds)} seconds`}
             detail="Packets and rows differ when events are filtered or retried. A zero loss rate does not erase historical loss." />
         </dl>
+        {analytics && <div aria-label="Dashboard acceleration" className="border border-gray-800 rounded-lg p-3 text-sm">
+          <p className="font-semibold">Dashboard acceleration · {analyticsLabel}</p>
+          <p className="text-xs text-gray-500 mt-1">
+            {analytics.enabled && analytics.healthy && hasAnalyticsCoverage && !analytics.complete
+              ? `History from ${analyticsCoverage.toLocaleString()} is ready. ` : ''}
+            {analytics.enabled && !analytics.complete
+              ? `${number(analytics.rows_backfilled)} historical rows checked. ` : ''}
+            Unprepared history and filters needing raw messages use standard queries with the full records.
+          </p>
+        </div>}
         <dl className="grid grid-cols-2 lg:grid-cols-4 gap-3">
           <Metric label="Receiver" value={LABELS[state] || state} state={state}
             detail={ingestion?.updated_at ? `Snapshot ${age(ingestion.age_seconds)}` : 'No receiver snapshot'} />

@@ -2,6 +2,24 @@
 
 The changes were tested against the upstream v3.7.2 base using synthetic events and disposable local databases. No live collector, gateway or production database was modified for these checks.
 
+## Narrow Dashboard analytics: 3.7.2-gzeon.13
+
+- The backend suite passed 1,674 tests with disposable PostgreSQL 16 integration and all eleven upgrade/restore tests enabled; six optional platform/benchmark checks were skipped. All 346 UI tests and the production UI build passed. The new store has 72 PostgreSQL cases, including deterministic concurrent timestamp/update/delete/truncate races, interrupted copying, damaged catalog shapes, re-enablement and 108 raw/projection exclusion comparisons.
+- The large fixture contained 46,016,728 permanent full-schema raw events, 25 valid raw indexes, a 30.54 GB raw heap and 10.24 GB raw indexes. A covered recent slice contained 4,878,547 derived rows with two indexes: 1.00 GB heap and 0.47 GB indexes. **Only that recent slice was prepared**, not all 46 million events. Full-history preparation adds further storage. Timed trials used a 4 GiB/4 CPU ARM64 container, PostgreSQL 16.15, 512 MiB shared buffers, 8 MiB work memory, JIT enabled, two parallel workers and durable commits. Seeding used 16 GiB; timed reads did not.
+- Actual Dashboard helpers ran all five statements over a fixed 24-hour window containing 4,706,675 events. Each workload alternated raw and derived sources in ABBA/BAAB order after diagnostic plans; caches were not flushed. All complete assembled responses matched exactly, including top-N rows, counts, exclusions, security preservation and chart buckets.
+
+| Fixed 24-hour workload | Raw combined SQL | Narrow combined SQL |
+| --- | ---: | ---: |
+| No exclusion profile | 5.62–6.62 s | 3.54–3.55 s |
+| Supported structured exclusions | 12.28–12.40 s | 4.01–4.29 s |
+
+- Those measurements are five SQL helpers plus response assembly, excluding HTTP/authentication and browser rendering. Inventory/threat metadata were synthetic and sparse; storage and event distributions differ from a deployed installation. The raw table retained intentionally stale recent-window statistics; the new derived table was analyzed. A narrower heap, stored security predicates, statistics and cache locality all contribute, so this is not an isolated index-only speedup or a production latency guarantee.
+- A separate packaged-image test used real authenticated API/MCP routing and coverage selection. Four combined 24-hour requests, in two concurrent pairs, completed in 3.92–4.29 seconds while a direct database writer committed 1,500 events at 50 events/second. All 1,500 corresponding facts were present. Fifty-row transaction times, including commit, ranged from 12.9 to 29.7 ms. HTTP windows moved with real time. The receiver and historical copier were stopped after startup for this load test; it does not measure concurrent UDP delivery or historical backfill throughput.
+- A guarded, rolled-back 1,000-row insertion experiment compared the same full raw schema with only the four projection triggers enabled/disabled. After an initial full-page-image-heavy run, a second ABBA trial measured 136–164 ms raw and 152–153 ms with capture. Global WAL insertion-LSN distance was 8.70–8.98 MB raw and 9.20–9.28 MB with capture. These short samples exclude commit, rollback and client packing; page history/background WAL can confound them. They show additional WAL and no stable throughput conclusion. Projection maintenance is therefore explicit opt-in, not a free performance default.
+- ARM64 and AMD64 images built and started. The packaged ARM64 receiver accepted 2,000 synthetic UDP events and stored exactly 2,000 raw and derived rows. All four Dashboard API routes and health passed with Bearer authentication; an unauthenticated protected request was denied after initial user setup. Numeric stage timing and covered-store health were present. A disable/recreate test retained raw data and token hashes, disabled all four database triggers, accepted one event during the disabled interval, then rebuilt exactly 2,001 facts on re-enablement with authenticated browsing working afterward.
+
+No existing raw index was dropped, no production database was changed, and no 24-hour production timeout is declared resolved. Flow, Security, Operations and Log Stream retain their current paths. See [enablement, coverage and downgrade instructions](dashboard-analytics.md).
+
 ## Long time ranges: 3.7.2-gzeon.12
 
 - The backend suite passed 1,569 tests with disposable PostgreSQL 16 integration and all eleven upgrade/restore tests enabled. Five optional query-benchmark variants passed separately, as did the Linux embedded-profile test. All 343 UI tests and the production UI build passed.

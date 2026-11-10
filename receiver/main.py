@@ -1010,6 +1010,12 @@ def main():
         except RuntimeError:
             index_thread = None
             logger.warning("Could not start index maintenance; intake continues", exc_info=True)
+        def pause_dashboard_copy():
+            if index_thread is not None and index_thread.is_alive():
+                return True
+            state = receiver.health_snapshot().get('collection', {}).get('state', 'unknown')
+            return state in ('delayed', 'error', 'unknown')
+        db.start_dashboard_store_maintenance(pause_callback=pause_dashboard_copy)
 
     receiver.started_callback = start_index_maintenance
 
@@ -1058,6 +1064,7 @@ def main():
     except KeyboardInterrupt:
         pass  # start() already drains in its finally block
     finally:
+        db.stop_dashboard_store_maintenance()
         unifi_api.stop_polling()
         pihole.stop_polling()
         enricher.close()

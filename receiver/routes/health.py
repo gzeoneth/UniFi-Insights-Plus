@@ -5,6 +5,7 @@ import json
 import math
 import time
 import os
+import re
 import shutil
 from datetime import datetime, timedelta, timezone
 
@@ -33,6 +34,38 @@ _RATE_FIELDS = ('received_per_second', 'staged_per_second', 'inserted_per_second
 _TIMING_STAGES = ('parse', 'enrich', 'spool_stage', 'spool_read', 'db_insert', 'spool_ack')
 _TIMING_FIELDS = ('count', 'total_ms', 'last_ms', 'max_ms', 'mean_ms', 'last_at', 'max_at')
 _WORKER_PHASES = {'idle', 'spool_open', 'parse_enrich', 'spool_stage', 'spool_read', 'db_insert', 'spool_ack'}
+
+
+def dashboard_analytics_status(conn):
+    """Small allowlisted progress snapshot; never count or scan event rows."""
+    from dashboard_store import enabled, snapshot_state
+    result = {'enabled': enabled(), 'status': 'disabled' if not enabled() else 'pending',
+              'healthy': False, 'complete': False, 'coverage_from': None,
+              'rows_backfilled': 0, 'updated_at': None, 'last_error': None}
+    if not result['enabled']:
+        return result
+    try:
+        with conn.cursor() as cur:
+            state = snapshot_state(cur)
+        conn.commit()
+        if state:
+            result.update({key: state.get(key) for key in
+                           ('healthy', 'complete')})
+            status = state.get('status')
+            result['status'] = status if status in {
+                'pending', 'backfill', 'ready', 'disabled', 'unsupported',
+            } else 'unavailable'
+            error = state.get('last_error')
+            if isinstance(error, str) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,79}', error):
+                result['last_error'] = error
+            result['rows_backfilled'] = state.get('rows_scanned', 0)
+            for key in ('coverage_from', 'updated_at'):
+                value = state.get(key)
+                result[key] = value.isoformat() if value else None
+    except Exception:
+        conn.rollback()
+        result.update(status='unavailable', healthy=False)
+    return result
 
 
 def _number(value, default=None):
@@ -267,6 +300,7 @@ def health():
         ingestion = read_ingest_health()
         return {
             'ingestion': ingestion,
+            'dashboard_analytics': dashboard_analytics_status(conn),
             'providers': ingestion['providers'],
             'total_logs_is_estimate': True,
             'status': 'ok',

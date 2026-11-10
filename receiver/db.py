@@ -348,6 +348,10 @@ class Database:
         self._service_index_connection = None
         self._service_index_thread = None
         self._service_index_thread_lock = threading.Lock()
+        self._dashboard_store_thread = None
+        self._dashboard_store_thread_lock = threading.Lock()
+        self._dashboard_store_stop = threading.Event()
+        self._dashboard_store_connection = None
         # Only display labels use this cache. Auth, filters, policies and
         # ordinary get_config reads retain their existing immediate semantics.
         self._display_config_cache = ReadCache(seconds=10, max_entries=1,
@@ -361,6 +365,44 @@ class Database:
         )
         logger.info("PostgreSQL connection pool ready (min=%d, max=%d)", self.min_conn, self.max_conn)
         self._ensure_schema()
+
+    def start_dashboard_store_maintenance(self, pause_callback=None):
+        """Start optional analytics setup/copying only after intake is ready."""
+        from dashboard_store import run_dashboard_store_worker
+        with self._dashboard_store_thread_lock:
+            if self._dashboard_store_thread is not None and self._dashboard_store_thread.is_alive():
+                return
+            self._dashboard_store_stop.clear()
+            self._dashboard_store_thread = threading.Thread(
+                target=run_dashboard_store_worker,
+                args=(self.conn_params, self._dashboard_store_stop),
+                kwargs={'connection_callback': self._set_dashboard_store_connection,
+                        'pause_callback': pause_callback},
+                name='dashboard-analytics', daemon=True,
+            )
+            try:
+                self._dashboard_store_thread.start()
+            except RuntimeError:
+                self._dashboard_store_thread = None
+                logger.warning('Could not start dashboard analytics maintenance; raw queries remain available')
+
+    def _set_dashboard_store_connection(self, connection):
+        self._dashboard_store_connection = connection
+
+    def stop_dashboard_store_maintenance(self):
+        """Cancel this worker's dedicated read/copy connection before closing."""
+        stop = getattr(self, '_dashboard_store_stop', None)
+        if stop is not None:
+            stop.set()
+        connection = getattr(self, '_dashboard_store_connection', None)
+        if connection is not None:
+            try:
+                connection.cancel()
+            except Exception:
+                pass
+        thread = getattr(self, '_dashboard_store_thread', None)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=5)
 
     def _ensure_schema(self):
         """Run idempotent schema migrations (safe on every boot).
@@ -1141,6 +1183,7 @@ END $$;""",
 
     def close(self):
         """Close all connections in the pool."""
+        self.stop_dashboard_store_maintenance()
         if self.pool:
             self.pool.closeall()
             logger.info("PostgreSQL connection pool closed.")

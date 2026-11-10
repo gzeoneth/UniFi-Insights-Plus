@@ -21,7 +21,9 @@ _HEAVY_PREFIXES = ('/api/logs', '/api/export', '/api/stats', '/api/dashboard',
 _LIGHT_MCP_TOOLS = frozenset(('get_health', 'get_log', 'get_unifi_status',
                               'list_interfaces', 'export_logs_csv_url'))
 _TIMING_NAMES = ('auth', 'token', 'session', 'audit', 'admission', 'pool_wait',
-                 'db_setup', 'query', 'commit', 'db_hold', 'handler')
+                 'db_setup', 'analytics_setup', 'query', 'stats_overview',
+                 'stats_dimensions', 'stats_addresses', 'stats_threats',
+                 'stats_charts', 'commit', 'db_hold', 'handler')
 _PROTECTED_PHASES = frozenset(('auth', 'token', 'session', 'audit', 'commit'))
 
 

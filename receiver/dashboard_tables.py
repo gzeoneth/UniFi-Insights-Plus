@@ -5,9 +5,10 @@ remain in the base scan, and each result keeps its own predicates and top ten.
 """
 
 from query_helpers import device_name_client_lateral, device_name_coalesce
+from dashboard_queries import dashboard_relation
 
 
-def dimension_tables_sql(where):
+def dimension_tables_sql(where, *, source='logs'):
     """One base scan for country, service and DNS group counts."""
     branches = []
     for category, column, flag, count_column in (
@@ -34,7 +35,7 @@ def dimension_tables_sql(where):
                    COUNT(*) FILTER(WHERE rule_action='allow') AS allowed,
                    COUNT(*) FILTER(WHERE rule_action='allow' AND direction='outbound') AS allowed_outbound,
                    COUNT(*) FILTER(WHERE log_type='dns') AS dns
-            FROM logs WHERE {where}
+            FROM {dashboard_relation(source)} WHERE {where}
               AND ((rule_action='block' AND (geo_country IS NOT NULL OR service_name IS NOT NULL))
                 OR (rule_action='allow' AND (service_name IS NOT NULL
                     OR (direction='outbound' AND geo_country IS NOT NULL)))
@@ -46,7 +47,7 @@ def dimension_tables_sql(where):
     """
 
 
-def address_tables_sql(where):
+def address_tables_sql(where, *, source='logs'):
     """One base scan for the four source/destination tables.
 
     Group by native INET, preserving masks. Public/private and exclusion tests
@@ -66,7 +67,7 @@ def address_tables_sql(where):
                    MAX(threat_score) FILTER(WHERE rule_action='block') AS blocked_score,
                    MAX(geo_country) FILTER(WHERE rule_action='allow') AS allowed_country,
                    MAX(asn_name) FILTER(WHERE rule_action='allow') AS allowed_asn
-            FROM logs WHERE {where}
+            FROM {dashboard_relation(source)} WHERE {where}
               AND rule_action IN ('block','allow')
               AND (src_ip IS NOT NULL OR dst_ip IS NOT NULL)
             GROUP BY GROUPING SETS ((src_ip), (dst_ip))

@@ -23,6 +23,9 @@ def _clean_env(monkeypatch):
                 'RETENTION_CLEANUP_TIME', 'RETENTION_TIME',
                 'RETENTION_DAYS', 'DNS_RETENTION_DAYS'):
         monkeypatch.delenv(var, raising=False)
+    # Legacy unit cursors model the raw schema only. Analytics-specific tests
+    # explicitly enable the real migration/coverage decision they exercise.
+    monkeypatch.setenv('DASHBOARD_ANALYTICS_ENABLED', 'false')
 
 
 @pytest.fixture(autouse=True)

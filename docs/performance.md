@@ -10,6 +10,12 @@ Pausing Log Stream stops its automatic row requests. Hidden tabs also suspend po
 
 API and MCP callers retain exact counts and offset pagination by default. Opt into `count_mode=none` and `pagination=cursor` for timestamp browsing. Use `next_cursor` to advance and `page_cursor` to repeat or count the current page, keeping the original filters. `total`, `pages` and `view_counts` are null when counts are skipped. `timings.query_ms` measures page-query work and the initial cursor boundary lookup; `timings.count_ms` measures the optional count. Neither includes HTTP transit or serialization.
 
+## Optional Dashboard analytics
+
+Version `.13` can maintain a narrow, transactionally synchronized event table for the Overview, Tables and Charts Dashboard reads, including the combined stats API and MCP call. It omits raw message payloads and uses two indexes. Enable it explicitly with `DASHBOARD_ANALYTICS_ENABLED=true`; see [setup, coverage and rollback](dashboard-analytics.md). Unprepared history and profiles requiring omitted fields use ordinary raw queries. Flow, Operations, Security and Log Stream keep their existing query paths.
+
+Server-Timing also reports the Overview, dimensions, addresses, threats and Charts stages separately, alongside total SQL time. These values identify the expensive stage; they do not include browser rendering or network transit.
+
 ## Address filters
 
 Complete addresses use PostgreSQL's native IP equality, and CIDRs use subnet containment. For example, `203.0.113.7` matches that address and `203.0.113.0/24` matches that subnet. Both IPv4 and IPv6 are supported. Use `contains:203.0.113.` for an explicit partial text search; incomplete legacy address searches remain supported. Text searches can require more work than exact addresses or CIDRs.
